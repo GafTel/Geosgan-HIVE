@@ -6,9 +6,10 @@ import sys
 from pathlib import Path
 
 from .agent_config import CheckpointConfig, load_hive_config
-from .checkpoints import CheckpointStore
+from .approvals import ApprovalManager
+from .checkpoints import CheckpointStore, ToolExecutionStatus
 from .config import Settings
-from .errors import ConfigError, HiveError
+from .errors import ApprovalError, ConfigError, HiveError
 from .factory import build_team
 from .gateway import ModelGateway
 from .recovery import RecoveryWorker
@@ -104,15 +105,48 @@ def main(argv: list[str] | None = None) -> int:
         "--recovery-worker", action="store_true",
         help="Run the opt-in automatic recovery worker until Ctrl+C",
     )
+    # Phase 3 (v0.5.0): tool approval + execution-ledger management (CLI-only
+    # trusted operator interface; a model can never approve its own action)
+    parser.add_argument(
+        "--pending-approvals", nargs="?", const="", default=None, metavar="RUN_ID",
+        help="List PENDING tool approvals (optionally filtered by RUN_ID) with a "
+             "bounded preview, and exit",
+    )
+    parser.add_argument("--show-approval", metavar="APPROVAL_ID", default=None,
+                        help="Show full details + preview of one approval and exit")
+    parser.add_argument("--approve", metavar="APPROVAL_ID", default=None,
+                        help="Approve an action (requires --operator)")
+    parser.add_argument("--deny", metavar="APPROVAL_ID", default=None,
+                        help="Deny an action (requires --operator)")
+    parser.add_argument("--cancel-approval", metavar="APPROVAL_ID", default=None,
+                        help="Cancel a pending approval (requires --operator)")
+    parser.add_argument("--operator", default=None,
+                        help="Trusted operator id for approve/deny/cancel/resolve")
+    parser.add_argument(
+        "--tool-executions", action="store_true",
+        help="List durable tool executions (ledger); filter with --run/--status",
+    )
+    parser.add_argument("--run", default=None, help="Filter tool executions by RUN_ID")
+    parser.add_argument("--status", default=None,
+                        help="Filter tool executions by status (started/completed/...)")
+    parser.add_argument("--resolve-execution", metavar="EXECUTION_ID", default=None,
+                        help="Operator-resolve an UNKNOWN tool execution "
+                             "(--decision completed|failed, --operator, --evidence)")
+    parser.add_argument("--decision", default=None, choices=["completed", "failed"],
+                        help="Resolution decision for --resolve-execution")
+    parser.add_argument("--evidence", default="", help="Evidence note for --resolve-execution")
     args = parser.parse_args(argv)
 
     management = bool(
         args.list_suspended or args.show or args.resume or args.cancel_run
-        or args.recovery_worker
+        or args.recovery_worker or args.pending_approvals is not None
+        or args.show_approval or args.approve or args.deny or args.cancel_approval
+        or args.tool_executions or args.resolve_execution
     )
     if args.task is None and not management:
         parser.error("task is required unless a management command is used "
-                     "(--list-suspended/--show/--resume/--cancel-run/--recovery-worker)")
+                     "(--list-suspended/--show/--resume/--cancel-run/--recovery-worker/"
+                     "--pending-approvals/--tool-executions/...)")
 
     settings = Settings()
     config_path = Path(args.agents_config) if args.agents_config else settings.config_path
@@ -154,6 +188,100 @@ def main(argv: list[str] | None = None) -> int:
             store.cancel(args.cancel_run, reason="cancelled via CLI")
             print(f"Run {args.cancel_run} cancelled.")
             return 0
+        if store is not None and (
+            args.pending_approvals is not None or args.show_approval or args.approve
+            or args.deny or args.cancel_approval or args.tool_executions
+            or args.resolve_execution
+        ):
+            from .agent_config import ApprovalConfig
+
+            ac = (
+                config.tools.approval
+                if config.tools is not None
+                else ApprovalConfig()
+            )
+            mgr = ApprovalManager(
+                store,
+                expiry_seconds=ac.expiry_seconds,
+                preview_bytes=ac.preview_bytes,
+            )
+            if args.pending_approvals is not None:
+                run_id = args.pending_approvals or None
+                pending = mgr.list_pending(run_id=run_id)
+                print(f"Pending approvals: {len(pending)}")
+                for row in pending:
+                    print(f"  {row['approval_id']}  run={row['run_id']} "
+                          f"agent={row['agent']} tool={row['tool']} "
+                          f"op={row['operation']} target={row['target']} "
+                          f"expires_at={row['expires_at']}")
+                    print("    preview:")
+                    for line in str(row["preview"]).splitlines():
+                        print(f"      {line}")
+                return 0
+            if args.show_approval:
+                row = mgr.get(args.show_approval)
+                if row is None:
+                    print(f"No approval {args.show_approval!r}", file=sys.stderr)
+                    return 1
+                for key in ("approval_id", "run_id", "task_id", "agent", "tool",
+                            "tool_version", "operation", "target", "status",
+                            "requested_at", "expires_at", "decided_by", "decided_at",
+                            "consumed_at", "args_sha256", "preconditions_json"):
+                    print(f"  {key}: {row[key]}")
+                print("  preview:")
+                for line in str(row["preview"]).splitlines():
+                    print(f"    {line}")
+                return 0
+            decision_cmd = (
+                ("approve", args.approve) if args.approve else
+                ("deny", args.deny) if args.deny else
+                ("cancel", args.cancel_approval) if args.cancel_approval else None
+            )
+            if decision_cmd is not None:
+                action, approval_id = decision_cmd
+                if not args.operator:
+                    print("--operator is required for approval decisions",
+                          file=sys.stderr)
+                    return 2
+                try:
+                    mgr.decide(approval_id, approve=(action == "approve"),
+                               cancel=(action == "cancel"), operator=args.operator)
+                except ApprovalError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
+                print(f"Approval {approval_id} -> {action.upper()}D by {args.operator}")
+                return 0
+            if args.tool_executions:
+                status = args.status
+                if status is not None and status not in {s.value for s in ToolExecutionStatus}:
+                    print(f"Invalid status {status!r}; valid: "
+                          f"{[s.value for s in ToolExecutionStatus]}", file=sys.stderr)
+                    return 2
+                rows = store.ledger_list(run_id=args.run, status=status)
+                print(f"Tool executions: {len(rows)}")
+                for row in rows:
+                    print(f"  {row['execution_id']}  run={row['run_id']} "
+                          f"agent={row['agent']} tool={row['tool']} "
+                          f"status={row['status']} approval={row['approval_id']} "
+                          f"started_at={row['started_at']} finished_at={row['finished_at']}")
+                    if row["error"]:
+                        print(f"    error: {row['error']}")
+                return 0
+            if args.resolve_execution:
+                if not args.operator or not args.decision:
+                    print("--resolve-execution requires --decision and --operator",
+                          file=sys.stderr)
+                    return 2
+                ok = store.ledger_resolve(args.resolve_execution,
+                                          decision=args.decision, operator=args.operator,
+                                          evidence=args.evidence or "(no evidence given)")
+                if not ok:
+                    print(f"Execution {args.resolve_execution!r} is not in UNKNOWN state",
+                          file=sys.stderr)
+                    return 1
+                print(f"Execution {args.resolve_execution} resolved as "
+                      f"{args.decision} by {args.operator}")
+                return 0
 
         tracker = UsageTracker(sink=usage_log)
         gateway = ModelGateway(

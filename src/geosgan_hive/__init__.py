@@ -106,7 +106,7 @@ from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.4.0"  # -> 0.5.0 at T7
+__version__ = "0.5.0"
 
 __all__ = [
     "Agent",
