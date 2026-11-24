@@ -57,29 +57,45 @@ def test_adelegate_uses_native_async_path():
     assert agents["analyst"].llm.calls == []  # sync path untouched
 
 
-def test_adelegate_many_parallel_deterministic_order_and_concurrency_cap():
+def test_adelegate_many_parallel_deterministic_order_and_concurrency_cap(monkeypatch):
+    """Concurrency is bounded at the gateway dispatch boundary: peak ACTIVE model
+    requests never exceed max_parallel_agents, and results keep input order."""
+    from types import SimpleNamespace
+
+    import litellm
+
+    from geosgan_hive.gateway import ModelGateway
+
     peak = {"current": 0, "max": 0}
-    lock = asyncio.Lock()
+    delays = {"analyst": 0.08, "reviewer": 0.02, "developer": 0.05}
 
-    def tracking_llm(name, delay):
-        async def handler(messages):
-            async with lock:
-                peak["current"] += 1
-                peak["max"] = max(peak["max"], peak["current"])
-            await asyncio.sleep(delay)
-            async with lock:
-                peak["current"] -= 1
-            return f"{name} done"
+    async def fake_acompletion(**kwargs):
+        agent = kwargs["model"].split("/", 1)[1]
+        peak["current"] += 1
+        peak["max"] = max(peak["max"], peak["current"])
+        await asyncio.sleep(delays[agent])  # inside the dispatched request
+        peak["current"] -= 1
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=f"{agent} done"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            model=kwargs["model"],
+        )
 
-        return FakeLLM(handler=handler)
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
 
     policy = make_policy(max_parallel_agents=2)
-    engine, agents = make_async_team(
-        policy=policy,
-        analyst=tracking_llm("analyst", 0.08),
-        reviewer=tracking_llm("reviewer", 0.02),
-        developer=tracking_llm("developer", 0.05),
-    )
+    engine = CollaborationEngine(policy=policy, tracker=UsageTracker())
+    gateway = ModelGateway(tracker=engine.tracker)
+    gateway.set_context_lookup(engine.context_for)  # dispatch reserves physical + slot
+    agents = {}
+    for name in ("researcher", "analyst", "reviewer", "developer"):
+        agents[name] = make_agent(
+            name, gateway.bind(f"ollama/{name}", agent=name), engine=engine,
+            allow_delegation=(name == "researcher"),
+            allowed_agents=["analyst", "reviewer", "developer"] if name == "researcher" else [],
+        )
+    engine.register(agents)
     proposals = [
         {"target": "analyst", "task": "slow"},
         {"target": "reviewer", "task": "fast"},
@@ -95,9 +111,12 @@ def test_adelegate_many_parallel_deterministic_order_and_concurrency_cap():
     assert [r.result for r in results] == ["analyst done", "reviewer done", "developer done"]
     assert all(r.status == DelegationStatus.COMPLETED for r in results)
     # bounded concurrency AND parallelism proven by observed overlap:
-    # peak == 2 means two handlers were inside concurrently (sequential would be 1)
+    # peak == 2 means two dispatched requests were in flight concurrently
     assert peak["max"] == 2
-    assert elapsed < 1.0  # generous sanity bound; sum of delays would be 0.15s sequential
+    assert elapsed < 1.0  # generous bound; sequential would take 0.15s+ of model time
+    # each dispatched request reserved one physical attempt
+    ctx = engine._contexts.get("r")
+    assert ctx.physical_reserved == 3
 
 
 def test_adelegate_many_dedupes_identical_proposals():

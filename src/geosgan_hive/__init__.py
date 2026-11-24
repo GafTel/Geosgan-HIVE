@@ -3,6 +3,7 @@
 from .agent_config import (
     CORE_ROLES,
     AgentSpec,
+    CheckpointConfig,
     HiveConfig,
     Limits,
     Permissions,
@@ -19,6 +20,12 @@ from .agents import (
     parse_delegation_call,
     parse_tool_call,
 )
+from .checkpoints import (
+    CheckpointStore,
+    ExecutionState,
+    PersistMode,
+    RunCheckpoint,
+)
 from .collaboration import (
     CollaborationEngine,
     DelegationProposal,
@@ -31,26 +38,52 @@ from .errors import (
     AuthenticationError,
     BadRequestError,
     BudgetExceededError,
+    CapabilityMismatchError,
+    CheckpointError,
     ConfigError,
+    ContextWindowExceededError,
     DelegationError,
     DelegationRejectedError,
+    ErrorClass,
+    FallbackExhaustedError,
     GatewayConnectionError,
     GatewayError,
     GatewayTimeoutError,
     HiveError,
     MissingCredentialsError,
     PermanentGatewayError,
+    ProviderUnavailableError,
+    QuotaExhaustedError,
     RateLimitError,
     ServiceUnavailableError,
     TransientGatewayError,
     UnknownProviderError,
+    classify_error,
 )
 from .factory import build_agent, build_supervisor, build_team
+from .fallback import (
+    CandidateDecision,
+    FallbackEngine,
+    FallbackMode,
+    FallbackPolicy,
+    effective_policy,
+)
 from .gateway import GatewayLLMClient, LLMResponse, ModelGateway
+from .health import CircuitBreaker, CircuitState, HealthRegistry
 from .llm import AsyncLLMClient, FakeLLM, LLMClient
 from .messages import Message
 from .orchestrator import FINISH, OrchestratorResult, Supervisor
-from .providers import Credentials, Provider, ProviderSpec, parse_model, resolve_credentials
+from .providers import (
+    Credentials,
+    ModelCapabilities,
+    Provider,
+    ProviderSpec,
+    cost_tier,
+    model_capabilities,
+    parse_model,
+    resolve_credentials,
+)
+from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
 from .run_context import (
     CollaborationEvent,
@@ -63,7 +96,7 @@ from .run_context import (
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Agent",
@@ -74,22 +107,37 @@ __all__ = [
     "BadRequestError",
     "BudgetExceededError",
     "CORE_ROLES",
+    "CandidateDecision",
+    "CapabilityMismatchError",
+    "CheckpointConfig",
+    "CheckpointError",
+    "CheckpointStore",
+    "CircuitBreaker",
+    "CircuitState",
     "CollaborationEngine",
     "CollaborationEvent",
     "CollaborationPolicy",
     "ConfigError",
+    "ContextWindowExceededError",
     "Credentials",
     "DelegationError",
     "DelegationProposal",
     "DelegationRejectedError",
     "DelegationStatus",
+    "ErrorClass",
     "EventType",
+    "ExecutionState",
     "FakeLLM",
     "FINISH",
+    "FallbackEngine",
+    "FallbackExhaustedError",
+    "FallbackMode",
+    "FallbackPolicy",
     "GatewayConnectionError",
     "GatewayError",
     "GatewayLLMClient",
     "GatewayTimeoutError",
+    "HealthRegistry",
     "HandoffRequest",
     "HandoffResult",
     "HiveConfig",
@@ -99,14 +147,20 @@ __all__ = [
     "Limits",
     "Message",
     "MissingCredentialsError",
+    "ModelCapabilities",
     "ModelGateway",
     "OrchestratorResult",
     "PermanentGatewayError",
     "Permissions",
+    "PersistMode",
     "Provider",
     "ProviderSpec",
+    "ProviderUnavailableError",
+    "QuotaExhaustedError",
     "RateLimitError",
+    "RecoveryWorker",
     "RetryPolicy",
+    "RunCheckpoint",
     "RunContext",
     "ServiceUnavailableError",
     "Settings",
@@ -127,10 +181,14 @@ __all__ = [
     "build_supervisor",
     "build_team",
     "check_run_limits",
+    "classify_error",
+    "cost_tier",
     "default_registry",
+    "effective_policy",
     "is_retryable",
     "load_hive_config",
     "load_settings",
+    "model_capabilities",
     "parse_delegation_call",
     "parse_model",
     "parse_tool_call",

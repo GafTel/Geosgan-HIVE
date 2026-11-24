@@ -8,3 +8,7 @@ __pycache__/
 build/
 dist/
 logs/
+*.db
+*.db-wal
+*.db-shm
+.geosgan_hive/

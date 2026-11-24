@@ -24,7 +24,8 @@ class FakeGateway:
         self.tracker = UsageTracker()
         self.calls: list[tuple[str, str]] = []  # (model, agent)
 
-    def bind(self, model, *, agent=None, temperature=0.2, max_tokens=None, timeout_seconds=None):
+    def bind(self, model, *, agent=None, temperature=0.2, max_tokens=None,
+             timeout_seconds=None, fallback=None, needs_tools=False):
         gateway = self
 
         class _Client:

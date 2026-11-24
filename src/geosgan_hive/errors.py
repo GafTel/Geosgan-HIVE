@@ -1,5 +1,51 @@
 from __future__ import annotations
 
+import asyncio
+from enum import StrEnum
+
+# ---------------------------------------------------------------------------
+# Phase 2.5: normalized provider error taxonomy
+# ---------------------------------------------------------------------------
+
+
+class ErrorClass(StrEnum):
+    """Normalized provider-error category (independent of the LiteLLM class)."""
+
+    RATE_LIMIT = "rate_limit"
+    QUOTA = "quota"
+    OUTAGE = "outage"  # provider 5xx
+    NETWORK = "network"
+    TIMEOUT = "timeout"
+    AUTH = "auth"
+    INVALID_REQUEST = "invalid_request"
+    CAPABILITY = "capability"  # model cannot serve this request shape
+    CONTEXT_WINDOW = "context_window"
+    BUDGET = "budget"  # run-level budget exhausted
+    PROVIDER_UNAVAILABLE = "provider_unavailable"  # WAIT/HYBRID suspension signal
+    FALLBACK_EXHAUSTED = "fallback_exhausted"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+def classify_error(exc: BaseException) -> tuple[ErrorClass, bool, bool, bool]:
+    """Return (error_class, retryable, fallback_eligible, terminal).
+
+    - retryable: may be retried on the same model (transient).
+    - fallback_eligible: an eligible alternative model may be tried.
+    - terminal: run-level terminal condition — never retry, never fallback
+      (cancellation, exhausted run budget).
+    Unknown errors are classified conservative-permanent (no retry, no fallback).
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return (ErrorClass.CANCELLED, False, False, True)
+    cls = getattr(exc, "error_class", ErrorClass.UNKNOWN)
+    return (
+        cls,
+        bool(getattr(exc, "retryable", False)),
+        bool(getattr(exc, "fallback_eligible", False)),
+        bool(getattr(exc, "terminal", False)),
+    )
+
 
 class HiveError(Exception):
     """Base error for geosgan_hive."""
@@ -23,25 +69,53 @@ class UnknownProviderError(ConfigError):
 class GatewayError(HiveError):
     """A model call through the gateway failed."""
 
+    error_class = ErrorClass.UNKNOWN
+    retryable = False
+    fallback_eligible = False
+    terminal = False
+
 
 class TransientGatewayError(GatewayError):
     """Retryable failure (rate limit, 5xx, timeout, connection)."""
+
+    retryable = True
 
 
 class RateLimitError(TransientGatewayError):
     """The provider rate-limited the call (HTTP 429)."""
 
+    error_class = ErrorClass.RATE_LIMIT
+    fallback_eligible = True
+
+
+class QuotaExhaustedError(GatewayError):
+    """The provider/account quota is exhausted. Fallback-eligible, not retryable
+    (we never invent quota reset timestamps)."""
+
+    error_class = ErrorClass.QUOTA
+    retryable = False
+    fallback_eligible = True
+
 
 class ServiceUnavailableError(TransientGatewayError):
     """The provider returned a transient server error (5xx)."""
+
+    error_class = ErrorClass.OUTAGE
+    fallback_eligible = True
 
 
 class GatewayTimeoutError(TransientGatewayError):
     """The call timed out."""
 
+    error_class = ErrorClass.TIMEOUT
+    fallback_eligible = True
+
 
 class GatewayConnectionError(TransientGatewayError):
     """The connection to the provider failed."""
+
+    error_class = ErrorClass.NETWORK
+    fallback_eligible = True
 
 
 class PermanentGatewayError(GatewayError):
@@ -49,15 +123,56 @@ class PermanentGatewayError(GatewayError):
 
 
 class AuthenticationError(PermanentGatewayError):
-    """The provider rejected the credentials (HTTP 401/403)."""
+    """The provider rejected the credentials (HTTP 401/403). Never retried,
+    never fallback-eligible, and never opens a provider-wide circuit (it is
+    credential-specific, not provider-wide)."""
+
+    error_class = ErrorClass.AUTH
 
 
 class BadRequestError(PermanentGatewayError):
-    """The request itself is invalid (HTTP 400, context window, ...)."""
+    """The request itself is invalid (HTTP 400, ...)."""
+
+    error_class = ErrorClass.INVALID_REQUEST
+
+
+class ContextWindowExceededError(BadRequestError):
+    """The prompt exceeds the model's context window. Fallback-eligible (another
+    model may have a larger window), never retried on the same model."""
+
+    error_class = ErrorClass.CONTEXT_WINDOW
+    fallback_eligible = True
+
+
+class CapabilityMismatchError(PermanentGatewayError):
+    """The target model cannot serve this request (tools, modality, ...)."""
+
+    error_class = ErrorClass.CAPABILITY
+
+
+class FallbackExhaustedError(GatewayError):
+    """The ordered fallback chain was exhausted for this logical call."""
+
+    error_class = ErrorClass.FALLBACK_EXHAUSTED
+
+
+class ProviderUnavailableError(GatewayError):
+    """WAIT/HYBRID signal: no eligible model is currently available; the run may
+    be suspended at a safe boundary and resumed later."""
+
+    error_class = ErrorClass.PROVIDER_UNAVAILABLE
 
 
 class BudgetExceededError(HiveError):
-    """The known cost of a run reached its configured per-run budget."""
+    """The known cost of a run reached its configured per-run budget, or a
+    dispatch budget (logical/physical) was exhausted — run-terminal."""
+
+    error_class = ErrorClass.BUDGET
+    terminal = True
+
+
+class CheckpointError(HiveError):
+    """Checkpoint store failure (corrupt, locked, incompatible schema, ...)."""
 
 
 class DelegationError(HiveError):
@@ -66,3 +181,5 @@ class DelegationError(HiveError):
 
 class DelegationRejectedError(DelegationError):
     """A handoff request was rejected by policy or permissions."""
+
+

@@ -93,3 +93,22 @@ agents:
       allow_delegation: false
       allowed_agents: []
     limits: {max_tool_steps: 2, max_calls_per_run: 10, timeout_seconds: 120}
+
+# Phase 2.5 (v0.4.0): intelligent model fallback — OPT-IN, disabled by default.
+# Uncomment to enable. WAIT/HYBRID require the checkpoint block below.
+# fallback:
+#   mode: continuity                  # off | continuity | wait | hybrid
+#   fallback_models: [ollama/llama3.2]  # ordered chain after the primary model
+#   max_fallback_attempts: 2
+#   max_wait_seconds: 300
+#   cooldown_seconds: 60
+#   failure_threshold: 3
+#   allowed_providers: [openai, mistral, anthropic, gemini, ollama]
+#   allowed_fallback_providers: [ollama]  # cross-provider transfer needs this
+#   allow_paid_fallback: false        # never auto-switch to a paid model from free
+#   allow_unknown_cost_fallback: false  # unknown cost is NOT zero
+# checkpoint:                          # SQLite (stdlib); DB files are gitignored
+#   path: .geosgan_hive/checkpoints.db
+#   persist_mode: metadata_only       # metadata_only | resumable (resume needs resumable)
+#   lease_ttl_seconds: 60
+#   worker_poll_seconds: 5

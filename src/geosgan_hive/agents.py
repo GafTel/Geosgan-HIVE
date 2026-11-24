@@ -410,20 +410,13 @@ class Agent:
             stop = self._check_limits(run_id, calls, run_context, task_id)
             if stop is not None:
                 return AgentResult(self.name, stop, tool_calls, step - 1, handoffs)
+            # request-level concurrency is bounded at the gateway dispatch boundary
             if acomplete is not None:
-                async def call():
-                    return await acomplete(messages, temperature=self.temperature, run_id=run_id)
+                raw = await acomplete(messages, temperature=self.temperature, run_id=run_id)
             else:  # legacy sync-only adapter: thread fallback only
-                async def call():
-                    return await asyncio.to_thread(
-                        self.llm.complete, messages, temperature=self.temperature, run_id=run_id
-                    )
-            if run_context is not None:
-                # bound ACTIVE model requests; never held while awaiting subtasks
-                async with run_context.semaphore():
-                    raw = await call()
-            else:
-                raw = await call()
+                raw = await asyncio.to_thread(
+                    self.llm.complete, messages, temperature=self.temperature, run_id=run_id
+                )
             calls += 1
             call = parse_tool_call(raw)
             if call is not None:
