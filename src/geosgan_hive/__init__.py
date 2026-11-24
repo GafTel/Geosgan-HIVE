@@ -83,6 +83,7 @@ from .providers import (
     parse_model,
     resolve_credentials,
 )
+from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
 from .run_context import (
     CollaborationEvent,
@@ -157,6 +158,7 @@ __all__ = [
     "ProviderUnavailableError",
     "QuotaExhaustedError",
     "RateLimitError",
+    "RecoveryWorker",
     "RetryPolicy",
     "RunCheckpoint",
     "RunContext",

@@ -81,8 +81,20 @@ def build_supervisor(
 
 
 def build_team(
-    config: HiveConfig, gateway: ModelGateway, tracker: UsageTracker | None = None
+    config: HiveConfig,
+    gateway: ModelGateway,
+    tracker: UsageTracker | None = None,
+    *,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> tuple[Supervisor, dict[str, Agent]]:
+    """Build the whole team from a validated config, wiring the engine.
+
+    The CollaborationEngine is shared by the supervisor and all agents; agents
+    never reference each other directly — all handoffs go through the engine.
+    `checkpoint_store` may be injected (e.g. by the CLI so management commands and
+    the team share ONE store connection); otherwise one is created from
+    `config.checkpoint` when present.
+    """
     """Build the whole HIVE team from a validated config, wiring the engine.
 
     The CollaborationEngine is shared by the supervisor and all agents; agents
@@ -100,8 +112,8 @@ def build_team(
         gateway.health.failure_threshold = config.fallback.failure_threshold
         gateway.health.cooldown_seconds = config.fallback.cooldown_seconds
         gateway.health.half_open_max_probes = config.fallback.half_open_max_probes
-    store = None
-    if config.checkpoint is not None:
+    store = checkpoint_store
+    if store is None and config.checkpoint is not None:
         store = CheckpointStore(
             config.checkpoint.path,
             persist_mode=config.checkpoint.persist_mode,
