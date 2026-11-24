@@ -52,8 +52,11 @@ def build_tool_catalog(config: HiveConfig | None = None) -> tuple[ToolCatalog, W
     deny = config.tools.deny_name_patterns if has_tools else None
     write_ext = config.tools.write_extensions if has_tools else None
     sandbox = WorkspaceSandbox(root, deny, write_extensions=write_ext)
+    # On Windows the sandbox cannot provide race-resistant write guarantees
+    # (no fd re-verification), so mutating tools are not even registered there.
+    writes_ok = sandbox.platform != "nt" or sandbox.allow_writes_on_windows
     register_file_tools(catalog, sandbox,
-                        allow_write=bool(has_tools and config.tools.allow_write))
+                        allow_write=bool(has_tools and config.tools.allow_write and writes_ok))
     return catalog, sandbox
 
 

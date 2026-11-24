@@ -421,14 +421,15 @@ class CheckpointStore:
         """Durably reserve ONE tool execution BEFORE the side effect is dispatched
         (Phase 3). Same guarantees as reserve_physical_durable: single atomic
         transaction, monotonic SQL increment (never decreases), only while RUNNING
-        so stale/recovered workers cannot dispatch. A crash after this commit
-        conservatively retains the reservation."""
+        AND the lease is still valid (ownership fencing beyond mere RUNNING state:
+        an expired lease blocks dispatch even if crash recovery has not flipped the
+        state yet). A crash after this commit conservatively retains the reservation."""
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE runs SET tool_reservations = tool_reservations + 1, updated_at=? "
-                "WHERE run_id=? AND state=?",
-                (now, run_id, ExecutionState.RUNNING.value),
+                "WHERE run_id=? AND state=? AND lease_expires_at > ?",
+                (now, run_id, ExecutionState.RUNNING.value, now),
             )
             return cur.rowcount == 1
 
@@ -441,13 +442,14 @@ class CheckpointStore:
         suspended/terminal (lease lost or recovered), dispatch is blocked.
 
         A crash after this commit but before dispatch conservatively retains the
-        reservation. Returns False when the run row is gone or not RUNNING."""
+        reservation. Returns False when the run row is gone, not RUNNING, or the
+        lease has expired (ownership fencing beyond mere RUNNING state)."""
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE runs SET physical_reserved = physical_reserved + 1, updated_at=? "
-                "WHERE run_id=? AND state=?",
-                (now, run_id, ExecutionState.RUNNING.value),
+                "WHERE run_id=? AND state=? AND lease_expires_at > ?",
+                (now, run_id, ExecutionState.RUNNING.value, now),
             )
             return cur.rowcount == 1
 
@@ -874,22 +876,82 @@ class CheckpointStore:
             return cur.rowcount == 1
 
     def consume_approval(
-        self, approval_id: str, *, expected_args_sha256: str, now_iso: str | None = None
+        self, approval_id: str, *, expected_args_sha256: str, now_iso: str | None = None,
+        expected_tool_version: str | None = None, expected_run_id: str | None = None,
+        expected_agent: str | None = None, expected_tool: str | None = None,
     ) -> bool:
         """Atomically consume an APPROVED approval: single transaction, single-use,
         bound to the exact argument hash (substitution -> rejected), not expired.
-        This is the durable execution-start transition companion."""
+        When the expected_* bindings are given, they are checked in the SAME
+        transaction, so an approval can never be consumed for a different
+        tool version / run / agent / tool. This is the durable execution-start
+        transition companion (see start_execution for the fully atomic variant)."""
         now = now_iso or self.now_iso()
+        cond = ["approval_id=?", "status=?", "args_sha256=?", "expires_at > ?"]
+        params: list[Any] = [
+            approval_id, ApprovalState.APPROVED.value, expected_args_sha256, now,
+        ]
+        if expected_tool_version is not None:
+            cond.append("tool_version=?")
+            params.append(expected_tool_version)
+        if expected_run_id is not None:
+            cond.append("run_id=?")
+            params.append(expected_run_id)
+        if expected_agent is not None:
+            cond.append("agent=?")
+            params.append(expected_agent)
+        if expected_tool is not None:
+            cond.append("tool=?")
+            params.append(expected_tool)
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "UPDATE approvals SET status=?, consumed_at=? "
-                "WHERE approval_id=? AND status=? AND args_sha256=? AND expires_at > ?",
-                (
-                    ApprovalState.CONSUMED.value, now, approval_id,
-                    ApprovalState.APPROVED.value, expected_args_sha256, now,
-                ),
+                "UPDATE approvals SET status=?, consumed_at=? WHERE " + " AND ".join(cond),
+                [ApprovalState.CONSUMED.value, now, *params],
             )
             return cur.rowcount == 1
+
+    def start_execution(
+        self, *, execution_id: str, run_id: str, agent: str, tool: str,
+        args_sha256: str, status: str, approval_id: str, expected_args_sha256: str,
+        task_id: str | None = None, tool_version: str = "1", args_json: str = "{}",
+        lease_owner: str | None = None, lease_generation: int | None = None,
+    ) -> bool:
+        """Atomic durable execution-start: consume the approval AND insert the ledger
+        row in ONE transaction (both succeed or neither). The approval consume is
+        bound to approval id + APPROVED state + exact args hash + tool version + run
+        + agent + tool + not expired. A duplicate execution_id aborts before any
+        write (no double dispatch, approval NOT consumed)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            if self._conn.execute(
+                "SELECT 1 FROM tool_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone():
+                return False
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, consumed_at=? "
+                "WHERE approval_id=? AND status=? AND args_sha256=? AND tool_version=? "
+                "AND run_id=? AND agent=? AND tool=? AND expires_at > ?",
+                (
+                    ApprovalState.CONSUMED.value, now, approval_id,
+                    ApprovalState.APPROVED.value, expected_args_sha256, tool_version,
+                    run_id, agent, tool, now,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "INSERT INTO tool_executions (execution_id, run_id, task_id, agent, "
+                "tool, tool_version, args_sha256, args_json, status, approval_id, "
+                "lease_owner, lease_generation, requested_at, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    execution_id, run_id, task_id, agent, tool, tool_version,
+                    args_sha256, args_json, status, approval_id, lease_owner,
+                    lease_generation, now,
+                    now if status == ToolExecutionStatus.STARTED.value else None,
+                ),
+            )
+            return True
 
     def sweep_expired_approvals(self) -> int:
         now = self.now_iso()

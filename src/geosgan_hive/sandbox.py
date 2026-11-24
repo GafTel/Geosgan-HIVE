@@ -48,13 +48,17 @@ class WorkspaceSandbox:
       the pre-open realpath is the fallback);
     - size caps are enforced before reading.
 
-    Platform notes: O_NOFOLLOW and /proc/self/fd verification are POSIX; on Windows,
+    Platform notes: O_NOFOLLOW and /proc/self/fd verification are POSIX. On Windows,
     realpath resolves junctions/reparse points and containment is enforced, but
-    fd-level re-verification is not available — documented limitation.
+    fd-level re-verification is NOT available, and realpath containment alone is
+    not a race-resistant guarantee — therefore WRITE operations (fs_write/fs_update)
+    are DISABLED BY DEFAULT on Windows (fail closed) unless explicitly overridden;
+    reads remain available with the documented residual TOCTOU limitation.
     """
 
     def __init__(self, root: str, deny_patterns: list[str] | None = None,
-                 write_extensions: list[str] | None = None) -> None:
+                 write_extensions: list[str] | None = None, *,
+                 platform: str | None = None, allow_writes_on_windows: bool = False) -> None:
         if not root or "\x00" in root:
             raise SandboxViolationError("invalid workspace root")
         self.root = os.path.realpath(root)
@@ -64,6 +68,8 @@ class WorkspaceSandbox:
             (e.lower() for e in write_extensions) if write_extensions is not None
             else (".txt", ".md")
         )
+        self.platform = platform or os.name
+        self.allow_writes_on_windows = bool(allow_writes_on_windows)
 
     # ---- path resolution ----
     def _deny_check(self, resolved: str) -> None:
@@ -110,6 +116,13 @@ class WorkspaceSandbox:
             raise SandboxViolationError(f"cannot stat {relpath!r}: {exc}") from exc
         if not stat.S_ISREG(pre.st_mode):
             raise SandboxViolationError(f"{relpath!r} is not a regular file")
+        if pre.st_nlink > 1:
+            # a hard link means another name exists for this inode, possibly OUTSIDE
+            # the workspace (path containment cannot catch hard links)
+            raise SandboxViolationError(
+                f"{relpath!r} has {pre.st_nlink} hard links — refusing (possible link "
+                "outside the workspace)"
+            )
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         try:
             fd = os.open(resolved, flags)
@@ -119,6 +132,11 @@ class WorkspaceSandbox:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 raise SandboxViolationError(f"{relpath!r} is not a regular file")
+            if st.st_nlink > 1:
+                raise SandboxViolationError(
+                    f"{relpath!r} has {st.st_nlink} hard links — refusing (possible link "
+                    "outside the workspace)"
+                )
             if st.st_size > max_bytes:
                 raise SandboxViolationError(
                     f"{relpath!r} is {st.st_size} bytes > limit {max_bytes}"
@@ -203,6 +221,12 @@ class WorkspaceSandbox:
         write is rejected and a fresh approval is required). The replace itself is
         atomic (tmp file in the same directory + os.replace), so readers never see a
         partially written file."""
+        if self.platform == "nt" and not self.allow_writes_on_windows:
+            raise SandboxViolationError(
+                "write operations are disabled by default on Windows: fd-level "
+                "re-verification is unavailable there and realpath containment alone "
+                "is not race-resistant"
+            )
         resolved = self.resolve(relpath)
         data = content.encode("utf-8")
         if len(data) > max_bytes:
@@ -233,6 +257,11 @@ class WorkspaceSandbox:
             st = os.lstat(resolved)
             if not stat.S_ISREG(st.st_mode):
                 raise SandboxViolationError(f"{relpath!r} is not a regular file")
+            if st.st_nlink > 1:
+                raise SandboxViolationError(
+                    f"{relpath!r} has {st.st_nlink} hard links — refusing to write a "
+                    "file that is also linked outside the workspace"
+                )
             if not require_exists:
                 raise SandboxViolationError(
                     f"{relpath!r} already exists \u2014 use fs_update with expected_sha256"

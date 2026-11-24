@@ -603,11 +603,24 @@ tools block; absent env vars keep legacy mode.
 
 - No network tools, HTTP transport, MCP or external API adapters yet (3.1/3.2);
   the adapter interfaces are in place but expose no nonfunctional capability.
-- Regex secret redaction cannot detect every secret shape.
-- Windows: no fd-level re-verification after open (documented); junctions and
-  reparse points are caught by realpath containment.
-- A timed-out/cancelled sync thread cannot be killed: its tool semaphore
+- Windows: fd-level re-verification after open is unavailable and realpath
+  containment alone is not race-resistant, so **write tools (fs_write/fs_update)
+  are disabled by default on Windows** (not even registered; the sandbox also
+  fails closed if called). Reads remain available with the documented residual
+  TOCTOU limitation. A Windows CI job runs the suite (POSIX-only tests self-skip).
+- Files with more than one hard link (`st_nlink > 1`) are refused for read and
+  write, because a second link may point outside the workspace and path
+  containment cannot see it.
+- Regex secret redaction cannot catch every secret shape (documented; it is a
+  mitigation, not a boundary). The authorization hash is always computed on the
+  ORIGINAL arguments; only persisted payloads/previews are redacted.
+- Sync-thread timeout cannot kill the underlying thread: its tool semaphore
   occupancy is held until the thread actually ends, and a mutating tool in
   that state is recorded UNKNOWN, never "safely cancelled".
+- Durable reserves (`tool_reservations`, `physical_reserved`) require RUNNING
+  state AND an unexpired lease — ownership fencing beyond mere state.
+- Approval consumption and the ledger execution-start row commit in ONE atomic
+  SQLite transaction, bound to approval id + args hash + tool version + run +
+  agent + tool + expiry; replay/substitution leave no partial state.
 - Resume revalidates the CURRENT policy/config; completed tool executions are
   never replayed; UNKNOWN mutations need operator resolution.

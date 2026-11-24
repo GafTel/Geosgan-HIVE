@@ -170,10 +170,18 @@ class ApprovalManager:
             raise ApprovalError(f"unknown approval {approval_id!r}")
         return str(row["preview"])
 
-    def consume(self, approval_id: str, *, expected_args_sha256: str) -> bool:
-        """Atomically consume (single-use, hash-bound, expiry-checked)."""
+    def consume(self, approval_id: str, *, expected_args_sha256: str,
+                expected_tool_version: str | None = None,
+                expected_run_id: str | None = None,
+                expected_agent: str | None = None,
+                expected_tool: str | None = None) -> bool:
+        """Atomically consume (single-use, hash-bound, expiry-checked, and bound to
+        the expected tool version / run / agent / tool when given)."""
         return self.store.consume_approval(
-            approval_id, expected_args_sha256=expected_args_sha256
+            approval_id, expected_args_sha256=expected_args_sha256,
+            expected_tool_version=expected_tool_version,
+            expected_run_id=expected_run_id, expected_agent=expected_agent,
+            expected_tool=expected_tool,
         )
 
     def sweep_expired(self) -> int:

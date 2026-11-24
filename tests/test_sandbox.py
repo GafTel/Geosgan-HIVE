@@ -24,8 +24,9 @@ def ws(tmp_path):
     (root / "checkpoints.db").write_bytes(b"\x00" * 16)
     outside = tmp_path / "outside.txt"
     outside.write_text("TOP SECRET OUTSIDE", encoding="utf-8")
-    os.symlink(outside, root / "escape_link.txt")  # symlink escaping the workspace
-    os.symlink(root / "sub", root / "inside_link")  # symlink staying inside
+    if os.name == "posix":  # symlink creation needs privileges on Windows
+        os.symlink(outside, root / "escape_link.txt")  # symlink escaping the workspace
+        os.symlink(root / "sub", root / "inside_link")  # symlink staying inside
     return WorkspaceSandbox(str(root))
 
 
@@ -66,6 +67,7 @@ def test_absolute_path_outside_root_rejected(ws, tmp_path):
     assert r.ok is False and "outside the workspace" in r.error
 
 
+@pytest.mark.skipif(os.name != "posix", reason="symlink creation is POSIX-privileged")
 def test_symlink_escape_rejected_but_inside_symlink_ok(ws):
     gw = make_gw(ws)
     r = gw.execute("fs_read", {"path": "escape_link.txt"}, ctx=ctx())
@@ -120,6 +122,7 @@ def test_listing_cap(ws):
     assert r.ok is False  # beyond tool-level cap
 
 
+@pytest.mark.skipif(os.name != "posix", reason="symlink race is POSIX-only")
 def test_race_between_resolve_and_open_fails_closed(ws, monkeypatch, tmp_path):
     """TOCTOU: if the path is swapped for an escaping symlink after resolution, the
     open fails (O_NOFOLLOW -> ELOOP) or the post-open fd re-verification rejects it."""

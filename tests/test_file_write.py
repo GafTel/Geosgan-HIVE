@@ -73,6 +73,7 @@ def test_update_binds_to_expected_sha256(tmp_path):
     assert (tmp_path / "ws" / "a.txt").read_text() == "tampered"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="symlink creation is POSIX-privileged")
 def test_write_rejects_traversal_outside_denied_names_extensions_symlinks(tmp_path):
     sb = make_sandbox(tmp_path)
     (tmp_path / "outside.txt").write_text("secret")

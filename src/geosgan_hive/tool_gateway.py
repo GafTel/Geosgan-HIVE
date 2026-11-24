@@ -188,9 +188,20 @@ class ToolGateway:
             return None
         return self._store.get(ctx.run_id)
 
+    def _lease_valid(self, run_row: Any) -> bool:
+        """Ownership fencing beyond mere RUNNING state: the row must be RUNNING AND
+        its lease must not have expired (a stale worker must not dispatch/commit)."""
+        if run_row is None or run_row.state.value != "running":
+            return False
+        if run_row.lease_expires_at is not None:
+            now = self._store.now_iso() if self._store is not None else utcnow()
+            if run_row.lease_expires_at <= now:
+                return False
+        return True
+
     def _obtain_approval(self, spec: ToolSpec, ctx: ToolExecutionContext,
                          args: dict[str, Any], adapter: ToolAdapter,
-                         run_context: RunContext | None, wait) -> tuple[str, Any]:
+                         run_context: RunContext | None, wait) -> tuple[Any, Any]:
         """Create a PENDING approval, wait for the operator (NO semaphore held),
         revalidate policy/lease/expiry, then consume atomically. Returns
         (approval_id, run row)."""
@@ -224,19 +235,51 @@ class ToolGateway:
                 mgr.sweep_expired()
                 raise ApprovalError(f"approval {req.approval_id} expired")
             wait(0.2)
-        # revalidate EVERYTHING immediately before execution
+        # revalidate EVERYTHING immediately before execution (consumption happens
+        # atomically WITH the ledger-start row in _start_execution)
         if not self.policy.allows(ctx.agent, spec.name):
             raise ToolPermissionError("policy changed since request — re-denied")
-        digest = args_sha256(args)
         run_row = self._run_lease(ctx)
-        if self.strict:
-            if run_row is None or run_row.state.value != "running":
-                raise ToolPermissionError("run not active — fail closed")
-        if not mgr.consume(req.approval_id, expected_args_sha256=digest):
-            raise ApprovalError(
-                "approval consume failed: replay, argument substitution or expiry"
+        if self.strict and not self._lease_valid(run_row):
+            raise ToolPermissionError("run not active — fail closed")
+        return req, run_row
+
+    def _start_execution(self, spec: ToolSpec, ctx: ToolExecutionContext,
+                         execution_id: str, args: dict[str, Any],
+                         req: Any, run_row: Any) -> str:
+        """Atomically consume the approval AND persist the ledger start row in ONE
+        SQLite transaction (both succeed or neither). Returns the approval id."""
+        mutating = spec.side_effect in (SideEffect.LOCAL_MUTATION, SideEffect.EXTERNAL_MUTATION)
+        if self._store is None or not ctx.run_id:
+            if mutating:
+                raise ToolPermissionError(
+                    f"tool '{spec.name}' mutates state but no durable ledger is "
+                    "configured — failing closed"
+                )
+            return ""
+        if mutating and not self._lease_valid(run_row):
+            raise ToolPermissionError(
+                f"tool '{spec.name}' requires a valid lease owner — failing closed"
             )
-        return req.approval_id, run_row
+        from .tool_spec import canonical_args
+
+        digest = args_sha256(args)
+        ok = self._store.start_execution(
+            execution_id=execution_id, run_id=ctx.run_id, task_id=ctx.task_id,
+            agent=ctx.agent, tool=spec.name, tool_version=spec.version,
+            args_sha256=digest,
+            args_json=redact_secrets(canonical_args(args))[: 8_000],
+            status="started" if mutating else "reserved",
+            approval_id=req.approval_id, expected_args_sha256=digest,
+            lease_owner=(run_row.lease_owner if run_row is not None else None),
+            lease_generation=(run_row.lease_generation if run_row is not None else None),
+        )
+        if not ok:
+            raise ApprovalError(
+                "approval consume failed: replay, argument/version/run/agent "
+                "substitution or expiry"
+            )
+        return req.approval_id
 
     def _ledger_start(self, spec: ToolSpec, ctx: ToolExecutionContext,
                       run_context: RunContext | None, execution_id: str,
@@ -252,11 +295,10 @@ class ToolGateway:
                     "configured — failing closed"
                 )
             return
-        if mutating:
-            if run_row is None or run_row.state.value != "running":
-                raise ToolPermissionError(
-                    f"tool '{spec.name}' requires a valid lease owner — failing closed"
-                )
+        if mutating and not self._lease_valid(run_row):
+            raise ToolPermissionError(
+                f"tool '{spec.name}' requires a valid lease owner — failing closed"
+            )
         from .tool_spec import canonical_args
 
         ok = self._store.ledger_start(
@@ -297,7 +339,6 @@ class ToolGateway:
         started = time.perf_counter()
         reg = None
         run_row = None
-        approval_id = ""
         try:
             self._check_context(ctx, run_context)
             reg = self.catalog.get(tool)
@@ -316,13 +357,14 @@ class ToolGateway:
                         f"tool '{tool}' requires approval but no ApprovalManager is "
                         "configured — failing closed"
                     )
-                approval_id, run_row = self._obtain_approval(
+                req, run_row = self._obtain_approval(
                     spec, ctx, validated, reg.adapter, run_context, self._sleep
                 )
+                self._start_execution(spec, ctx, execution_id, validated, req, run_row)
             else:
                 run_row = self._run_lease(ctx)
-            self._ledger_start(spec, ctx, run_context, execution_id, validated,
-                               approval_id, run_row)
+                self._ledger_start(spec, ctx, run_context, execution_id, validated,
+                                   "", run_row)
             output = self._run_sync(reg.adapter, validated, ctx, spec, run_context)
             text, nbytes, truncated = self._shape_output(spec, output)
             self._ledger_finish(spec, execution_id, "completed", run_row, output=text)
@@ -402,7 +444,6 @@ class ToolGateway:
         started = time.perf_counter()
         reg = None
         run_row = None
-        approval_id = ""
         try:
             self._check_context(ctx, run_context)
             reg = self.catalog.get(tool)
@@ -422,13 +463,14 @@ class ToolGateway:
                         "configured — failing closed"
                     )
 
-                approval_id, run_row = await self._obtain_approval_async(
+                req, run_row = await self._obtain_approval_async(
                     spec, ctx, validated, reg.adapter, run_context
                 )
+                self._start_execution(spec, ctx, execution_id, validated, req, run_row)
             else:
                 run_row = self._run_lease(ctx)
-            self._ledger_start(spec, ctx, run_context, execution_id, validated,
-                               approval_id, run_row)
+                self._ledger_start(spec, ctx, run_context, execution_id, validated,
+                                   "", run_row)
             output = await self._run_async(reg.adapter, validated, ctx, spec, run_context)
             text, nbytes, truncated = self._shape_output(spec, output)
             self._ledger_finish(spec, execution_id, "completed", run_row, output=text)
@@ -467,7 +509,7 @@ class ToolGateway:
 
     async def _obtain_approval_async(self, spec: ToolSpec, ctx: ToolExecutionContext,
                                      args: dict[str, Any], adapter: ToolAdapter,
-                                     run_context: RunContext | None) -> tuple[str, Any]:
+                                     run_context: RunContext | None) -> tuple[Any, Any]:
         mgr = self.approval_manager
         assert mgr is not None
         actx = self._approval_context(adapter, args)
@@ -499,15 +541,10 @@ class ToolGateway:
             await self._async_sleep(0.2)
         if not self.policy.allows(ctx.agent, spec.name):
             raise ToolPermissionError("policy changed since request — re-denied")
-        digest = args_sha256(args)
         run_row = self._run_lease(ctx)
-        if self.strict and (run_row is None or run_row.state.value != "running"):
+        if self.strict and not self._lease_valid(run_row):
             raise ToolPermissionError("run not active — fail closed")
-        if not mgr.consume(req.approval_id, expected_args_sha256=digest):
-            raise ApprovalError(
-                "approval consume failed: replay, argument substitution or expiry"
-            )
-        return req.approval_id, run_row
+        return req, run_row
 
     async def _run_async(self, adapter: ToolAdapter, args: dict[str, Any],
                          ctx: ToolExecutionContext, spec: ToolSpec,
