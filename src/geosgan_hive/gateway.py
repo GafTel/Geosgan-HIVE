@@ -190,7 +190,12 @@ class ModelGateway:
             )
         store = self._durable_store
         if store is not None and run_id is not None:
-            if not store.reserve_physical_durable(run_id):
+            row = store.get(run_id)
+            owner = row.lease_owner if row is not None else None
+            gen = row.lease_generation if row is not None else None
+            if not store.reserve_physical_durable(
+                run_id, lease_owner=owner, lease_generation=gen
+            ):
                 ctx.release_physical_reservation()
                 raise CheckpointError(
                     f"run {run_id!r} is no longer active (suspended/terminal/recovered); "

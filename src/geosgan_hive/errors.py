@@ -183,3 +183,55 @@ class DelegationRejectedError(DelegationError):
     """A handoff request was rejected by policy or permissions."""
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: tool engine errors
+# ---------------------------------------------------------------------------
+
+
+class ToolError(HiveError):
+    """Base error for the Tool Engine. Gateway converts these into structured
+    ToolResult errors (the agent loop continues); they never execute anything."""
+
+
+class ToolNotFoundError(ToolError):
+    """Unknown tool name — fail closed."""
+
+
+class ToolPermissionError(ToolError):
+    """Denied by policy / missing security context — fail closed."""
+
+
+class ToolValidationError(ToolError):
+    """Arguments failed schema or size validation (incl. unexpected arguments)."""
+
+
+class ToolBudgetExceededError(ToolError):
+    """A tool budget (run/agent/tool) was exhausted — run-terminal for tools."""
+
+    error_class = ErrorClass.BUDGET
+    terminal = True
+
+
+class ToolTimeoutError(ToolError):
+    """The tool execution exceeded its timeout. For mutating tools the outcome is
+    UNCERTAIN (a sync thread cannot be killed); occupancy is kept until the
+    underlying operation actually terminates."""
+
+
+class ApprovalRequiredError(ToolError):
+    """The action requires human approval; carries the pending approval id."""
+
+    def __init__(self, message: str, *, approval_id: str = "") -> None:
+        super().__init__(message)
+        self.approval_id = approval_id
+
+
+class ApprovalError(ToolError):
+    """Approval lifecycle failure (unknown/expired/denied/replay/substitution)."""
+
+
+class SandboxViolationError(ToolError):
+    """A file operation violated workspace isolation (traversal, symlink escape,
+    special file, denied name, outside root) — fail closed."""

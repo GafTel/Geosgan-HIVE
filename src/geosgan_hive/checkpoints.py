@@ -13,7 +13,52 @@ from typing import Any
 
 from .errors import CheckpointError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
+
+#: Phase 3 (T4): durable tool-execution ledger + human approvals
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tool_executions (
+    execution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    agent TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tool_version TEXT NOT NULL DEFAULT '1',
+    args_sha256 TEXT NOT NULL,
+    args_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    idempotency_key TEXT,
+    approval_id TEXT,
+    lease_owner TEXT,
+    lease_generation INTEGER,
+    requested_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    result_sha256 TEXT,
+    error TEXT,
+    output_bytes INTEGER
+);
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    agent TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tool_version TEXT NOT NULL DEFAULT '1',
+    operation TEXT NOT NULL,
+    target TEXT,
+    args_json TEXT NOT NULL,
+    args_sha256 TEXT NOT NULL,
+    preconditions_json TEXT NOT NULL DEFAULT '{}',
+    preview TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    decided_by TEXT,
+    decided_at TEXT,
+    consumed_at TEXT
+);
+"""
 
 
 class ExecutionState(StrEnum):
@@ -66,6 +111,8 @@ class RunCheckpoint:
     updated_at: str
     root_task_id: str | None = field(default=None)
     physical_reserved: int = field(default=0)  # durable, monotonic per-dispatch count
+    lease_generation: int = field(default=0)  # bumped on every claim (fencing)
+    tool_reservations: int = field(default=0)  # durable tool-execution reservations
 
 
 _SCHEMA = """
@@ -96,7 +143,9 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     root_task_id TEXT,
-    physical_reserved INTEGER NOT NULL DEFAULT 0
+    physical_reserved INTEGER NOT NULL DEFAULT 0,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    tool_reservations INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -141,6 +190,7 @@ class CheckpointStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            self._conn.executescript(_LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -149,13 +199,52 @@ class CheckpointStore:
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(row["value"]) != SCHEMA_VERSION:
-                raise CheckpointError(
-                    f"checkpoint database {self.path!r} has schema_version {row['value']}, "
-                    f"expected {SCHEMA_VERSION}; refusing to open an incompatible store"
-                )
+            else:
+                v = int(row["value"])
+                if v > SCHEMA_VERSION:
+                    raise CheckpointError(
+                        f"checkpoint database {self.path!r} has schema_version {v}, "
+                        f"expected {SCHEMA_VERSION}; refusing to open an "
+                        "incompatible store"
+                    )
+                while v < SCHEMA_VERSION:  # versioned forward migrations only
+                    if v == 3:
+                        self._migrate_3_to_4()
+                    elif v == 4:
+                        self._migrate_4_to_5()
+                    else:
+                        raise CheckpointError(
+                            f"checkpoint database {self.path!r} has schema_version {v}, "
+                            f"expected {SCHEMA_VERSION}; refusing to open an "
+                            "incompatible store"
+                        )
+                    v += 1
         self._harden_permissions()
         self._recover_crashed()
+
+    def _migrate_3_to_4(self) -> None:
+        """Versioned migration v3 -> v4: adds lease_generation (ownership fencing by
+        owner AND generation) and tool_reservations (durable per-dispatch tool budget
+        reservations). Idempotent; runs inside the open transaction."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "lease_generation" not in cols:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "tool_reservations" not in cols:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN tool_reservations INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_4_to_5(self) -> None:
+        """v4 -> v5: durable tool-execution ledger + approval records (Phase 3 T4)."""
+        self._conn.executescript(_LEDGER_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
 
     def _harden_permissions(self) -> None:
         """Best-effort: owner-only permissions on the database files (POSIX).
@@ -238,6 +327,8 @@ class CheckpointStore:
             updated_at=row["updated_at"],
             root_task_id=row["root_task_id"],
             physical_reserved=int(row["physical_reserved"]),
+            lease_generation=int(row["lease_generation"]),
+            tool_reservations=int(row["tool_reservations"]),
         )
 
     def get(self, run_id: str) -> RunCheckpoint | None:
@@ -326,7 +417,33 @@ class CheckpointStore:
         assert cp is not None
         return cp
 
-    def reserve_physical_durable(self, run_id: str) -> bool:
+    def reserve_tool_durable(self, run_id: str, *, lease_owner: str | None = None,
+                             lease_generation: int | None = None) -> bool:
+        """Durably reserve ONE tool execution BEFORE the side effect is dispatched
+        (Phase 3). Single atomic transaction, monotonic SQL increment (never
+        decreases). Fenced by expected execution state (RUNNING), lease validity
+        (unexpired) AND — when provided — the ACTUAL lease owner and generation, so
+        a stale worker cannot dispatch after another worker acquired a fresh lease.
+        A crash after this commit conservatively retains the reservation."""
+        now = self.now_iso()
+        cond = ["run_id=?", "state=?", "lease_expires_at > ?"]
+        params: list[Any] = [run_id, ExecutionState.RUNNING.value, now]
+        if lease_owner is not None:
+            cond.append("lease_owner=?")
+            params.append(lease_owner)
+        if lease_generation is not None:
+            cond.append("lease_generation=?")
+            params.append(lease_generation)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET tool_reservations = tool_reservations + 1, updated_at=? "
+                "WHERE " + " AND ".join(cond),
+                [now, *params],
+            )
+            return cur.rowcount == 1
+
+    def reserve_physical_durable(self, run_id: str, *, lease_owner: str | None = None,
+                                 lease_generation: int | None = None) -> bool:
         """Durably commit ONE physical dispatch reservation to SQLite BEFORE the
         provider request is sent. Single atomic transaction; the counter is
         monotonic (SQL increment, never a read-modify-write), so concurrent
@@ -335,13 +452,22 @@ class CheckpointStore:
         suspended/terminal (lease lost or recovered), dispatch is blocked.
 
         A crash after this commit but before dispatch conservatively retains the
-        reservation. Returns False when the run row is gone or not RUNNING."""
+        reservation. Returns False when the run row is gone, not RUNNING, or the
+        lease has expired (ownership fencing beyond mere RUNNING state)."""
         now = self.now_iso()
+        cond = ["run_id=?", "state=?", "lease_expires_at > ?"]
+        params: list[Any] = [run_id, ExecutionState.RUNNING.value, now]
+        if lease_owner is not None:
+            cond.append("lease_owner=?")
+            params.append(lease_owner)
+        if lease_generation is not None:
+            cond.append("lease_generation=?")
+            params.append(lease_generation)
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE runs SET physical_reserved = physical_reserved + 1, updated_at=? "
-                "WHERE run_id=? AND state=?",
-                (now, run_id, ExecutionState.RUNNING.value),
+                "WHERE " + " AND ".join(cond),
+                [now, *params],
             )
             return cur.rowcount == 1
 
@@ -423,7 +549,8 @@ class CheckpointStore:
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "UPDATE runs SET state=?, updated_at=?, lease_owner=?, lease_expires_at=? "
+                "UPDATE runs SET state=?, updated_at=?, lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1 "
                 "WHERE run_id=? AND state IN (?, ?) AND lease_owner=?",
                 (
                     ExecutionState.RUNNING.value,
@@ -444,6 +571,7 @@ class CheckpointStore:
         run_id: str,
         *,
         owner: str,
+        lease_generation: int | None = None,
         result: str,
         counters_json: str,
         steps_json: str,
@@ -457,7 +585,8 @@ class CheckpointStore:
                 "UPDATE runs SET state=?, result=?, error=NULL, counters_json=?, "
                 "steps_json=?, route_json=?, transcript_json=?, step_count=?, "
                 "lease_owner=NULL, lease_expires_at=NULL, updated_at=? "
-                "WHERE run_id=? AND lease_owner=?",
+                "WHERE run_id=? AND lease_owner=?"
+                + (" AND lease_generation=?" if lease_generation is not None else ""),
                 (
                     ExecutionState.COMPLETED.value,
                     result,
@@ -469,6 +598,7 @@ class CheckpointStore:
                     now,
                     run_id,
                     owner,
+                    *([lease_generation] if lease_generation is not None else []),
                 ),
             )
             if cur.rowcount != 1:
@@ -482,6 +612,7 @@ class CheckpointStore:
         *,
         owner: str | None,
         error: str,
+        lease_generation: int | None = None,
         counters_json: str = "{}",
         steps_json: str = "[]",
         route_json: str = "[]",
@@ -505,11 +636,13 @@ class CheckpointStore:
                 cur = self._conn.execute(
                     "UPDATE runs SET state=?, error=?, counters_json=?, steps_json=?, "
                     "route_json=?, transcript_json=?, step_count=?, lease_owner=NULL, "
-                    "lease_expires_at=NULL, updated_at=? WHERE run_id=? AND lease_owner=?",
+                    "lease_expires_at=NULL, updated_at=? WHERE run_id=? AND lease_owner=?"
+                    + (" AND lease_generation=?" if lease_generation is not None else ""),
                     (
                         ExecutionState.FAILED.value, error, counters_json, steps_json,
                         route_json, self._transcript_or_none(transcript_json),
                         step_count, now, run_id, owner,
+                        *([lease_generation] if lease_generation is not None else []),
                     ),
                 )
             if cur.rowcount != 1:
@@ -542,7 +675,8 @@ class CheckpointStore:
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "UPDATE runs SET lease_owner=?, lease_expires_at=?, updated_at=? "
+                "UPDATE runs SET lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1, updated_at=? "
                 "WHERE run_id=? AND state IN (?, ?) "
                 "AND (lease_owner IS NULL OR lease_expires_at <= ?)",
                 (
@@ -577,6 +711,326 @@ class CheckpointStore:
                 (now, run_id, owner),
             )
 
+    # ---- Phase 3: tool execution ledger ----
+
+    def _verify_lease_locked(self, run_id: str, lease_owner: str | None,
+                             lease_generation: int | None) -> bool:
+        """Inside an open transaction: the run must be RUNNING with an unexpired
+        lease AND (when given) match the expected owner AND generation. This is the
+        atomic ownership-fencing check used by every durable tool dispatch and
+        execution-start transition."""
+        row = self._conn.execute(
+            "SELECT state, lease_owner, lease_generation, lease_expires_at FROM runs "
+            "WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["state"] != ExecutionState.RUNNING.value:
+            return False
+        if row["lease_expires_at"] is not None and row["lease_expires_at"] <= self.now_iso():
+            return False
+        if lease_owner is not None and row["lease_owner"] != lease_owner:
+            return False
+        if lease_generation is not None and int(row["lease_generation"]) != int(lease_generation):
+            return False
+        return True
+
+    def ledger_start(
+        self,
+        *,
+        execution_id: str,
+        run_id: str,
+        agent: str,
+        tool: str,
+        args_sha256: str,
+        status: str,
+        task_id: str | None = None,
+        tool_version: str = "1",
+        args_json: str = "{}",
+        idempotency_key: str | None = None,
+        approval_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Insert a ledger row (execution-start is persisted BEFORE the side effect).
+        Single atomic transaction; duplicate execution_id is rejected (no double
+        dispatch). For mutating ops the row is fenced by lease owner+generation."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            if lease_owner is not None and not self._verify_lease_locked(
+                run_id, lease_owner, lease_generation
+            ):
+                return False  # stale worker / lost lease: no dispatch, no ledger row
+            try:
+                self._conn.execute(
+                    "INSERT INTO tool_executions (execution_id, run_id, task_id, agent, "
+                    "tool, tool_version, args_sha256, args_json, status, idempotency_key, "
+                    "approval_id, lease_owner, lease_generation, requested_at, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution_id, run_id, task_id, agent, tool, tool_version,
+                        args_sha256, args_json, status, idempotency_key, approval_id,
+                        lease_owner, lease_generation, now,
+                        now if status == ToolExecutionStatus.STARTED.value else None,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False  # duplicate execution id -> never double-dispatch
+            return True
+
+    def ledger_update(
+        self,
+        execution_id: str,
+        *,
+        status: str,
+        result_sha256: str | None = None,
+        error: str | None = None,
+        output_bytes: int | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Transition a ledger row; fenced by owner+generation when provided (stale
+        workers cannot commit results after losing ownership)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            if lease_owner is not None:
+                cur = self._conn.execute(
+                    "UPDATE tool_executions SET status=?, finished_at=?, result_sha256=?, "
+                    "error=?, output_bytes=? "
+                    "WHERE execution_id=? AND lease_owner=? AND lease_generation=?",
+                    (status, now, result_sha256, error, output_bytes,
+                     execution_id, lease_owner, lease_generation),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE tool_executions SET status=?, finished_at=?, result_sha256=?, "
+                    "error=?, output_bytes=? WHERE execution_id=?",
+                    (status, now, result_sha256, error, output_bytes, execution_id),
+                )
+            return cur.rowcount == 1
+
+    def ledger_get(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tool_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+        return _ledger_row_to_dict(row) if row else None
+
+    def ledger_list(
+        self, *, run_id: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            query = "SELECT * FROM tool_executions"
+            cond, params = [], []
+            if run_id is not None:
+                cond.append("run_id=?")
+                params.append(run_id)
+            if status is not None:
+                cond.append("status=?")
+                params.append(status)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY requested_at"
+            rows = self._conn.execute(query, params).fetchall()
+        return [_ledger_row_to_dict(r) for r in rows]
+
+    def ledger_resolve(
+        self, execution_id: str, *, decision: str, operator: str, evidence: str
+    ) -> bool:
+        """Operator resolution of an UNKNOWN outcome: records the decision + evidence
+        without claiming the side effect was verified."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE tool_executions SET status=?, error=?, finished_at=? "
+                "WHERE execution_id=? AND status=?",
+                (
+                    ToolExecutionStatus.COMPLETED.value if decision == "completed"
+                    else ToolExecutionStatus.FAILED.value,
+                    f"operator-resolved by {operator}: {decision}; evidence: {evidence}",
+                    now,
+                    execution_id,
+                    ToolExecutionStatus.UNKNOWN.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    # ---- Phase 3: approvals ----
+    def create_approval(
+        self,
+        *,
+        approval_id: str,
+        run_id: str,
+        agent: str,
+        tool: str,
+        operation: str,
+        args_json: str,
+        args_sha256: str,
+        preview: str,
+        expires_at: str,
+        task_id: str | None = None,
+        tool_version: str = "1",
+        target: str | None = None,
+        preconditions_json: str = "{}",
+    ) -> None:
+        now = self.now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO approvals (approval_id, run_id, task_id, agent, tool, "
+                "tool_version, operation, target, args_json, args_sha256, "
+                "preconditions_json, preview, status, requested_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    approval_id, run_id, task_id, agent, tool, tool_version, operation,
+                    target, args_json, args_sha256, preconditions_json, preview,
+                    ApprovalState.PENDING.value, now, expires_at,
+                ),
+            )
+
+    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approvals WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+        return {k: row[k] for k in row.keys()} if row else None
+
+    def list_approvals(
+        self, *, run_id: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            query = "SELECT * FROM approvals"
+            cond, params = [], []
+            if run_id is not None:
+                cond.append("run_id=?")
+                params.append(run_id)
+            if status is not None:
+                cond.append("status=?")
+                params.append(status)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY requested_at"
+            rows = self._conn.execute(query, params).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def decide_approval(
+        self, approval_id: str, *, decision: str, operator: str
+    ) -> bool:
+        """Operator decision (APPROVED/DENIED/CANCELLED). Only PENDING rows can be
+        decided; the decider must be a trusted operator id (never an agent/model)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, decided_by=?, decided_at=? "
+                "WHERE approval_id=? AND status=? AND expires_at > ?",
+                (decision, operator, now, approval_id, ApprovalState.PENDING.value, now),
+            )
+            return cur.rowcount == 1
+
+    def consume_approval(
+        self, approval_id: str, *, expected_args_sha256: str, now_iso: str | None = None,
+        expected_tool_version: str | None = None, expected_run_id: str | None = None,
+        expected_agent: str | None = None, expected_tool: str | None = None,
+        expected_task_id: str | None = None,
+    ) -> bool:
+        """Atomically consume an APPROVED approval: single transaction, single-use,
+        bound to the exact argument hash (substitution -> rejected), not expired.
+        When the expected_* bindings are given, they are checked in the SAME
+        transaction, so an approval can never be consumed for a different
+        tool version / run / agent / tool. This is the durable execution-start
+        transition companion (see start_execution for the fully atomic variant)."""
+        now = now_iso or self.now_iso()
+        cond = ["approval_id=?", "status=?", "args_sha256=?", "expires_at > ?"]
+        params: list[Any] = [
+            approval_id, ApprovalState.APPROVED.value, expected_args_sha256, now,
+        ]
+        if expected_tool_version is not None:
+            cond.append("tool_version=?")
+            params.append(expected_tool_version)
+        if expected_run_id is not None:
+            cond.append("run_id=?")
+            params.append(expected_run_id)
+        if expected_agent is not None:
+            cond.append("agent=?")
+            params.append(expected_agent)
+        if expected_tool is not None:
+            cond.append("tool=?")
+            params.append(expected_tool)
+        if expected_task_id is not None:
+            cond.append("task_id=?")
+            params.append(expected_task_id)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, consumed_at=? WHERE " + " AND ".join(cond),
+                [ApprovalState.CONSUMED.value, now, *params],
+            )
+            return cur.rowcount == 1
+
+    def start_execution(
+        self, *, execution_id: str, run_id: str, agent: str, tool: str,
+        args_sha256: str, status: str, approval_id: str, expected_args_sha256: str,
+        task_id: str | None = None, tool_version: str = "1", args_json: str = "{}",
+        lease_owner: str | None = None, lease_generation: int | None = None,
+        expected_task_id: str | None = None,
+    ) -> bool:
+        """Atomic durable execution-start: consume the approval AND insert the ledger
+        row in ONE transaction (both succeed or neither). The approval consume is
+        bound to approval id + APPROVED state + exact args hash + tool version + run
+        + agent + tool + not expired. A duplicate execution_id aborts before any
+        write (no double dispatch, approval NOT consumed)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            if self._conn.execute(
+                "SELECT 1 FROM tool_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone():
+                return False
+            # atomic ownership fencing: state + lease expiry + owner + generation
+            if not self._verify_lease_locked(run_id, lease_owner, lease_generation):
+                return False
+            cond = [
+                "approval_id=?", "status=?", "args_sha256=?", "tool_version=?",
+                "run_id=?", "agent=?", "tool=?", "expires_at > ?",
+            ]
+            params: list[Any] = [
+                approval_id, ApprovalState.APPROVED.value, expected_args_sha256,
+                tool_version, run_id, agent, tool, now,
+            ]
+            if expected_task_id is not None:
+                cond.append("task_id=?")
+                params.append(expected_task_id)
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, consumed_at=? WHERE " + " AND ".join(cond),
+                [ApprovalState.CONSUMED.value, now, *params],
+            )
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "INSERT INTO tool_executions (execution_id, run_id, task_id, agent, "
+                "tool, tool_version, args_sha256, args_json, status, approval_id, "
+                "lease_owner, lease_generation, requested_at, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    execution_id, run_id, task_id, agent, tool, tool_version,
+                    args_sha256, args_json, status, approval_id, lease_owner,
+                    lease_generation, now,
+                    now if status == ToolExecutionStatus.STARTED.value else None,
+                ),
+            )
+            return True
+
+    def sweep_expired_approvals(self) -> int:
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=? WHERE status IN (?, ?) AND expires_at <= ?",
+                (
+                    ApprovalState.EXPIRED.value,
+                    ApprovalState.PENDING.value,
+                    ApprovalState.APPROVED.value,
+                    now,
+                ),
+            )
+            return cur.rowcount
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -588,3 +1042,34 @@ def steps_to_json(steps: list[dict[str, Any]]) -> str:
 
 def counters_to_json(counters: dict[str, Any]) -> str:
     return json.dumps(counters, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (T4): durable tool-execution ledger
+# ---------------------------------------------------------------------------
+
+class ApprovalState(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    CONSUMED = "consumed"
+    CANCELLED = "cancelled"
+
+
+class ToolExecutionStatus(StrEnum):
+    REJECTED = "rejected"
+    WAITING_APPROVAL = "waiting_approval"
+    RESERVED = "reserved"
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"  # cancelled BEFORE execution
+    UNKNOWN = "unknown"  # outcome uncertain (crash/timeout after side effect started)
+
+
+def _ledger_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
+
+
+# methods are attached to CheckpointStore below (kept here for cohesion)

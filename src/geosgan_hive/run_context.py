@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from .messages import Message
+from .tool_spec import ToolBudgets
 
 if TYPE_CHECKING:
     from .usage import UsageTracker
@@ -55,6 +56,12 @@ class EventType(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     TASK_SUSPENDED = "task_suspended"
     TASK_RESUMED = "task_resumed"
+    # Phase 3: tool engine events
+    TOOL_EXECUTED = "tool_executed"
+    TOOL_REJECTED = "tool_rejected"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_DECIDED = "approval_decided"
+    TOOL_EXECUTION_RESOLVED = "tool_execution_resolved"
 
 
 class CollaborationEvent(BaseModel):
@@ -109,6 +116,7 @@ class RunContext:
     policy: CollaborationPolicy
     tracker: UsageTracker | None = None
     closed: bool = field(default=False)
+    tool_budgets: ToolBudgets = field(default_factory=ToolBudgets)
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -121,6 +129,13 @@ class RunContext:
         self._physical_reserved = 0
         self._semaphore: asyncio.Semaphore | None = None
         self._sync_semaphore: threading.Semaphore | None = None
+        # Phase 3: tool budgets + a SEPARATE tool-execution semaphore (model slots
+        # are never held while executing tools or waiting for approval)
+        self._tool_calls = 0
+        self._tool_calls_agent: dict[str, int] = {}
+        self._tool_calls_tool: dict[str, int] = {}
+        self._tool_semaphore: asyncio.Semaphore | None = None
+        self._sync_tool_semaphore: threading.Semaphore | None = None
 
     # ---- model-call budget (run-wide, atomic) ----
     def reserve_model_call(self, task_id: str | None = None) -> bool:
@@ -210,6 +225,43 @@ class RunContext:
         with self._lock:
             return self._physical_reserved
 
+    # ---- tool budgets (run-wide, per-agent, per-tool; atomic check+reserve) ----
+    def reserve_tool_call(self, *, agent: str, tool: str) -> tuple[bool, str | None]:
+        """Atomically reserve one tool call. A reservation is consumed when the call
+        is DISPATCHED (validation/policy rejections happen before this and consume
+        nothing). Enforces the run-wide, per-agent and per-tool caps in one lock."""
+        with self._lock:
+            b = self.tool_budgets
+            if self._tool_calls >= b.max_tool_calls_per_run:
+                return False, f"tool-call limit per run ({b.max_tool_calls_per_run}) reached"
+            if self._tool_calls_agent.get(agent, 0) >= b.max_tool_calls_per_agent:
+                return False, (
+                    f"tool-call limit for agent '{agent}' ({b.max_tool_calls_per_agent}) reached"
+                )
+            if self._tool_calls_tool.get(tool, 0) >= b.max_tool_calls_per_tool:
+                return False, (
+                    f"tool-call limit for tool '{tool}' ({b.max_tool_calls_per_tool}) reached"
+                )
+            self._tool_calls += 1
+            self._tool_calls_agent[agent] = self._tool_calls_agent.get(agent, 0) + 1
+            self._tool_calls_tool[tool] = self._tool_calls_tool.get(tool, 0) + 1
+            return True, None
+
+    def release_tool_reservation(self, *, agent: str, tool: str) -> None:
+        """Roll back a reservation when the durable commit failed before dispatch."""
+        with self._lock:
+            if self._tool_calls > 0:
+                self._tool_calls -= 1
+            if self._tool_calls_agent.get(agent, 0) > 0:
+                self._tool_calls_agent[agent] -= 1
+            if self._tool_calls_tool.get(tool, 0) > 0:
+                self._tool_calls_tool[tool] -= 1
+
+    @property
+    def tool_calls(self) -> int:
+        with self._lock:
+            return self._tool_calls
+
     def counters_snapshot(self) -> dict:
         """Persistable budget counters (for durable checkpoints)."""
         with self._lock:
@@ -218,6 +270,11 @@ class RunContext:
                 "physical_reserved": self._physical_reserved,
                 "handoffs": self._handoffs,
                 "agent_calls": dict(self._agent_calls),
+                "tool_calls": {
+                    "total": self._tool_calls,
+                    "per_agent": dict(self._tool_calls_agent),
+                    "per_tool": dict(self._tool_calls_tool),
+                },
             }
 
     def restore_counters(self, snapshot: dict) -> None:
@@ -228,6 +285,10 @@ class RunContext:
             self._physical_reserved = int(snapshot.get("physical_reserved", 0))
             self._handoffs = int(snapshot.get("handoffs", 0))
             self._agent_calls = {k: int(v) for k, v in snapshot.get("agent_calls", {}).items()}
+            tc = snapshot.get("tool_calls", {})
+            self._tool_calls = int(tc.get("total", 0))
+            self._tool_calls_agent = {k: int(v) for k, v in tc.get("per_agent", {}).items()}
+            self._tool_calls_tool = {k: int(v) for k, v in tc.get("per_tool", {}).items()}
 
     @property
     def physical_requests(self) -> int:
@@ -376,6 +437,24 @@ class RunContext:
         if self._sync_semaphore is None:
             self._sync_semaphore = threading.Semaphore(self.policy.max_parallel_agents)
         return self._sync_semaphore
+
+    def semaphore_tool(self) -> asyncio.Semaphore:
+        """Bounds CONCURRENT TOOL executions (async). Separate from the model-request
+        semaphore; acquired only around the execution itself, never during approval
+        waits, so nested delegation cannot deadlock."""
+        if self._tool_semaphore is None:
+            self._tool_semaphore = asyncio.Semaphore(
+                self.tool_budgets.max_concurrent_tool_executions
+            )
+        return self._tool_semaphore
+
+    def sync_tool_semaphore(self) -> threading.Semaphore:
+        """Same bound for the synchronous tool path."""
+        if self._sync_tool_semaphore is None:
+            self._sync_tool_semaphore = threading.Semaphore(
+                self.tool_budgets.max_concurrent_tool_executions
+            )
+        return self._sync_tool_semaphore
 
     def close(self) -> None:
         with self._lock:

@@ -112,3 +112,24 @@ agents:
 #   persist_mode: metadata_only       # metadata_only | resumable (resume needs resumable)
 #   lease_ttl_seconds: 60
 #   worker_poll_seconds: 5
+
+# Phase 3 (v0.5.0): TOOL ENGINE — OPT-IN, disabled by default.
+# Absent `tools:` block = legacy mode: the previously authorized built-in tools
+# (calculator, current_datetime, word_count) keep working per agent permissions.
+# An explicit block with `enabled: []` DENIES ALL tools. New capabilities are
+# disabled unless listed. The ToolGateway is always the single execution boundary.
+# tools:
+#   enabled: [calculator, word_count, json_parse, csv_parse, fs_list, fs_read, fs_metadata]
+#   workspace_root: workspace          # file tools are sandboxed to this root
+#   allow_write: false                 # fs_write/fs_update need this + human approval
+#   write_extensions: [.txt, .md]      # bounded plaintext documents only
+#   approval:                          # durable approvals, CLI-only operator decisions
+#     expiry_seconds: 600
+#     preview_bytes: 2000
+#   budgets:                           # independent of model-call/physical-request budgets
+#     max_tool_calls_per_run: 50
+#     max_tool_calls_per_agent: 20
+#     max_tool_calls_per_tool: 10
+#     max_concurrent_tool_executions: 4
+#     max_tool_execution_seconds: 30
+#   deny_name_patterns: [.env, ".env.*", "*.db", "*.db-wal", "*.db-shm", .git]

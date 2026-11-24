@@ -93,10 +93,20 @@ from .run_context import (
     TaskNode,
     TaskStatus,
 )
+from .tool_gateway import (
+    BuiltinToolAdapter,
+    ToolExecutionContext,
+    ToolGateway,
+    ToolResult,
+    redact_secrets,
+)
+from .tool_policy import ToolPolicy, ToolPolicyEntry, build_policy
+from .tool_registry import RegisteredTool, ToolAdapter, ToolCatalog
+from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical_args, validate_args
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Agent",
@@ -164,12 +174,24 @@ __all__ = [
     "RunContext",
     "ServiceUnavailableError",
     "Settings",
+    "SideEffect",
     "Supervisor",
     "SupervisorSpec",
     "TaskNode",
     "TaskStatus",
+    "BuiltinToolAdapter",
+    "RegisteredTool",
+    "ToolAdapter",
+    "ToolBudgets",
     "ToolCall",
+    "ToolCatalog",
+    "ToolExecutionContext",
+    "ToolGateway",
+    "ToolPolicy",
+    "ToolPolicyEntry",
     "ToolRegistry",
+    "ToolResult",
+    "ToolSpec",
     "TransientGatewayError",
     "UnknownProviderError",
     "UsageRecord",
@@ -177,9 +199,12 @@ __all__ = [
     "UsageTracker",
     "apply_env_overrides",
     "arun_agent",
+    "args_sha256",
     "build_agent",
+    "build_policy",
     "build_supervisor",
     "build_team",
+    "canonical_args",
     "check_run_limits",
     "classify_error",
     "cost_tier",
@@ -192,5 +217,7 @@ __all__ = [
     "parse_delegation_call",
     "parse_model",
     "parse_tool_call",
+    "redact_secrets",
     "resolve_credentials",
+    "validate_args",
 ]

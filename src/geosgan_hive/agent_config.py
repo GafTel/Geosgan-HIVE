@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from .errors import ConfigError, HiveError
 from .fallback import FallbackMode, FallbackPolicy
 from .providers import parse_model
 from .run_context import CollaborationPolicy
+from .tool_spec import ToolBudgets
 
 #: Core roles of the HIVE. The default config defines exactly these five.
 CORE_ROLES = ("supervisor", "researcher", "developer", "analyst", "reviewer")
@@ -93,6 +95,51 @@ class CheckpointConfig(BaseModel):
         return value
 
 
+class ApprovalConfig(BaseModel):
+    """Human-approval policy for sensitive tool actions (CLI-only in Phase 3)."""
+
+    expiry_seconds: float = Field(default=600.0, gt=0)
+    preview_bytes: int = Field(default=2_000, ge=1)  # bounded preview shown to the operator
+
+
+class ToolsConfig(BaseModel):
+    """Tool Engine configuration (Phase 3).
+
+    Distinguishes ABSENT configuration (HiveConfig.tools is None -> legacy mode:
+    previously authorized built-in tools keep working) from an EXPLICIT block
+    (enabled defaults to [] -> deny ALL tools unless listed). New capabilities are
+    disabled by default. No credentials ever live here.
+    """
+
+    enabled: list[str] = Field(default_factory=list)  # empty = deny all tools
+    workspace_root: str = "workspace"  # file tools are sandboxed to this root
+    allow_write: bool = False  # fs_write/fs_update additionally need this + approval
+    #: extensions fs_write/fs_update may create/modify (bounded plaintext docs)
+    write_extensions: list[str] = Field(default_factory=lambda: [".txt", ".md"])
+    budgets: ToolBudgets = Field(default_factory=ToolBudgets)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    #: name patterns file tools must never expose (credential files, checkpoint DBs)
+    deny_name_patterns: list[str] = Field(
+        default_factory=lambda: [".env", ".env.*", "*.db", "*.db-wal", "*.db-shm", ".git"]
+    )
+
+    @field_validator("enabled")
+    @classmethod
+    def _validate_enabled(cls, value: list[str]) -> list[str]:
+        for name in value:
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                raise ValueError(f"invalid tool name {name!r}")
+        return value
+
+    @field_validator("write_extensions")
+    @classmethod
+    def _validate_write_extensions(cls, value: list[str]) -> list[str]:
+        for ext in value:
+            if not re.fullmatch(r"\.[a-z0-9]+", ext, re.IGNORECASE):
+                raise ValueError(f"invalid write extension {ext!r} (expected e.g. '.txt')")
+        return [e.lower() for e in value]
+
+
 class HiveConfig(BaseModel):
     """Whole team configuration: one supervisor plus the specialist agents."""
 
@@ -101,6 +148,7 @@ class HiveConfig(BaseModel):
     collaboration: CollaborationPolicy = Field(default_factory=CollaborationPolicy)
     fallback: FallbackPolicy = Field(default_factory=FallbackPolicy)  # global default: OFF
     checkpoint: CheckpointConfig | None = None  # required for WAIT/HYBRID modes
+    tools: ToolsConfig | None = None  # None = legacy built-in tools only; block = explicit
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:
@@ -148,6 +196,7 @@ _LIST_FIELDS = {"fallback_models", "allowed_providers", "allowed_fallback_provid
 _AGENT_FALLBACK_ENV = (("MODE", "mode"), ("MODELS", "fallback_models"))
 
 
+
 def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dict[str, Any]:
     """Apply explicit environment-variable overrides to a raw YAML dict.
 
@@ -188,6 +237,28 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
         checkpoint = data.setdefault("checkpoint", {})
         if isinstance(checkpoint, dict):
             sections.append(("HIVE_CHECKPOINT", _CHECKPOINT_FIELDS, checkpoint))
+    # Phase 3: HIVE_TOOLS_* overrides create an explicit tools block (absent block
+    # stays absent -> legacy mode is preserved)
+    if any(k.startswith("HIVE_TOOLS_") for k in environ):
+        tools = data.setdefault("tools", {})
+        if isinstance(tools, dict):
+            for key in ("enabled", "workspace_root", "allow_write", "write_extensions"):
+                env_var = f"HIVE_TOOLS_{key.upper()}"
+                if env_var in environ:
+                    value = environ[env_var]
+                    tools[key] = (
+                        [v.strip() for v in value.split(",") if v.strip()]
+                        if key in ("enabled", "write_extensions")
+                        else value
+                    )
+            if "HIVE_TOOLS_APPROVAL_EXPIRY_SECONDS" in environ:
+                tools.setdefault("approval", {})["expiry_seconds"] = environ[
+                    "HIVE_TOOLS_APPROVAL_EXPIRY_SECONDS"
+                ]
+            if "HIVE_TOOLS_BUDGETS_MAX_TOOL_CALLS_PER_RUN" in environ:
+                tools.setdefault("budgets", {})["max_tool_calls_per_run"] = environ[
+                    "HIVE_TOOLS_BUDGETS_MAX_TOOL_CALLS_PER_RUN"
+                ]
     for prefix, fields, section in sections:
         for key in fields:
             env_var = f"{prefix}_{key.upper()}"

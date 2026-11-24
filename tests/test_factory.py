@@ -114,9 +114,13 @@ def test_build_team_applies_least_privilege_per_agent(tmp_path):
     config = load_team(tmp_path)
     gateway = FakeGateway(make_handler())
     _supervisor, agents = build_team(config, gateway)
-    assert agents["researcher"].tools.names() == ["calculator"]
-    assert agents["analyst"].tools.names() == []  # allow_tools: false
-    assert agents["reviewer"].tools.names() == ["word_count"]
+    # Phase 3: production agents resolve their toolset through the ToolGateway policy
+    def tool_names(agent):
+        return [s["name"] for s in agent.tool_gateway.schemas_for(agent.name)]
+
+    assert tool_names(agents["researcher"]) == ["calculator"]
+    assert agents["analyst"].tool_gateway.schemas_for("analyst") == []  # allow_tools: false
+    assert tool_names(agents["reviewer"]) == ["word_count"]
     # the model only sees its allowed tools in the system prompt
     gateway.handler("researcher", [])
     supervisor = build_team(config, gateway)[0]

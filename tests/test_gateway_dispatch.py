@@ -110,7 +110,8 @@ def test_counters_snapshot_and_restore_without_double_counting():
     ctx.reserve_physical_request()
     snap = ctx.counters_snapshot()
     assert snap == {"model_calls": 2, "physical_reserved": 1, "handoffs": 0,
-                    "agent_calls": {"researcher": 2}}
+                    "agent_calls": {"researcher": 2},
+                    "tool_calls": {"total": 0, "per_agent": {}, "per_tool": {}}}
     # simulate process restart: fresh context restored from the snapshot
     ctx2 = RunContext("r", CollaborationPolicy())
     ctx2.restore_counters(snap)
