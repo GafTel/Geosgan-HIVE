@@ -5,22 +5,22 @@ Ejecutar desde la raíz del proyecto:  python examples/demo_offline.py
 
 import json
 
-from agent_setup.config import Settings
-from agent_setup.factory import build_supervisor
-from agent_setup.llm import FakeLLM
+from geosgan_hive.config import Settings
+from geosgan_hive.factory import build_supervisor
+from geosgan_hive.llm import FakeLLM
 
 
 def main() -> None:
     respuestas = [
-        # 1. el supervisor delega en el investigador
-        json.dumps({"next": "investigador", "reason": "hay que calcular el dato primero"}),
-        # 2. el investigador llama a la calculadora
+        # 1. el supervisor delega en el researcher
+        json.dumps({"next": "researcher", "reason": "hay que calcular el dato primero"}),
+        # 2. el researcher llama a la calculadora
         json.dumps({"tool": "calculator", "args": {"expression": "12 * 8 + 4"}}),
-        # 3. el investigador responde con el dato calculado
+        # 3. el researcher responde con el dato calculado
         "He calculado que 12 * 8 + 4 = 100.",
-        # 4. el supervisor delega en el redactor
-        json.dumps({"next": "redactor", "reason": "ya tenemos el dato"}),
-        # 5. el redactor escribe el texto
+        # 4. el supervisor delega en el writer
+        json.dumps({"next": "writer", "reason": "ya tenemos el dato"}),
+        # 5. el writer escribe el texto
         "Texto redactado con el dato calculado: el resultado es 100.",
         # 6. el supervisor termina con la respuesta final
         json.dumps({"next": "FINISH", "answer": "El resultado final es 100 (12 * 8 + 4)."}),

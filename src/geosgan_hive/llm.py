@@ -7,13 +7,13 @@ from .messages import Message
 
 
 class LLMClient(Protocol):
-    """Contrato mínimo de un cliente de modelo de lenguaje."""
+    """Minimal contract of a language-model client."""
 
     def complete(self, messages: Sequence[Message], *, temperature: float = 0.2) -> str: ...
 
 
 class LiteLLMClient:
-    """Cliente real usando litellm (multi-proveedor: OpenAI, Anthropic, Gemini, Ollama...)."""
+    """Real client using litellm (multi-provider: OpenAI, Anthropic, Gemini, Ollama...)."""
 
     def __init__(self, model: str, api_key: str | None = None, **kwargs: Any) -> None:
         self.model = model
@@ -42,10 +42,10 @@ Handler = Callable[[list[Message]], str]
 
 
 class FakeLLM:
-    """Cliente falso para tests y demos sin clave de API.
+    """Fake client for tests and demos without an API key.
 
-    Acepta un `handler` (messages -> str) o una cola de `responses`.
-    Registra todas las llamadas en `calls` para aserciones.
+    Accepts a `handler` (messages -> str) or a queue of `responses`.
+    Records every call in `calls` for assertions.
     """
 
     def __init__(self, handler: Handler | None = None, responses: Sequence[str] = ()) -> None:
@@ -58,5 +58,5 @@ class FakeLLM:
         if self.handler is not None:
             return self.handler(list(messages))
         if not self.responses:
-            raise AssertionError("FakeLLM sin respuestas disponibles")
+            raise AssertionError("FakeLLM with no responses available")
         return self.responses.pop(0)

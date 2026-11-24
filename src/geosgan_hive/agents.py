@@ -10,9 +10,9 @@ from .messages import Message
 from .tools import ToolRegistry
 
 TOOL_CALL_INSTRUCTIONS = """\
-Cuando necesites usar una herramienta, responde ÚNICAMENTE con un JSON así:
-{"tool": "<nombre_de_la_herramienta>", "args": {"<parametro>": "<valor>"}}
-No añadas texto fuera del JSON. Cuando tengas la respuesta final, responde en texto plano."""
+When you need to use a tool, reply ONLY with a JSON like:
+{"tool": "<tool_name>", "args": {"<parameter>": "<value>"}}
+Do not add any text outside the JSON. When you have the final answer, reply in plain text."""
 
 
 @dataclass
@@ -55,7 +55,7 @@ def parse_tool_call(text: str) -> dict[str, Any] | None:
 
 
 class Agent:
-    """Agente individual con bucle de uso de herramientas hasta dar su respuesta."""
+    """Individual agent with a tool-calling loop until it gives its answer."""
 
     def __init__(
         self,
@@ -80,7 +80,7 @@ class Agent:
         prompt = self.system_prompt
         schemas = self.tools.schemas()
         if schemas:
-            prompt += "\n\nHerramientas disponibles:\n"
+            prompt += "\n\nAvailable tools:\n"
             prompt += json.dumps(schemas, ensure_ascii=False, indent=2)
             prompt += "\n\n" + TOOL_CALL_INSTRUCTIONS
         return Message(role="system", content=prompt, agent=self.name)
@@ -102,8 +102,8 @@ class Agent:
                         role="user",
                         agent="system",
                         content=(
-                            "Has alcanzado el máximo de llamadas a herramientas. "
-                            "Responde ahora la respuesta final en texto plano."
+                            "You have reached the maximum number of tool calls. "
+                            "Reply now with the final answer in plain text."
                         ),
                     )
                 )
@@ -115,7 +115,7 @@ class Agent:
                 Message(
                     role="user",
                     agent="tool",
-                    content=f"Resultado de '{call['tool']}': {result}",
+                    content=f"Result of '{call['tool']}': {result}",
                 )
             )
         return AgentResult(agent=self.name, answer=raw, tool_calls=tool_calls, steps=max_iterations)

@@ -1,8 +1,8 @@
 import json
 
-from agent_setup.agents import Agent, parse_tool_call
-from agent_setup.llm import FakeLLM
-from agent_setup.tools import CalculatorTool, ToolRegistry
+from geosgan_hive.agents import Agent, parse_tool_call
+from geosgan_hive.llm import FakeLLM
+from geosgan_hive.tools import CalculatorTool, ToolRegistry
 
 
 def make_agent(llm, **kwargs):

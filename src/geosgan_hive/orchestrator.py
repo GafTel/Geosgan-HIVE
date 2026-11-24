@@ -11,12 +11,12 @@ from .messages import Message
 FINISH = "FINISH"
 
 SUPERVISOR_INSTRUCTIONS = """\
-Eres el supervisor de un equipo de agentes especialistas.
-Decides qué agente atiende la tarea en cada paso.
-Responde ÚNICAMENTE con un JSON:
-- Para delegar: {"next": "<nombre_del_agente>", "reason": "<por qué>"}
-- Para terminar: {"next": "FINISH", "answer": "<respuesta final al usuario>"}
-No añadas texto fuera del JSON."""
+You are the supervisor of a team of specialist agents.
+You decide which agent handles the task at each step.
+Reply ONLY with a JSON:
+- To delegate: {"next": "<agent_name>", "reason": "<why>"}
+- To finish: {"next": "FINISH", "answer": "<final answer to the user>"}
+Do not add any text outside the JSON."""
 
 
 @dataclass
@@ -36,7 +36,7 @@ def parse_decision(text: str) -> dict[str, Any] | None:
 
 
 class Supervisor:
-    """Orquestador que enruta la tarea entre agentes hasta obtener una respuesta final."""
+    """Orchestrator that routes the task between agents until a final answer."""
 
     def __init__(
         self,
@@ -47,7 +47,7 @@ class Supervisor:
         temperature: float = 0.2,
     ) -> None:
         if not agents:
-            raise ValueError("Se necesita al menos un agente")
+            raise ValueError("At least one agent is required")
         self.agents = dict(agents)
         self.llm = llm
         self.max_steps = max_steps
@@ -55,7 +55,7 @@ class Supervisor:
 
     def _system_message(self) -> Message:
         roster = "\n".join(f"- {name}: {agent.description}" for name, agent in self.agents.items())
-        content = f"Agentes disponibles:\n{roster}\n\n{SUPERVISOR_INSTRUCTIONS}"
+        content = f"Available agents:\n{roster}\n\n{SUPERVISOR_INSTRUCTIONS}"
         return Message(role="system", content=content, agent="supervisor")
 
     def run(self, task: str) -> OrchestratorResult:
@@ -84,7 +84,7 @@ class Supervisor:
                     Message(
                         role="user",
                         agent="system",
-                        content=f"Error: no existe el agente '{nxt}'. Válidos: {valid}.",
+                        content=f"Error: agent '{nxt}' does not exist. Valid: {valid}.",
                     )
                 )
                 continue
@@ -93,7 +93,7 @@ class Supervisor:
             transcript.append(Message(role="assistant", content=result.answer, agent=agent.name))
         return OrchestratorResult(
             task=task,
-            final_answer="Se alcanzó el número máximo de pasos sin respuesta final.",
+            final_answer="Maximum number of steps reached without a final answer.",
             route=route,
             transcript=transcript,
             steps=self.max_steps,
