@@ -196,6 +196,14 @@ class RunContext:
             self._physical_reserved += 1
             return True
 
+    def release_physical_reservation(self) -> None:
+        """Roll back ONE in-memory reservation (only when the durable commit failed,
+        i.e. nothing was persisted and nothing was dispatched). Never lets the
+        in-memory counter drift below the durable one."""
+        with self._lock:
+            if self._physical_reserved > 0:
+                self._physical_reserved -= 1
+
     @property
     def physical_reserved(self) -> int:
         """Physical dispatch attempts reserved so far (pre-dispatch)."""

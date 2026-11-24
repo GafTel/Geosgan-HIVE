@@ -13,7 +13,7 @@ from typing import Any
 
 from .errors import CheckpointError
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ExecutionState(StrEnum):
@@ -65,6 +65,7 @@ class RunCheckpoint:
     created_at: str
     updated_at: str
     root_task_id: str | None = field(default=None)
+    physical_reserved: int = field(default=0)  # durable, monotonic per-dispatch count
 
 
 _SCHEMA = """
@@ -94,7 +95,8 @@ CREATE TABLE IF NOT EXISTS runs (
     lease_expires_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    root_task_id TEXT
+    root_task_id TEXT,
+    physical_reserved INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -235,6 +237,7 @@ class CheckpointStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             root_task_id=row["root_task_id"],
+            physical_reserved=int(row["physical_reserved"]),
         )
 
     def get(self, run_id: str) -> RunCheckpoint | None:
@@ -322,6 +325,25 @@ class CheckpointStore:
         cp = self.get(run_id)
         assert cp is not None
         return cp
+
+    def reserve_physical_durable(self, run_id: str) -> bool:
+        """Durably commit ONE physical dispatch reservation to SQLite BEFORE the
+        provider request is sent. Single atomic transaction; the counter is
+        monotonic (SQL increment, never a read-modify-write), so concurrent
+        connections/threads/workers cannot lose increments and persisted counters
+        never decrease. Only allowed while the run is RUNNING: once the run is
+        suspended/terminal (lease lost or recovered), dispatch is blocked.
+
+        A crash after this commit but before dispatch conservatively retains the
+        reservation. Returns False when the run row is gone or not RUNNING."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET physical_reserved = physical_reserved + 1, updated_at=? "
+                "WHERE run_id=? AND state=?",
+                (now, run_id, ExecutionState.RUNNING.value),
+            )
+            return cur.rowcount == 1
 
     def update_progress(
         self, run_id: str, *, owner: str, counters_json: str, step_count: int

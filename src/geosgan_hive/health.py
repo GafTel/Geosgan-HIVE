@@ -35,6 +35,14 @@ class HealthRegistry:
     """Thread-safe, async-compatible provider/model health registry.
 
     - Keys: provider-wide ``p:<provider>`` and model-specific ``m:<model>``.
+    - Credential scope: the architecture resolves exactly ONE credential per
+      provider (first matching env var), so the provider scope IS that
+      credential's scope. Multi-credential-per-provider isolation is NOT supported
+      and NOT claimed. AUTH failures are credential-specific and never open a
+      provider-wide circuit (``open_circuit=False``), so a bad key cannot disable
+      other authorized usage of the same provider process; QUOTA is account-wide
+      and correctly opens the provider scope. Raw credentials are never stored in
+      keys, state or logs.
     - CLOSED -> OPEN after `failure_threshold` recorded failures.
     - OPEN -> HALF_OPEN automatically once the cooldown has elapsed (monotonic clock).
     - HALF_OPEN: at most `half_open_max_probes` concurrent probes, single-flight

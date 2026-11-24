@@ -119,6 +119,10 @@ def build_team(
             persist_mode=config.checkpoint.persist_mode,
             lease_ttl_seconds=config.checkpoint.lease_ttl_seconds,
         )
+    if store is not None and hasattr(gateway, "set_durable_store"):
+        # every physical dispatch reservation is durably committed to SQLite
+        # BEFORE the provider request is sent
+        gateway.set_durable_store(store)
     tools = default_registry()
     agents = {
         spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback)

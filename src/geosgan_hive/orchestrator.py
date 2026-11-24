@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
@@ -85,6 +87,7 @@ class Supervisor:
         checkpoint_config_json: str | None = None,
         suspend_cooldown_seconds: float = 60.0,
         max_wait_seconds: float = 300.0,
+        lease_renew_interval_seconds: float | None = None,
     ) -> None:
         if not agents:
             raise ValueError("At least one agent is required")
@@ -101,6 +104,92 @@ class Supervisor:
         self.checkpoint_config_json = checkpoint_config_json
         self.suspend_cooldown_seconds = suspend_cooldown_seconds
         self.max_wait_seconds = max_wait_seconds
+        # periodic lease renewal while a run is active, so a long model call never
+        # loses valid ownership; None -> ttl/3 (min 0.05s) computed per run
+        self.lease_renew_interval_seconds = lease_renew_interval_seconds
+        self._lease_lost: dict[str, Any] = {}  # run_id -> threading.Event/asyncio.Event
+        self._keepers: dict[str, Any] = {}  # run_id -> thread/task handle
+
+    def _lease_interval(self) -> float:
+        if self.lease_renew_interval_seconds is not None:
+            return self.lease_renew_interval_seconds
+        ttl = self.checkpoint_store.lease_ttl_seconds if self.checkpoint_store else 60.0
+        return max(0.05, ttl / 3.0)
+
+    def _lease_lost_flag(self, run_id: str) -> Any | None:
+        return self._lease_lost.get(run_id)
+
+    def _check_lease(self, run_id: str) -> None:
+        """Abort dispatches/commits once ownership is lost (keeper observed a failed
+        fenced renewal, or the row was recovered by another process)."""
+        lost = self._lease_lost.get(run_id)
+        if lost is not None and lost.is_set():
+            raise CheckpointError(
+                f"run {run_id!r}: lease lost (stale worker); dispatches and commits blocked"
+            )
+
+    def _start_lease_keeper(self, run_id: str, owner: str) -> None:
+        """Start periodic ownership-fenced lease renewal (thread for sync runs,
+        asyncio task for async runs). Stops on completion/failure/cancellation."""
+        store = self.checkpoint_store
+        if store is None:
+            return
+        interval = self._lease_interval()
+        lost = threading.Event()
+        self._lease_lost[run_id] = lost
+
+        def _keep_sync() -> None:
+            while not lost.wait(interval):
+                if not store.renew_lease(run_id, owner):  # fenced: stale worker fails
+                    lost.set()
+                    return
+
+        thread = threading.Thread(target=_keep_sync, daemon=True,
+                                  name=f"lease-keeper-{run_id}")
+        thread.start()
+        self._keepers[run_id] = thread
+
+    def _start_lease_keeper_async(self, run_id: str, owner: str) -> None:
+        store = self.checkpoint_store
+        if store is None:
+            return
+        interval = self._lease_interval()
+        lost = threading.Event()  # is_set() works from both threads and tasks
+        self._lease_lost[run_id] = lost
+
+        async def _keep_async() -> None:
+            try:
+                while not lost.is_set():
+                    await asyncio.sleep(interval)
+                    if not store.renew_lease(run_id, owner):
+                        lost.set()
+                        return
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(_keep_async(), name=f"lease-keeper-{run_id}")
+        self._keepers[run_id] = task
+
+    def _stop_lease_keeper(self, run_id: str) -> None:
+        keeper = self._keepers.pop(run_id, None)
+        lost = self._lease_lost.pop(run_id, None)
+        if lost is not None:
+            lost.set()
+        if keeper is None:
+            return
+        if isinstance(keeper, threading.Thread):
+            keeper.join(timeout=2.0)
+        else:  # asyncio task: cancel from the running loop
+            if not keeper.done():
+                keeper.cancel()
+
+    async def _astop_lease_keeper(self, run_id: str) -> None:
+        """Stop the keeper and await its cancellation (async path: no orphan tasks)."""
+        keeper = self._keepers.get(run_id)
+        self._stop_lease_keeper(run_id)
+        if keeper is not None and not isinstance(keeper, threading.Thread):
+            with contextlib.suppress(asyncio.CancelledError):
+                await keeper
 
     def _system_message(self) -> Message:
         roster = "\n".join(f"- {name}: {agent.description}" for name, agent in self.agents.items())
@@ -327,10 +416,12 @@ class Supervisor:
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                self._start_lease_keeper(run_id, owner)
             result = self._run_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
             return result
         finally:
+            self._stop_lease_keeper(run_id)
             self._close_run(run_id, ctx, root_task_id)
 
     def resume(self, run_id: str, *, owner: str | None = None) -> OrchestratorResult:
@@ -377,6 +468,7 @@ class Supervisor:
         if not store.claim_lease(run_id, owner):
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
+        self._start_lease_keeper(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
@@ -384,7 +476,13 @@ class Supervisor:
             description=cp.task, depth=0,
         )
         ctx.update_task(root_task_id, status=TaskStatus.RUNNING)
-        ctx.restore_counters(json.loads(cp.counters_json or "{}"))
+        counters = json.loads(cp.counters_json or "{}")
+        # reconcile with the durable per-dispatch column: never reset, never double
+        # count — take the max of the boundary snapshot and the monotonic column
+        counters["physical_reserved"] = max(
+            int(counters.get("physical_reserved", 0)), cp.physical_reserved
+        )
+        ctx.restore_counters(counters)
         for step in json.loads(cp.steps_json or "[]"):
             ctx.create_task(
                 task_id=step["task_id"], parent_task_id=root_task_id,
@@ -409,6 +507,7 @@ class Supervisor:
             result.root_task_id = root_task_id
             return result
         finally:
+            self._stop_lease_keeper(run_id)
             self._close_run(run_id, ctx, root_task_id)
 
     def _run_loop(self, task: str, run_id: str, ctx: RunContext | None,
@@ -421,6 +520,8 @@ class Supervisor:
         route = route if route is not None else []
         calls = 0
         for step in range(start_step, self.max_steps + 1):
+            if resume_owner is not None:
+                self._check_lease(run_id)  # lost ownership blocks further dispatches
             if resume_owner is not None and self.checkpoint_store is not None:
                 if not self.checkpoint_store.renew_lease(run_id, resume_owner):
                     raise CheckpointError(
@@ -569,6 +670,7 @@ class Supervisor:
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                self._start_lease_keeper_async(run_id, owner)
             result = await self._arun_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
             return result
@@ -581,6 +683,7 @@ class Supervisor:
                 )
             raise
         finally:
+            await self._astop_lease_keeper(run_id)
             self._close_run(run_id, ctx, root_task_id)
 
     async def aresume(self, run_id: str, *, owner: str | None = None) -> OrchestratorResult:
@@ -622,6 +725,7 @@ class Supervisor:
         if not store.claim_lease(run_id, owner):
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
+        self._start_lease_keeper_async(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
@@ -629,7 +733,13 @@ class Supervisor:
             description=cp.task, depth=0,
         )
         ctx.update_task(root_task_id, status=TaskStatus.RUNNING)
-        ctx.restore_counters(json.loads(cp.counters_json or "{}"))
+        counters = json.loads(cp.counters_json or "{}")
+        # reconcile with the durable per-dispatch column: never reset, never double
+        # count — take the max of the boundary snapshot and the monotonic column
+        counters["physical_reserved"] = max(
+            int(counters.get("physical_reserved", 0)), cp.physical_reserved
+        )
+        ctx.restore_counters(counters)
         for step in json.loads(cp.steps_json or "[]"):
             ctx.create_task(
                 task_id=step["task_id"], parent_task_id=root_task_id,
@@ -658,6 +768,7 @@ class Supervisor:
                 ctx.update_task(root_task_id, status=TaskStatus.CANCELLED, finished_at=utcnow())
             raise
         finally:
+            await self._astop_lease_keeper(run_id)
             self._close_run(run_id, ctx, root_task_id)
 
     async def _arun_loop(self, task: str, run_id: str, ctx: RunContext | None,
@@ -670,6 +781,8 @@ class Supervisor:
         route = route if route is not None else []
         calls = 0
         for step in range(start_step, self.max_steps + 1):
+            if resume_owner is not None:
+                self._check_lease(run_id)  # lost ownership blocks further dispatches
             if resume_owner is not None and self.checkpoint_store is not None:
                 if not self.checkpoint_store.renew_lease(run_id, resume_owner):
                     raise CheckpointError(

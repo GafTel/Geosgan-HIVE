@@ -464,3 +464,34 @@ python examples/demo_fallback.py    # offline: fallback chain, circuit breaker, 
   interrupted mid-call (the wrapper still times out; the call stays counted).
 - RESUMABLE checkpoints store the transcript in plaintext SQLite; protect the file
   locally. Reserved dispatch attempts are not provider billing.
+
+### Approval-gate additions (C9)
+
+- **Periodic lease renewal**: while a run is active, the supervisor runs an
+  ownership-fenced lease keeper (thread on the sync path, asyncio task on the
+  async path) that renews every `lease_ttl/3` (configurable via
+  `lease_renew_interval_seconds`). Long model calls therefore never lose valid
+  ownership; renewal failure marks the run's lease as lost, which blocks further
+  dispatches (`reserve_physical_durable` only succeeds while RUNNING) and terminal
+  commits (ownership-fenced `mark_*`). Keepers stop on completion, failure and
+  cancellation with no orphaned tasks; crashed workers lose their persisted lease
+  after `lease_ttl_seconds` and are recovered as FAILED on reopen.
+- **Durable physical reservations**: schema v3 adds a monotonic
+  `runs.physical_reserved` column. Every physical dispatch (initial, retry,
+  fallback, probe, failed, cancelled) is committed to SQLite in ONE atomic
+  transaction BEFORE the provider request is sent (wired via
+  `ModelGateway.set_durable_store`, used by `build_team`/CLI). Counters never
+  decrease; a crash after reservation conservatively retains it; resume reconciles
+  `max(snapshot, column)` so resumed logical calls are never double counted.
+  Reserved attempts remain distinct from confirmed requests and provider billing.
+- **Credential scope of health keys**: exactly ONE credential per provider is
+  resolved (first matching env var), so provider-scope circuits == that
+  credential's scope. Auth failures never open provider-wide circuits; quota is
+  account-wide and opens the provider scope; raw credentials never appear in keys,
+  state or logs. Multi-credential-per-provider isolation is NOT supported and NOT
+  claimed.
+- **Resume authorization**: resumed runs always execute under the CURRENT config
+  (permissions, fallback providers, policies); the checkpoint's `config_json` is
+  only integrity-checked, never used to authorize anything. Incomplete
+  checkpoints (resumable mode without transcript) and corrupt snapshots are
+  rejected explicitly.

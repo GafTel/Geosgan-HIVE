@@ -16,6 +16,7 @@ from .errors import (
 )
 from .errors import (
     BudgetExceededError,
+    CheckpointError,
     ErrorClass,
     FallbackExhaustedError,
     GatewayConnectionError,
@@ -145,6 +146,14 @@ class ModelGateway:
         # provider -> max Retry-After hint seen (seconds); used to extend the
         # persisted next_attempt_at of suspended runs (never invents reset times)
         self._retry_after_hints: dict[str, float] = {}
+        # optional durable store: every physical dispatch reservation is committed
+        # to SQLite BEFORE the provider request is sent (Phase 2.5 gate requirement)
+        self._durable_store: Any = None
+
+    def set_durable_store(self, store: Any) -> None:
+        """Wire a CheckpointStore so each physical dispatch is durably reserved
+        (monotonic, atomic, before the request) for runs that have one."""
+        self._durable_store = store
 
     def retry_after_hint(self, provider: Provider | str) -> float:
         """Largest Retry-After hint (seconds) observed for this provider, 0 if none."""
@@ -169,20 +178,36 @@ class ModelGateway:
             return self._context_lookup(run_id)
         return None
 
-    def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
-        """One physical dispatch: reserve the physical attempt atomically, acquire
-        the request slot ONLY around the in-flight request (never during backoff,
-        cooldown, checkpointing or delegation waits), then call LiteLLM."""
-        ctx = self._run_context(run_id)
-        import litellm
-
-        if ctx is None:
-            return litellm.completion(**kwargs)
+    def _reserve_physical(self, ctx: Any, run_id: str | None) -> None:
+        """Reserve one physical attempt: in-memory cap check first, then the durable
+        SQLite commit BEFORE the request is sent. If the durable commit fails (run
+        no longer RUNNING: lease lost/recovered), the in-memory reservation is
+        rolled back (nothing was persisted or dispatched) and dispatch is blocked."""
         if not ctx.reserve_physical_request():
             raise BudgetExceededError(
                 f"Physical provider-request limit "
                 f"({ctx.policy.max_provider_requests_per_run}) reached for this run."
             )
+        store = self._durable_store
+        if store is not None and run_id is not None:
+            if not store.reserve_physical_durable(run_id):
+                ctx.release_physical_reservation()
+                raise CheckpointError(
+                    f"run {run_id!r} is no longer active (suspended/terminal/recovered); "
+                    "dispatch blocked"
+                )
+
+    def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
+        """One physical dispatch: reserve the physical attempt atomically (durably
+        when wired), acquire the request slot ONLY around the in-flight request
+        (never during backoff, cooldown, checkpointing or delegation waits), then
+        call LiteLLM."""
+        ctx = self._run_context(run_id)
+        import litellm
+
+        if ctx is None:
+            return litellm.completion(**kwargs)
+        self._reserve_physical(ctx, run_id)
         sem = ctx.sync_semaphore()
         sem.acquire()
         try:
@@ -198,11 +223,7 @@ class ModelGateway:
 
         if ctx is None:
             return await litellm.acompletion(**kwargs)
-        if not ctx.reserve_physical_request():
-            raise BudgetExceededError(
-                f"Physical provider-request limit "
-                f"({ctx.policy.max_provider_requests_per_run}) reached for this run."
-            )
+        self._reserve_physical(ctx, run_id)
         sem = ctx.semaphore()
         await sem.acquire()
         try:
