@@ -262,7 +262,10 @@ class ToolGateway:
         ok = self._store.ledger_start(
             execution_id=execution_id, run_id=ctx.run_id, task_id=ctx.task_id,
             agent=ctx.agent, tool=spec.name, tool_version=spec.version,
-            args_sha256=args_sha256(args), args_json=canonical_args(args)[: 8_000],
+            args_sha256=args_sha256(args),
+            # hash is computed on the ORIGINAL args (authoritative binding); the
+            # persisted payload is bounded AND secret-redacted
+            args_json=redact_secrets(canonical_args(args))[: 8_000],
             status="started" if mutating else "reserved",
             approval_id=approval_id or None,
             lease_owner=(run_row.lease_owner if run_row is not None else None),

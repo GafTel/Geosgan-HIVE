@@ -81,6 +81,8 @@ class ApprovalManager:
         expires_at = (
             self.store.utcnow() + timedelta(seconds=self.expiry_seconds)
         ).isoformat(timespec="milliseconds")
+        from .tool_gateway import redact_secrets
+
         self.store.create_approval(
             approval_id=approval_id,
             run_id=ctx.run_id or "",
@@ -90,7 +92,8 @@ class ApprovalManager:
             tool_version=spec.version,
             operation=operation,
             target=target,
-            args_json=canonical[: 8_000],  # bounded payload; hash is authoritative
+            # bounded + secret-redacted payload; the hash is authoritative
+            args_json=redact_secrets(canonical)[: 8_000],
             args_sha256=digest,
             preconditions_json=_json.dumps(preconditions or {}, default=str)[: 4_000],
             preview=preview,
@@ -116,7 +119,9 @@ class ApprovalManager:
         """Bounded, meaningful human preview (a hash alone is not sufficient)."""
         import json as _json
 
-        arg_text = _json.dumps(args, ensure_ascii=False, default=str)
+        from .tool_gateway import redact_secrets
+
+        arg_text = redact_secrets(_json.dumps(args, ensure_ascii=False, default=str))
         if len(arg_text) > self.preview_bytes:
             arg_text = arg_text[: self.preview_bytes] + "...[truncated]"
         lines = [
