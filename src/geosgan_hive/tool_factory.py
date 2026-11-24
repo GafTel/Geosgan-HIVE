@@ -42,8 +42,10 @@ def build_tool_catalog() -> ToolCatalog:
     ToolPolicy decides what each agent may use (deny-by-default)."""
     catalog = ToolCatalog()
     register_builtin_tools(catalog)
-    # T2/T3 extend this with data and file tools (registered but denied unless
-    # enabled in the policy)
+    from .tools_data import register_data_tools
+
+    register_data_tools(catalog)  # T2: registered but denied unless enabled
+    # T3/T5 add sandboxed file tools here (registered but denied unless enabled)
     return catalog
 
 
