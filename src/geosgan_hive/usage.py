@@ -26,6 +26,7 @@ class UsageRecord:
     attempts: int
     timestamp: str
     run_id: str | None = None
+    error: str | None = None  # set when the call ultimately failed/was cancelled
 
 
 @dataclass

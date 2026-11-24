@@ -30,6 +30,10 @@ class CollaborationPolicy(BaseModel):
     max_parallel_agents: int = Field(default=3, ge=1, le=32)
     default_delegation_timeout_seconds: float = Field(default=120.0, gt=0)
     max_model_calls_per_run: int = Field(default=200, ge=1)
+    # Optional hard cap on PHYSICAL provider requests (incl. retries). None = tracked
+    # only (RunContext.physical_requests), never enforced. Distinct from the hard
+    # logical-call budget above, which is always enforced.
+    max_provider_requests_per_run: int | None = Field(default=None, ge=1)
     allow_agent_to_agent: bool = False  # global kill switch; supervisor retains authority
 
 
@@ -104,7 +108,6 @@ class RunContext:
         self._model_calls = 0
         self._handoffs = 0
         self._agent_calls: dict[str, int] = {}
-        self._slot_holders: set[str] = set()  # task_ids whose subtree holds a semaphore slot
         self._semaphore: asyncio.Semaphore | None = None
 
     # ---- model-call budget (run-wide, atomic) ----
@@ -131,6 +134,33 @@ class RunContext:
         """Logical model calls reserved in this run (one per llm.complete/acomplete)."""
         with self._lock:
             return self._model_calls
+
+    def reserve_model_call_for(
+        self, agent: str, task_id: str | None = None, per_agent_limit: int | None = None
+    ) -> tuple[bool, str | None]:
+        """Atomic check+reserve of one model call for `agent`.
+
+        Under a single lock: enforces the run-wide logical budget AND the per-agent
+        run-wide limit, then increments both counters. Concurrent delegations to the
+        same agent can never exceed the per-agent limit (no check/reserve race).
+        """
+        with self._lock:
+            if self._model_calls >= self.policy.max_model_calls_per_run:
+                return False, (
+                    f"Run-wide model-call limit "
+                    f"({self.policy.max_model_calls_per_run}) reached."
+                )
+            if per_agent_limit is not None and self._agent_calls.get(agent, 0) >= per_agent_limit:
+                return False, (
+                    f"Per-agent limit reached: max {per_agent_limit} model calls "
+                    f"for '{agent}' in this run."
+                )
+            self._model_calls += 1
+            node = self._tasks.get(task_id) if task_id else None
+            if node is not None:
+                node.model_calls += 1
+            self._agent_calls[agent] = self._agent_calls.get(agent, 0) + 1
+            return True, None
 
     def agent_calls(self, agent: str) -> int:
         """Logical model calls made by one agent across the WHOLE run (all its tasks),
@@ -273,33 +303,11 @@ class RunContext:
 
     # ---- bounded concurrency (async runs; one event loop per run) ----
     def semaphore(self) -> asyncio.Semaphore:
+        """Bounds ACTIVE model requests (acquired per model call, never while an
+        agent waits for its delegated subtasks, so it cannot deadlock)."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.policy.max_parallel_agents)
         return self._semaphore
-
-    def has_slot_ancestor(self, task_id: str | None) -> bool:
-        """True if any task in `task_id`'s ancestor chain (inclusive) holds a
-        semaphore slot. Nested delegations inherit the ancestor's slot instead of
-        acquiring a new one, so a full semaphore can never deadlock on agents that
-        are merely waiting for their own delegated subtasks."""
-        with self._lock:
-            current = task_id
-            while current is not None:
-                if current in self._slot_holders:
-                    return True
-                node = self._tasks.get(current)
-                if node is None:
-                    return False
-                current = node.parent_task_id
-            return False
-
-    def mark_slot(self, task_id: str) -> None:
-        with self._lock:
-            self._slot_holders.add(task_id)
-
-    def unmark_slot(self, task_id: str) -> None:
-        with self._lock:
-            self._slot_holders.discard(task_id)
 
     def close(self) -> None:
         with self._lock:

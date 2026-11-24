@@ -112,9 +112,18 @@ class Supervisor:
             self.collaboration.close_run(run_id)
 
     def _budget_stop(self, ctx: RunContext | None, task_id: str | None = None) -> str | None:
-        if ctx is not None and not ctx.reserve_model_call(task_id):
-            return f"Run-wide model-call limit ({ctx.policy.max_model_calls_per_run}) reached."
-        return None
+        if ctx is None:
+            return None
+        cap = ctx.policy.max_provider_requests_per_run
+        if cap is not None and ctx.physical_requests >= cap:
+            return (
+                f"Provider-request limit ({cap}) reached for this run "
+                f"(physical requests incl. retries)."
+            )
+        ok, reason = ctx.reserve_model_call_for(
+            "supervisor", task_id, self.limits.max_calls_per_run
+        )
+        return None if ok else reason
 
     def _start_agent_task(self, ctx: RunContext | None, root_task_id: str | None,
                           agent_name: str, task: str) -> tuple[str | None, int]:
@@ -246,14 +255,21 @@ class Supervisor:
             run_id=run_id,
         )
 
-    async def _acomplete(self, messages: list[Message], *, run_id: str | None) -> str:
+    async def _acomplete(self, messages: list[Message], *, run_id: str | None,
+                         run_context: RunContext | None = None) -> str:
         acomplete = getattr(self.llm, "acomplete", None)
         if acomplete is not None:
-            return await acomplete(messages, temperature=self.temperature, run_id=run_id)
-        # legacy sync-only adapter: thread fallback only
-        return await asyncio.to_thread(
-            self.llm.complete, messages, temperature=self.temperature, run_id=run_id
-        )
+            async def call():
+                return await acomplete(messages, temperature=self.temperature, run_id=run_id)
+        else:  # legacy sync-only adapter: thread fallback only
+            async def call():
+                return await asyncio.to_thread(
+                    self.llm.complete, messages, temperature=self.temperature, run_id=run_id
+                )
+        if run_context is not None:
+            async with run_context.semaphore():  # bound active model requests
+                return await call()
+        return await call()
 
     async def arun(self, task: str, *, run_id: str | None = None) -> OrchestratorResult:
         """Native async twin of `run` (sequential routing; agents run via arun)."""
@@ -288,7 +304,7 @@ class Supervisor:
                 )
             try:
                 raw = await self._acomplete(
-                    [self._system_message(), *transcript], run_id=run_id
+                    [self._system_message(), *transcript], run_id=run_id, run_context=ctx
                 )
             except GatewayError as exc:
                 return OrchestratorResult(

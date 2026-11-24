@@ -279,11 +279,18 @@ enforced across the **whole run** (`RunContext.agent_calls`), so they cannot be
 bypassed by repeatedly delegating to the same agent. The soft cost budget is
 unchanged (unknown costs stay `None`).
 
-**Logical vs physical requests**: `RunContext.model_calls` counts *logical* model
-calls (one per `llm.complete`/`acomplete`, reserved pre-call). `RunContext.physical_requests`
-counts *physical provider requests* — the sum of retry `attempts` in the usage
-records — so a call the gateway retried 3 times counts as 1 logical call but 3
-physical requests. Both are exact under concurrency.
+**Logical vs physical requests** (two distinct budgets): `max_model_calls_per_run`
+is the **hard logical budget** — one unit reserved atomically per `llm.complete`/
+`acomplete` (before the call), covering supervisor + specialists + delegated + nested
+calls, with a run-wide per-agent limit enforced in the same atomic step.
+`RunContext.physical_requests` counts **physical provider requests** — the sum of
+retry `attempts` in the usage records (failed/cancelled calls are recorded with
+`error` set and `cost_usd=None`) — so a call retried 3 times is 1 logical call but
+3 physical requests. Physical requests are tracked always, and can optionally be
+hard-capped via `max_provider_requests_per_run` (default: off). Both are exact
+under concurrency. Concurrency (`max_parallel_agents`) bounds **active model
+requests**: the semaphore is taken per model call, never while an agent waits for
+its delegated subtasks, so it cannot deadlock.
 
 **Deadlock safety**: the `max_parallel_agents` semaphore is acquired per top-level
 delegation; nested delegations inherit the ancestor's slot (`has_slot_ancestor`),
@@ -310,6 +317,7 @@ the native path. `geosgan-hive "task" --async` runs the whole team asynchronousl
 | `max_parallel_agents` | `3` | `HIVE_COLLABORATION_MAX_PARALLEL_AGENTS` |
 | `default_delegation_timeout_seconds` | `120` | `HIVE_COLLABORATION_DEFAULT_DELEGATION_TIMEOUT_SECONDS` |
 | `max_model_calls_per_run` | `200` | `HIVE_COLLABORATION_MAX_MODEL_CALLS_PER_RUN` |
+| `max_provider_requests_per_run` | `null` (tracked, not capped) | `HIVE_COLLABORATION_MAX_PROVIDER_REQUESTS_PER_RUN` |
 
 ```bash
 python examples/demo_collaboration.py   # offline: parallel delegation + run history

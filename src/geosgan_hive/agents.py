@@ -192,19 +192,19 @@ class Agent:
         if stop is not None:
             return stop
         if run_context is not None:
-            # per-agent limit across the WHOLE run (not per delegation)
-            if run_context.agent_calls(self.name) >= self.limits.max_calls_per_run:
+            cap = run_context.policy.max_provider_requests_per_run
+            if cap is not None and run_context.physical_requests >= cap:
                 return (
-                    f"Per-agent limit reached: max {self.limits.max_calls_per_run} "
-                    f"model calls for '{self.name}' in this run."
+                    f"Provider-request limit ({cap}) reached for this run "
+                    f"(physical requests incl. retries)."
                 )
-            if not run_context.reserve_model_call(task_id):
-                # reserve immediately before each actual model request; counts every
-                # supervisor/agent/delegated/nested LLM request run-wide
-                return (
-                    f"Run-wide model-call limit "
-                    f"({run_context.policy.max_model_calls_per_run}) reached."
-                )
+            # atomic check+reserve: run-wide budget AND per-agent run-wide limit
+            # (repeated delegation cannot reset the per-agent limit)
+            ok, reason = run_context.reserve_model_call_for(
+                self.name, task_id, self.limits.max_calls_per_run
+            )
+            if not ok:
+                return reason
         return None
 
     def _delegation_allowed(self, run_context: RunContext | None) -> bool:
@@ -411,11 +411,19 @@ class Agent:
             if stop is not None:
                 return AgentResult(self.name, stop, tool_calls, step - 1, handoffs)
             if acomplete is not None:
-                raw = await acomplete(messages, temperature=self.temperature, run_id=run_id)
+                async def call():
+                    return await acomplete(messages, temperature=self.temperature, run_id=run_id)
             else:  # legacy sync-only adapter: thread fallback only
-                raw = await asyncio.to_thread(
-                    self.llm.complete, messages, temperature=self.temperature, run_id=run_id
-                )
+                async def call():
+                    return await asyncio.to_thread(
+                        self.llm.complete, messages, temperature=self.temperature, run_id=run_id
+                    )
+            if run_context is not None:
+                # bound ACTIVE model requests; never held while awaiting subtasks
+                async with run_context.semaphore():
+                    raw = await call()
+            else:
+                raw = await call()
             calls += 1
             call = parse_tool_call(raw)
             if call is not None:

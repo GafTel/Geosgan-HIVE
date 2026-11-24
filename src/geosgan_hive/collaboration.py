@@ -457,18 +457,11 @@ class CollaborationEngine:
         )
         if early is not None or req is None:
             return early  # type: ignore[return-value]
-        # A nested delegation inherits the ancestor's semaphore slot instead of
-        # acquiring a new one: with every slot held by an agent waiting on its own
-        # subtask, no circular wait can occur (no deadlock).
-        if ctx.has_slot_ancestor(req.parent_task_id):
-            return await self._execute_async(ctx, req, timeout)
-        sem = ctx.semaphore()
-        async with sem:  # bounded by policy.max_parallel_agents
-            ctx.mark_slot(req.task_id)
-            try:
-                return await self._execute_async(ctx, req, timeout)
-            finally:
-                ctx.unmark_slot(req.task_id)
+        # Concurrency is bounded per MODEL CALL (RunContext.semaphore in Agent.arun /
+        # Supervisor.arun), never around the whole agent execution, so a full
+        # semaphore can never deadlock on agents waiting for their own subtasks
+        # and active model requests never exceed max_parallel_agents.
+        return await self._execute_async(ctx, req, timeout)
 
     async def _execute_async(
         self, ctx: RunContext, req: HandoffRequest, timeout: float | None

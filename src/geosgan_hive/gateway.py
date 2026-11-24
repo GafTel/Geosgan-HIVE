@@ -176,6 +176,10 @@ class ModelGateway:
                 if is_retryable(error) and attempt < policy.max_attempts:
                     self._sleep(policy.delay_for_attempt(attempt, _retry_after_seconds(exc)))
                     continue
+                self._record_failure(
+                    model=model, agent=agent, run_id=run_id, attempts=attempt,
+                    error=type(error).__name__, latency_ms=(time.perf_counter() - started) * 1000,
+                )
                 raise error from exc
             latency_ms = (time.perf_counter() - started) * 1000
             return self._to_response(
@@ -229,12 +233,22 @@ class ModelGateway:
                 import litellm
 
                 response = await litellm.acompletion(**kwargs)
+            except asyncio.CancelledError:
+                self._record_failure(
+                    model=model, agent=agent, run_id=run_id, attempts=attempt,
+                    error="cancelled", latency_ms=(time.perf_counter() - started) * 1000,
+                )
+                raise
             except Exception as exc:
                 error = _map_litellm_error(exc)
                 if is_retryable(error) and attempt < policy.max_attempts:
                     delay = policy.delay_for_attempt(attempt, _retry_after_seconds(exc))
                     await self._async_sleep(delay)
                     continue
+                self._record_failure(
+                    model=model, agent=agent, run_id=run_id, attempts=attempt,
+                    error=type(error).__name__, latency_ms=(time.perf_counter() - started) * 1000,
+                )
                 raise error from exc
             latency_ms = (time.perf_counter() - started) * 1000
             return self._to_response(
@@ -304,6 +318,24 @@ class ModelGateway:
         )
         self.tracker.record(record)
         return LLMResponse(content=content, model=model, usage=record)
+
+    def _record_failure(
+        self, *, model: str, agent: str | None, run_id: str | None,
+        attempts: int, error: str, latency_ms: float,
+    ) -> None:
+        """Record a failed/cancelled call so physical provider requests (retry
+        attempts, timeouts, cancellations) are accounted, never silently dropped.
+        cost_usd stays None on failure (unknown, never 0)."""
+        provider, _ = parse_model(model)
+        self.tracker.record(
+            UsageRecord(
+                agent=agent, model=model, provider=provider.value,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                cost_usd=None, latency_ms=latency_ms, attempts=attempts,
+                timestamp=datetime.now(UTC).isoformat(timespec="milliseconds"),
+                run_id=run_id, error=error,
+            )
+        )
 
     @staticmethod
     def _safe_cost(response: Any) -> float | None:
