@@ -1,0 +1,67 @@
+# GEOSGAN HIVE - default multi-model team (Phase 1: MULTI-MODEL CORE).
+#
+# SECURITY: never put API keys or any secret in this file. Provider credentials
+# are read from environment variables only, and only for providers actually
+# used (see README: OPENAI_API_KEY, MISTRAL_API_KEY, ANTHROPIC_API_KEY,
+# GEMINI_API_KEY/GOOGLE_API_KEY; Ollama needs no key).
+#
+# Every field can be overridden per role via env vars, e.g.:
+#   HIVE_AGENT_DEVELOPER_MODEL=ollama/codellama
+#   HIVE_SUPERVISOR_TEMPERATURE=0.1
+#   HIVE_AGENT_REVIEWER_MAX_STEPS... (supervisor only: HIVE_SUPERVISOR_MAX_STEPS)
+
+supervisor:
+  name: supervisor
+  description: Routes the task between the specialist agents and produces the final answer.
+  system_prompt: >-
+    You are the supervisor of the GEOSGAN HIVE team. You coordinate the
+    researcher, developer, analyst and reviewer agents. Delegate each part of
+    the task to the best agent, wait for their answers in the context, and
+    finish with a single final answer for the user.
+  model: openai/gpt-4o-mini
+  temperature: 0.2
+  max_steps: 8
+  permissions: {allow_tools: false, allowed_tools: []}
+  limits: {max_calls_per_run: 50, timeout_seconds: 60, max_cost_usd_per_run: null}
+
+agents:
+  - name: researcher
+    description: Investigates and organizes information, using its allowed tools for concrete data.
+    system_prompt: >-
+      You are a meticulous researcher. Analyze the task, use your allowed tools
+      when they provide concrete data, and deliver a structured summary.
+    model: gemini/gemini-2.0-flash
+    temperature: 0.2
+    permissions: {allow_tools: true, allowed_tools: [calculator, current_datetime, word_count]}
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60}
+
+  - name: developer
+    description: Writes and explains code and technical solutions.
+    system_prompt: >-
+      You are a senior developer. Produce correct, idiomatic code and explain
+      the technical decisions. Use your allowed tools only for concrete data.
+    model: mistral/mistral-large-latest
+    temperature: 0.1
+    permissions: {allow_tools: true, allowed_tools: [calculator]}
+    limits: {max_tool_steps: 3, max_calls_per_run: 20, timeout_seconds: 90}
+
+  - name: analyst
+    description: Analyzes data, numbers and texts, and quantifies findings.
+    system_prompt: >-
+      You are a rigorous analyst. Break the problem down, compute what can be
+      computed with your allowed tools, and report findings with numbers.
+    model: anthropic/claude-3-7-sonnet-latest
+    temperature: 0.2
+    permissions: {allow_tools: true, allowed_tools: [calculator, word_count]}
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60}
+
+  - name: reviewer
+    description: "Reviews and improves answers - correctness, clarity and task coverage."
+    system_prompt: >-
+      You are a demanding reviewer. Evaluate the answer in the context, detect
+      clarity, correctness or coverage issues, and deliver the improved final
+      version. You may only measure text with your allowed tools.
+    model: ollama/llama3.2
+    temperature: 0.2
+    permissions: {allow_tools: true, allowed_tools: [word_count]}
+    limits: {max_tool_steps: 2, max_calls_per_run: 10, timeout_seconds: 120}

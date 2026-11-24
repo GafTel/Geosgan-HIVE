@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Message:
-    """Mensaje de la conversación. `agent` indica quién lo produjo (traza)."""
+    """Conversation message. `agent` records who produced it (trace)."""
 
     role: str  # "system" | "user" | "assistant"
     content: str

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from agent_setup.tools import (
+from geosgan_hive.tools import (
     CalculatorTool,
     CurrentDateTimeTool,
     WordCountTool,
@@ -36,7 +36,7 @@ def test_calculator_missing_param():
 
 
 def test_word_count():
-    assert WordCountTool().run({"text": "hola mundo"}) == "palabras=2 caracteres=10"
+    assert WordCountTool().run({"text": "hola mundo"}) == "words=2 characters=10"
 
 
 def test_current_datetime_is_iso():
