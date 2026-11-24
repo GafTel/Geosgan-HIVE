@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -35,6 +36,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-steps", type=int, default=None, help="Override the supervisor max steps"
     )
+    parser.add_argument(
+        "--async",
+        dest="async_",
+        action="store_true",
+        help="Run asynchronously via Supervisor.arun (native async execution)",
+    )
     args = parser.parse_args(argv)
 
     settings = Settings()
@@ -60,7 +67,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_steps is not None:
         supervisor.max_steps = args.max_steps
 
-    result = supervisor.run(args.task)
+    if args.async_:
+        result = asyncio.run(supervisor.arun(args.task))
+    else:
+        result = supervisor.run(args.task)
 
     route = " -> ".join(result.route) if result.route else "(direct supervisor answer)"
     print(f"Route: {route}")

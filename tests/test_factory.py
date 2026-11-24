@@ -8,6 +8,12 @@ from geosgan_hive.usage import UsageTracker
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TEAM_YAML = """
+collaboration:
+  allow_agent_to_agent: true
+  max_delegation_depth: 2
+  max_handoffs_per_run: 10
+  max_parallel_agents: 3
+  max_model_calls_per_run: 200
 supervisor:
   name: supervisor
   description: routes
@@ -130,3 +136,30 @@ def test_default_repo_config_builds_the_five_roles():
     models = {name: agent.llm.model for name, agent in agents.items()}
     models["supervisor"] = supervisor.llm.model
     assert len(set(models.values())) == 5  # five independent models
+
+
+def test_build_team_wires_collaboration_engine(tmp_path):
+    config = load_team(tmp_path)
+    gateway = FakeGateway(make_handler())
+    supervisor, agents = build_team(config, gateway)
+    engine = supervisor.collaboration
+    assert engine is not None
+    assert set(engine.agents) == set(agents)
+    assert all(agent.collaboration is engine for agent in agents.values())
+    # policy comes from the YAML collaboration block / defaults
+    assert engine.policy.max_delegation_depth == 2
+    assert engine.policy.max_handoffs_per_run == 10
+    assert engine.policy.max_parallel_agents == 3
+    assert engine.policy.max_model_calls_per_run == 200
+    assert engine.policy.allow_agent_to_agent is True
+
+
+def test_build_team_default_config_has_engine_with_policy():
+    config = load_hive_config(REPO_ROOT / "config" / "agents.yaml", environ={})
+    gateway = FakeGateway(make_handler())
+    supervisor, agents = build_team(config, gateway)
+    assert supervisor.collaboration is not None
+    assert supervisor.collaboration.policy.allow_agent_to_agent is True
+    # delegation graph from YAML is on the agents' permissions
+    assert agents["researcher"].permissions.allowed_agents == ["analyst", "reviewer"]
+    assert agents["reviewer"].permissions.allow_delegation is False

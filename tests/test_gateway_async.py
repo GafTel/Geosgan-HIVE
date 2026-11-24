@@ -169,3 +169,27 @@ def test_async_timeout_mapping(monkeypatch, openai_key):
     )
     with pytest.raises(GatewayTimeoutError):
         asyncio.run(gateway.acomplete([Message("user", "hi")], model="openai/gpt-4o-mini"))
+
+
+def test_bound_client_acomplete_delegates_to_gateway(monkeypatch, openai_key):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return fake_response(content="bound async ok", model=kwargs["model"])
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.002)
+    tracker = UsageTracker()
+    gateway = ModelGateway(tracker=tracker)
+    client = gateway.bind(
+        "openai/gpt-4o-mini", agent="developer", temperature=0.4, timeout_seconds=9.0
+    )
+    out = asyncio.run(client.acomplete([Message("user", "code")], run_id="run-b"))
+    assert out == "bound async ok"
+    assert calls[0]["model"] == "openai/gpt-4o-mini"
+    assert calls[0]["temperature"] == 0.4
+    assert calls[0]["timeout"] == 9.0
+    assert calls[0]["num_retries"] == 0
+    record = tracker.records()[0]
+    assert record.agent == "developer" and record.run_id == "run-b" and record.cost_usd == 0.002

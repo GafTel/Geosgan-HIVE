@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from .agents import Agent
+from .collaboration import CollaborationEngine
 from .gateway import ModelGateway
 from .orchestrator import Supervisor
 from .tools import ToolRegistry, default_registry
@@ -13,6 +14,7 @@ def build_agent(
     gateway: ModelGateway,
     tracker: UsageTracker,
     tools: ToolRegistry | None = None,
+    collaboration: CollaborationEngine | None = None,
 ) -> Agent:
     """Build one specialist agent from its spec: own model, permissions, limits."""
     registry = tools if tools is not None else default_registry()
@@ -33,6 +35,7 @@ def build_agent(
         limits=spec.limits,
         usage_tracker=tracker,
         temperature=spec.temperature,
+        collaboration=collaboration,
     )
 
 
@@ -41,6 +44,7 @@ def build_supervisor(
     agents: dict[str, Agent],
     gateway: ModelGateway,
     tracker: UsageTracker,
+    collaboration: CollaborationEngine | None = None,
 ) -> Supervisor:
     llm = gateway.bind(
         spec.model,
@@ -56,15 +60,24 @@ def build_supervisor(
         temperature=spec.temperature,
         usage_tracker=tracker,
         limits=spec.limits,
+        collaboration=collaboration,
     )
 
 
 def build_team(
     config: HiveConfig, gateway: ModelGateway, tracker: UsageTracker | None = None
 ) -> tuple[Supervisor, dict[str, Agent]]:
-    """Build the whole HIVE team (supervisor + agents) from a validated config."""
+    """Build the whole HIVE team from a validated config, wiring the engine.
+
+    The CollaborationEngine is shared by the supervisor and all agents; agents
+    never reference each other directly — all handoffs go through the engine.
+    """
     tracker = tracker if tracker is not None else gateway.tracker
+    engine = CollaborationEngine(policy=config.collaboration, tracker=tracker)
     tools = default_registry()
-    agents = {spec.name: build_agent(spec, gateway, tracker, tools) for spec in config.agents}
-    supervisor = build_supervisor(config.supervisor, agents, gateway, tracker)
+    agents = {
+        spec.name: build_agent(spec, gateway, tracker, tools, engine) for spec in config.agents
+    }
+    engine.register(agents)
+    supervisor = build_supervisor(config.supervisor, agents, gateway, tracker, engine)
     return supervisor, agents

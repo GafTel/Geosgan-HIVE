@@ -3,6 +3,12 @@
 # (requires a local Ollama server; default base http://localhost:11434,
 #  override with OLLAMA_API_BASE)
 
+collaboration:
+  allow_agent_to_agent: true
+  max_delegation_depth: 2
+  max_handoffs_per_run: 10
+  max_parallel_agents: 3
+
 supervisor:
   name: supervisor
   description: Routes the task between the specialist agents and produces the final answer.
@@ -19,7 +25,11 @@ agents:
     description: Investigates and organizes information.
     system_prompt: You are a meticulous researcher. Deliver a structured summary.
     model: ollama/llama3.2
-    permissions: {allow_tools: true, allowed_tools: [calculator, current_datetime, word_count]}
+    permissions:
+      allow_tools: true
+      allowed_tools: [calculator, current_datetime, word_count]
+      allow_delegation: true
+      allowed_agents: [analyst, reviewer]
   - name: developer
     description: Writes and explains code.
     system_prompt: You are a senior developer. Produce correct code and explain it.

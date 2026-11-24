@@ -165,3 +165,70 @@ def test_supervisor_spec_extends_agent_spec():
     assert isinstance(spec, AgentSpec)
     assert spec.max_steps == 8
     assert isinstance(spec, HiveConfig.model_fields["supervisor"].annotation)
+
+
+def test_delegation_permissions_default_to_least_privilege():
+    perms = Permissions()
+    assert perms.allow_delegation is False
+    assert perms.allowed_agents == []
+
+
+def test_default_config_collaboration_policy():
+    config = load_hive_config(DEFAULT_CONFIG, environ={})
+    policy = config.collaboration
+    assert policy.allow_agent_to_agent is True
+    assert policy.max_delegation_depth == 2
+    assert policy.max_handoffs_per_run == 10
+    assert policy.max_parallel_agents == 3
+    assert policy.default_delegation_timeout_seconds == 120.0
+    assert policy.max_model_calls_per_run == 200
+    by_name = {a.name: a for a in config.agents}
+    assert by_name["researcher"].permissions.allow_delegation is True
+    assert by_name["researcher"].permissions.allowed_agents == ["analyst", "reviewer"]
+    assert by_name["reviewer"].permissions.allow_delegation is False
+    assert by_name["reviewer"].permissions.allowed_agents == []
+
+
+def test_local_config_enables_conservative_collaboration():
+    config = load_hive_config(LOCAL_CONFIG, environ={})
+    assert config.collaboration.allow_agent_to_agent is True
+    assert config.collaboration.max_delegation_depth == 2
+
+
+def test_collaboration_policy_defaults_when_block_absent(tmp_path):
+    path = write_yaml(tmp_path, MINIMAL_YAML)
+    config = load_hive_config(path, environ={})
+    assert config.collaboration.allow_agent_to_agent is False  # disabled unless enabled
+    assert config.collaboration.max_model_calls_per_run == 200
+
+
+def test_unknown_delegation_target_is_rejected(tmp_path):
+    bad = MINIMAL_YAML.replace(
+        "model: ollama/llama3.2",
+        "model: ollama/llama3.2\n"
+        "    permissions: {allow_delegation: true, allowed_agents: [ghost]}",
+    )
+    path = write_yaml(tmp_path, bad)
+    with pytest.raises(ConfigError) as exc_info:
+        load_hive_config(path, environ={})
+    assert "ghost" in str(exc_info.value)
+
+
+def test_invalid_collaboration_values_are_rejected(tmp_path):
+    bad = MINIMAL_YAML + "\ncollaboration: {max_delegation_depth: 0}\n"
+    path = write_yaml(tmp_path, bad)
+    with pytest.raises(ConfigError):
+        load_hive_config(path, environ={})
+
+
+def test_collaboration_env_overrides(tmp_path):
+    path = write_yaml(tmp_path, MINIMAL_YAML)
+    env = {
+        "HIVE_COLLABORATION_MAX_DELEGATION_DEPTH": "3",
+        "HIVE_COLLABORATION_ALLOW_AGENT_TO_AGENT": "true",
+        "HIVE_COLLABORATION_MAX_PARALLEL_AGENTS": "5",
+    }
+    config = load_hive_config(path, environ=env)
+    assert config.collaboration.max_delegation_depth == 3
+    assert config.collaboration.allow_agent_to_agent is True
+    assert config.collaboration.max_parallel_agents == 5

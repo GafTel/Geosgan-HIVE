@@ -80,3 +80,25 @@ def test_cli_routes_through_agents_with_per_agent_models(monkeypatch, tmp_path, 
     # supervisor and researcher both ran on their own (here: same local) model
     assert calls == ["ollama/llama3.2", "ollama/llama3.2", "ollama/llama3.2"]
     assert "cost_usd=$0.000300" in out
+
+
+def test_cli_async_flag_runs_arun_offline(monkeypatch, capsys):
+    async def fake_acompletion(**kwargs):
+        content = json.dumps({"next": "FINISH", "answer": "async done"})
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1, total_tokens=3),
+            model=kwargs.get("model", "ollama/llama3.2"),
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    def no_cost(completion_response):
+        raise ValueError("local model has no known cost")
+
+    monkeypatch.setattr(litellm, "completion_cost", no_cost)
+    rc = main(["task", "--agents-config", str(LOCAL_CONFIG), "--async"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "async done" in out
+    assert "Usage summary:" in out
