@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import os
 import stat
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,10 @@ DEFAULT_DENY_PATTERNS = (".env", ".env.*", "*.db", "*.db-wal", "*.db-shm", ".git
 
 #: Hash files only up to this size for fs_metadata.
 MAX_HASH_BYTES = 10 * 1024 * 1024
+
+#: Hard cap on a single written file (fs_write/fs_update), independent of the
+#: gateway input cap.
+MAX_WRITE_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -48,12 +53,17 @@ class WorkspaceSandbox:
     fd-level re-verification is not available — documented limitation.
     """
 
-    def __init__(self, root: str, deny_patterns: list[str] | None = None) -> None:
+    def __init__(self, root: str, deny_patterns: list[str] | None = None,
+                 write_extensions: list[str] | None = None) -> None:
         if not root or "\x00" in root:
             raise SandboxViolationError("invalid workspace root")
         self.root = os.path.realpath(root)
         os.makedirs(self.root, exist_ok=True)
         self.deny_patterns = tuple(deny_patterns or DEFAULT_DENY_PATTERNS)
+        self.write_extensions = tuple(
+            (e.lower() for e in write_extensions) if write_extensions is not None
+            else (".txt", ".md")
+        )
 
     # ---- path resolution ----
     def _deny_check(self, resolved: str) -> None:
@@ -164,6 +174,103 @@ class WorkspaceSandbox:
             mtime=st.st_mtime,
             sha256=sha,
         )
+
+    # ---- writes (atomic replace; approval-bound preconditions) ----
+    def sha256_file(self, relpath: str) -> str:
+        fd, _ = self.open_read(relpath, max_bytes=MAX_HASH_BYTES)
+        h = hashlib.sha256()
+        try:
+            while True:
+                chunk = os.read(fd, 65_536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        finally:
+            os.close(fd)
+        return h.hexdigest()
+
+    def write_text(self, relpath: str, content: str, *, expected_sha256: str | None = None,
+                   require_exists: bool = False,
+                   max_bytes: int = MAX_WRITE_BYTES) -> str:
+        """Atomically create (require_exists=False: target must NOT exist) or update
+        (require_exists=True: target must exist and match expected_sha256) a plaintext
+        file inside the workspace. Returns the sha256 of the written content.
+
+        Fail closed: containment + deny patterns (resolve), extension allowlist,
+        final component must not be a symlink, parent must be a directory inside the
+        root, size cap, and for updates the CURRENT content hash must still equal the
+        approved expected_sha256 (TOCTOU: if the file changed after approval, the
+        write is rejected and a fresh approval is required). The replace itself is
+        atomic (tmp file in the same directory + os.replace), so readers never see a
+        partially written file."""
+        resolved = self.resolve(relpath)
+        data = content.encode("utf-8")
+        if len(data) > max_bytes:
+            raise SandboxViolationError(
+                f"content is {len(data)} bytes > write limit {max_bytes}"
+            )
+        ext = os.path.splitext(resolved)[1].lower()
+        if self.write_extensions and ext not in self.write_extensions:
+            raise SandboxViolationError(
+                f"extension {ext!r} is not in the write allowlist "
+                f"{sorted(self.write_extensions)}"
+            )
+        lexical = (os.path.normpath(relpath) if os.path.isabs(relpath)
+                   else os.path.normpath(os.path.join(self.root, relpath)))
+        if os.path.islink(lexical):
+            raise SandboxViolationError(
+                f"{relpath!r} is a symlink \u2014 refusing to write through it"
+            )
+        parent = os.path.dirname(resolved)
+        try:
+            pst = os.stat(parent)
+        except OSError as exc:
+            raise SandboxViolationError(f"parent directory missing: {exc}") from exc
+        if not stat.S_ISDIR(pst.st_mode) or os.path.commonpath([parent, self.root]) != self.root:
+            raise SandboxViolationError("parent directory is not inside the workspace")
+        exists = os.path.lexists(resolved)
+        if exists:
+            st = os.lstat(resolved)
+            if not stat.S_ISREG(st.st_mode):
+                raise SandboxViolationError(f"{relpath!r} is not a regular file")
+            if not require_exists:
+                raise SandboxViolationError(
+                    f"{relpath!r} already exists \u2014 use fs_update with expected_sha256"
+                )
+            if expected_sha256 is not None:
+                current = self.sha256_file(relpath)
+                if current != expected_sha256:
+                    raise SandboxViolationError(
+                        f"{relpath!r} changed after approval (sha256 mismatch) \u2014 "
+                        "fresh approval required"
+                    )
+        elif require_exists:
+            raise SandboxViolationError(
+                f"{relpath!r} does not exist \u2014 use fs_write to create it"
+            )
+        # atomic replace: tmp file in the SAME directory (same filesystem)
+        tmp = os.path.join(parent, f".{os.path.basename(resolved)}.tmp-{os.getpid()}-"
+                           f"{uuid.uuid4().hex}")
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_CLOEXEC", 0))
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, resolved)  # atomic on the same filesystem
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return hashlib.sha256(data).hexdigest()
 
     def list_dir(self, relpath: str, *, max_entries: int) -> list[dict[str, Any]]:
         resolved = self.resolve(relpath)

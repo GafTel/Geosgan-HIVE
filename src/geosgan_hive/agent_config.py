@@ -114,6 +114,8 @@ class ToolsConfig(BaseModel):
     enabled: list[str] = Field(default_factory=list)  # empty = deny all tools
     workspace_root: str = "workspace"  # file tools are sandboxed to this root
     allow_write: bool = False  # fs_write/fs_update additionally need this + approval
+    #: extensions fs_write/fs_update may create/modify (bounded plaintext docs)
+    write_extensions: list[str] = Field(default_factory=lambda: [".txt", ".md"])
     budgets: ToolBudgets = Field(default_factory=ToolBudgets)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     #: name patterns file tools must never expose (credential files, checkpoint DBs)
@@ -128,6 +130,14 @@ class ToolsConfig(BaseModel):
             if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
                 raise ValueError(f"invalid tool name {name!r}")
         return value
+
+    @field_validator("write_extensions")
+    @classmethod
+    def _validate_write_extensions(cls, value: list[str]) -> list[str]:
+        for ext in value:
+            if not re.fullmatch(r"\.[a-z0-9]+", ext, re.IGNORECASE):
+                raise ValueError(f"invalid write extension {ext!r} (expected e.g. '.txt')")
+        return [e.lower() for e in value]
 
 
 class HiveConfig(BaseModel):
@@ -232,13 +242,13 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
     if any(k.startswith("HIVE_TOOLS_") for k in environ):
         tools = data.setdefault("tools", {})
         if isinstance(tools, dict):
-            for key in ("enabled", "workspace_root", "allow_write"):
+            for key in ("enabled", "workspace_root", "allow_write", "write_extensions"):
                 env_var = f"HIVE_TOOLS_{key.upper()}"
                 if env_var in environ:
                     value = environ[env_var]
                     tools[key] = (
                         [v.strip() for v in value.split(",") if v.strip()]
-                        if key == "enabled"
+                        if key in ("enabled", "write_extensions")
                         else value
                     )
             if "HIVE_TOOLS_APPROVAL_EXPIRY_SECONDS" in environ:

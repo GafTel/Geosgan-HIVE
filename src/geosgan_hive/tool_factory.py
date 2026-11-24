@@ -50,8 +50,10 @@ def build_tool_catalog(config: HiveConfig | None = None) -> tuple[ToolCatalog, W
     has_tools = config is not None and config.tools is not None
     root = config.tools.workspace_root if has_tools else "workspace"
     deny = config.tools.deny_name_patterns if has_tools else None
-    sandbox = WorkspaceSandbox(root, deny)
-    register_file_tools(catalog, sandbox)
+    write_ext = config.tools.write_extensions if has_tools else None
+    sandbox = WorkspaceSandbox(root, deny, write_extensions=write_ext)
+    register_file_tools(catalog, sandbox,
+                        allow_write=bool(has_tools and config.tools.allow_write))
     return catalog, sandbox
 
 
