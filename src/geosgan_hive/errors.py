@@ -58,3 +58,11 @@ class BadRequestError(PermanentGatewayError):
 
 class BudgetExceededError(HiveError):
     """The known cost of a run reached its configured per-run budget."""
+
+
+class DelegationError(HiveError):
+    """Base error for collaboration/delegation failures."""
+
+
+class DelegationRejectedError(DelegationError):
+    """A handoff request was rejected by policy or permissions."""
