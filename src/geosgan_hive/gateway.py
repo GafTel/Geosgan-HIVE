@@ -356,3 +356,20 @@ class GatewayLLMClient:
             max_tokens=self.max_tokens,
             timeout_seconds=self.timeout_seconds,
         )
+
+    async def acomplete(
+        self,
+        messages: Sequence[Message],
+        *,
+        temperature: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        return await self.gateway.acomplete(
+            messages,
+            model=self.model,
+            agent=self.agent,
+            run_id=run_id,
+            temperature=self.temperature if temperature is None else temperature,
+            max_tokens=self.max_tokens,
+            timeout_seconds=self.timeout_seconds,
+        )
