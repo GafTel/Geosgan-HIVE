@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from .agents import Agent
 from .checkpoints import CheckpointStore
@@ -7,6 +9,7 @@ from .collaboration import CollaborationEngine
 from .fallback import FallbackPolicy, effective_policy
 from .gateway import ModelGateway
 from .orchestrator import Supervisor
+from .tool_factory import build_tool_gateway
 from .tools import ToolRegistry, default_registry
 from .usage import UsageTracker
 
@@ -18,6 +21,7 @@ def build_agent(
     tools: ToolRegistry | None = None,
     collaboration: CollaborationEngine | None = None,
     global_fallback: FallbackPolicy | None = None,
+    tool_gateway: Any = None,
 ) -> Agent:
     """Build one specialist agent from its spec: own model, permissions, limits."""
     registry = tools if tools is not None else default_registry()
@@ -42,6 +46,7 @@ def build_agent(
         usage_tracker=tracker,
         temperature=spec.temperature,
         collaboration=collaboration,
+        tool_gateway=tool_gateway,
     )
 
 
@@ -124,8 +129,15 @@ def build_team(
         # BEFORE the provider request is sent
         gateway.set_durable_store(store)
     tools = default_registry()
+    # Phase 3: the ToolGateway is ALWAYS wired in production; every tool call goes
+    # through it (policy + budgets + validation). Legacy registry path remains only
+    # for standalone fixtures that build agents without a gateway.
+    tool_gw = build_tool_gateway(config, store)
+    if config.tools is not None:
+        engine.tool_budgets = config.tools.budgets
     agents = {
-        spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback)
+        spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback,
+                               tool_gateway=tool_gw)
         for spec in config.agents
     }
     engine.register(agents)

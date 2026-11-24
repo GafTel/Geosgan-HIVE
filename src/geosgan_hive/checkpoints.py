@@ -13,7 +13,9 @@ from typing import Any
 
 from .errors import CheckpointError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+#: versions this store can open directly or migrate up to
+_MIGRATABLE_FROM = (3, 4)
 
 
 class ExecutionState(StrEnum):
@@ -66,6 +68,8 @@ class RunCheckpoint:
     updated_at: str
     root_task_id: str | None = field(default=None)
     physical_reserved: int = field(default=0)  # durable, monotonic per-dispatch count
+    lease_generation: int = field(default=0)  # bumped on every claim (fencing)
+    tool_reservations: int = field(default=0)  # durable tool-execution reservations
 
 
 _SCHEMA = """
@@ -96,7 +100,9 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     root_task_id TEXT,
-    physical_reserved INTEGER NOT NULL DEFAULT 0
+    physical_reserved INTEGER NOT NULL DEFAULT 0,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    tool_reservations INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -149,6 +155,8 @@ class CheckpointStore:
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+            elif int(row["value"]) == 3:
+                self._migrate_3_to_4()
             elif int(row["value"]) != SCHEMA_VERSION:
                 raise CheckpointError(
                     f"checkpoint database {self.path!r} has schema_version {row['value']}, "
@@ -156,6 +164,23 @@ class CheckpointStore:
                 )
         self._harden_permissions()
         self._recover_crashed()
+
+    def _migrate_3_to_4(self) -> None:
+        """Versioned migration v3 -> v4: adds lease_generation (ownership fencing by
+        owner AND generation) and tool_reservations (durable per-dispatch tool budget
+        reservations). Idempotent; runs inside the open transaction."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "lease_generation" not in cols:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "tool_reservations" not in cols:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN tool_reservations INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
 
     def _harden_permissions(self) -> None:
         """Best-effort: owner-only permissions on the database files (POSIX).
@@ -238,6 +263,8 @@ class CheckpointStore:
             updated_at=row["updated_at"],
             root_task_id=row["root_task_id"],
             physical_reserved=int(row["physical_reserved"]),
+            lease_generation=int(row["lease_generation"]),
+            tool_reservations=int(row["tool_reservations"]),
         )
 
     def get(self, run_id: str) -> RunCheckpoint | None:
@@ -325,6 +352,21 @@ class CheckpointStore:
         cp = self.get(run_id)
         assert cp is not None
         return cp
+
+    def reserve_tool_durable(self, run_id: str) -> bool:
+        """Durably reserve ONE tool execution BEFORE the side effect is dispatched
+        (Phase 3). Same guarantees as reserve_physical_durable: single atomic
+        transaction, monotonic SQL increment (never decreases), only while RUNNING
+        so stale/recovered workers cannot dispatch. A crash after this commit
+        conservatively retains the reservation."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET tool_reservations = tool_reservations + 1, updated_at=? "
+                "WHERE run_id=? AND state=?",
+                (now, run_id, ExecutionState.RUNNING.value),
+            )
+            return cur.rowcount == 1
 
     def reserve_physical_durable(self, run_id: str) -> bool:
         """Durably commit ONE physical dispatch reservation to SQLite BEFORE the
@@ -423,7 +465,8 @@ class CheckpointStore:
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "UPDATE runs SET state=?, updated_at=?, lease_owner=?, lease_expires_at=? "
+                "UPDATE runs SET state=?, updated_at=?, lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1 "
                 "WHERE run_id=? AND state IN (?, ?) AND lease_owner=?",
                 (
                     ExecutionState.RUNNING.value,
@@ -542,7 +585,8 @@ class CheckpointStore:
         now = self.now_iso()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "UPDATE runs SET lease_owner=?, lease_expires_at=?, updated_at=? "
+                "UPDATE runs SET lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1, updated_at=? "
                 "WHERE run_id=? AND state IN (?, ?) "
                 "AND (lease_owner IS NULL OR lease_expires_at <= ?)",
                 (

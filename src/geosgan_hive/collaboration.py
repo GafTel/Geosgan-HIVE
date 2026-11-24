@@ -12,6 +12,7 @@ from .agents import arun_agent
 from .errors import GatewayError
 from .messages import Message
 from .run_context import CollaborationPolicy, EventType, RunContext, TaskStatus, utcnow
+from .tool_spec import ToolBudgets
 from .usage import UsageTracker
 
 if TYPE_CHECKING:
@@ -101,9 +102,11 @@ class CollaborationEngine:
         agents: dict[str, Agent] | None = None,
         *,
         max_cached_runs: int = 32,
+        tool_budgets: Any = None,
     ) -> None:
         self.policy = policy or CollaborationPolicy()
         self.tracker = tracker if tracker is not None else UsageTracker()
+        self.tool_budgets = tool_budgets  # ToolBudgets | None (Phase 3)
         self.agents: dict[str, Agent] = dict(agents or {})
         self.max_cached_runs = max_cached_runs
         self._contexts: dict[str, RunContext] = {}
@@ -120,7 +123,10 @@ class CollaborationEngine:
                 if len(self._contexts) >= self.max_cached_runs:
                     oldest = next(iter(self._contexts))
                     self._contexts.pop(oldest, None)
-                ctx = RunContext(run_id, self.policy, self.tracker)
+                ctx = RunContext(
+                    run_id, self.policy, self.tracker,
+                    tool_budgets=self.tool_budgets or ToolBudgets(),
+                )
                 self._contexts[run_id] = ctx
             return ctx
 
