@@ -13,9 +13,52 @@ from typing import Any
 
 from .errors import CheckpointError
 
-SCHEMA_VERSION = 4
-#: versions this store can open directly or migrate up to
-_MIGRATABLE_FROM = (3, 4)
+SCHEMA_VERSION = 5
+
+#: Phase 3 (T4): durable tool-execution ledger + human approvals
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tool_executions (
+    execution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    agent TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tool_version TEXT NOT NULL DEFAULT '1',
+    args_sha256 TEXT NOT NULL,
+    args_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    idempotency_key TEXT,
+    approval_id TEXT,
+    lease_owner TEXT,
+    lease_generation INTEGER,
+    requested_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    result_sha256 TEXT,
+    error TEXT,
+    output_bytes INTEGER
+);
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    agent TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tool_version TEXT NOT NULL DEFAULT '1',
+    operation TEXT NOT NULL,
+    target TEXT,
+    args_json TEXT NOT NULL,
+    args_sha256 TEXT NOT NULL,
+    preconditions_json TEXT NOT NULL DEFAULT '{}',
+    preview TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    decided_by TEXT,
+    decided_at TEXT,
+    consumed_at TEXT
+);
+"""
 
 
 class ExecutionState(StrEnum):
@@ -147,6 +190,7 @@ class CheckpointStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            self._conn.executescript(_LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -155,13 +199,26 @@ class CheckpointStore:
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(row["value"]) == 3:
-                self._migrate_3_to_4()
-            elif int(row["value"]) != SCHEMA_VERSION:
-                raise CheckpointError(
-                    f"checkpoint database {self.path!r} has schema_version {row['value']}, "
-                    f"expected {SCHEMA_VERSION}; refusing to open an incompatible store"
-                )
+            else:
+                v = int(row["value"])
+                if v > SCHEMA_VERSION:
+                    raise CheckpointError(
+                        f"checkpoint database {self.path!r} has schema_version {v}, "
+                        f"expected {SCHEMA_VERSION}; refusing to open an "
+                        "incompatible store"
+                    )
+                while v < SCHEMA_VERSION:  # versioned forward migrations only
+                    if v == 3:
+                        self._migrate_3_to_4()
+                    elif v == 4:
+                        self._migrate_4_to_5()
+                    else:
+                        raise CheckpointError(
+                            f"checkpoint database {self.path!r} has schema_version {v}, "
+                            f"expected {SCHEMA_VERSION}; refusing to open an "
+                            "incompatible store"
+                        )
+                    v += 1
         self._harden_permissions()
         self._recover_crashed()
 
@@ -178,6 +235,13 @@ class CheckpointStore:
             self._conn.execute(
                 "ALTER TABLE runs ADD COLUMN tool_reservations INTEGER NOT NULL DEFAULT 0"
             )
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_4_to_5(self) -> None:
+        """v4 -> v5: durable tool-execution ledger + approval records (Phase 3 T4)."""
+        self._conn.executescript(_LEDGER_SCHEMA)
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -621,6 +685,226 @@ class CheckpointStore:
                 (now, run_id, owner),
             )
 
+    # ---- Phase 3: tool execution ledger ----
+    def ledger_start(
+        self,
+        *,
+        execution_id: str,
+        run_id: str,
+        agent: str,
+        tool: str,
+        args_sha256: str,
+        status: str,
+        task_id: str | None = None,
+        tool_version: str = "1",
+        args_json: str = "{}",
+        idempotency_key: str | None = None,
+        approval_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Insert a ledger row (execution-start is persisted BEFORE the side effect).
+        Single atomic transaction; duplicate execution_id is rejected (no double
+        dispatch). For mutating ops the row is fenced by lease owner+generation."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            try:
+                self._conn.execute(
+                    "INSERT INTO tool_executions (execution_id, run_id, task_id, agent, "
+                    "tool, tool_version, args_sha256, args_json, status, idempotency_key, "
+                    "approval_id, lease_owner, lease_generation, requested_at, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution_id, run_id, task_id, agent, tool, tool_version,
+                        args_sha256, args_json, status, idempotency_key, approval_id,
+                        lease_owner, lease_generation, now,
+                        now if status == ToolExecutionStatus.STARTED.value else None,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False  # duplicate execution id -> never double-dispatch
+            return True
+
+    def ledger_update(
+        self,
+        execution_id: str,
+        *,
+        status: str,
+        result_sha256: str | None = None,
+        error: str | None = None,
+        output_bytes: int | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Transition a ledger row; fenced by owner+generation when provided (stale
+        workers cannot commit results after losing ownership)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            if lease_owner is not None:
+                cur = self._conn.execute(
+                    "UPDATE tool_executions SET status=?, finished_at=?, result_sha256=?, "
+                    "error=?, output_bytes=? "
+                    "WHERE execution_id=? AND lease_owner=? AND lease_generation=?",
+                    (status, now, result_sha256, error, output_bytes,
+                     execution_id, lease_owner, lease_generation),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE tool_executions SET status=?, finished_at=?, result_sha256=?, "
+                    "error=?, output_bytes=? WHERE execution_id=?",
+                    (status, now, result_sha256, error, output_bytes, execution_id),
+                )
+            return cur.rowcount == 1
+
+    def ledger_get(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tool_executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+        return _ledger_row_to_dict(row) if row else None
+
+    def ledger_list(
+        self, *, run_id: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            query = "SELECT * FROM tool_executions"
+            cond, params = [], []
+            if run_id is not None:
+                cond.append("run_id=?")
+                params.append(run_id)
+            if status is not None:
+                cond.append("status=?")
+                params.append(status)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY requested_at"
+            rows = self._conn.execute(query, params).fetchall()
+        return [_ledger_row_to_dict(r) for r in rows]
+
+    def ledger_resolve(
+        self, execution_id: str, *, decision: str, operator: str, evidence: str
+    ) -> bool:
+        """Operator resolution of an UNKNOWN outcome: records the decision + evidence
+        without claiming the side effect was verified."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE tool_executions SET status=?, error=?, finished_at=? "
+                "WHERE execution_id=? AND status=?",
+                (
+                    ToolExecutionStatus.COMPLETED.value if decision == "completed"
+                    else ToolExecutionStatus.FAILED.value,
+                    f"operator-resolved by {operator}: {decision}; evidence: {evidence}",
+                    now,
+                    execution_id,
+                    ToolExecutionStatus.UNKNOWN.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    # ---- Phase 3: approvals ----
+    def create_approval(
+        self,
+        *,
+        approval_id: str,
+        run_id: str,
+        agent: str,
+        tool: str,
+        operation: str,
+        args_json: str,
+        args_sha256: str,
+        preview: str,
+        expires_at: str,
+        task_id: str | None = None,
+        tool_version: str = "1",
+        target: str | None = None,
+        preconditions_json: str = "{}",
+    ) -> None:
+        now = self.now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO approvals (approval_id, run_id, task_id, agent, tool, "
+                "tool_version, operation, target, args_json, args_sha256, "
+                "preconditions_json, preview, status, requested_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    approval_id, run_id, task_id, agent, tool, tool_version, operation,
+                    target, args_json, args_sha256, preconditions_json, preview,
+                    ApprovalState.PENDING.value, now, expires_at,
+                ),
+            )
+
+    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approvals WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+        return {k: row[k] for k in row.keys()} if row else None
+
+    def list_approvals(
+        self, *, run_id: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            query = "SELECT * FROM approvals"
+            cond, params = [], []
+            if run_id is not None:
+                cond.append("run_id=?")
+                params.append(run_id)
+            if status is not None:
+                cond.append("status=?")
+                params.append(status)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY requested_at"
+            rows = self._conn.execute(query, params).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def decide_approval(
+        self, approval_id: str, *, decision: str, operator: str
+    ) -> bool:
+        """Operator decision (APPROVED/DENIED/CANCELLED). Only PENDING rows can be
+        decided; the decider must be a trusted operator id (never an agent/model)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, decided_by=?, decided_at=? "
+                "WHERE approval_id=? AND status=? AND expires_at > ?",
+                (decision, operator, now, approval_id, ApprovalState.PENDING.value, now),
+            )
+            return cur.rowcount == 1
+
+    def consume_approval(
+        self, approval_id: str, *, expected_args_sha256: str, now_iso: str | None = None
+    ) -> bool:
+        """Atomically consume an APPROVED approval: single transaction, single-use,
+        bound to the exact argument hash (substitution -> rejected), not expired.
+        This is the durable execution-start transition companion."""
+        now = now_iso or self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=?, consumed_at=? "
+                "WHERE approval_id=? AND status=? AND args_sha256=? AND expires_at > ?",
+                (
+                    ApprovalState.CONSUMED.value, now, approval_id,
+                    ApprovalState.APPROVED.value, expected_args_sha256, now,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def sweep_expired_approvals(self) -> int:
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approvals SET status=? WHERE status IN (?, ?) AND expires_at <= ?",
+                (
+                    ApprovalState.EXPIRED.value,
+                    ApprovalState.PENDING.value,
+                    ApprovalState.APPROVED.value,
+                    now,
+                ),
+            )
+            return cur.rowcount
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -632,3 +916,34 @@ def steps_to_json(steps: list[dict[str, Any]]) -> str:
 
 def counters_to_json(counters: dict[str, Any]) -> str:
     return json.dumps(counters, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (T4): durable tool-execution ledger
+# ---------------------------------------------------------------------------
+
+class ApprovalState(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    CONSUMED = "consumed"
+    CANCELLED = "cancelled"
+
+
+class ToolExecutionStatus(StrEnum):
+    REJECTED = "rejected"
+    WAITING_APPROVAL = "waiting_approval"
+    RESERVED = "reserved"
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"  # cancelled BEFORE execution
+    UNKNOWN = "unknown"  # outcome uncertain (crash/timeout after side effect started)
+
+
+def _ledger_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
+
+
+# methods are attached to CheckpointStore below (kept here for cohesion)

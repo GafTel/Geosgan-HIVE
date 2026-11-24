@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .agent_config import HiveConfig
+from .approvals import ApprovalManager
 from .sandbox import WorkspaceSandbox
 from .tool_gateway import BuiltinToolAdapter, ToolGateway
 from .tool_policy import build_policy
 from .tool_registry import ToolCatalog
 from .tool_spec import SideEffect, ToolSpec
 from .tools import CalculatorTool, CurrentDateTimeTool, WordCountTool
-
-if TYPE_CHECKING:
-    from .approvals import ApprovalManager
 
 #: Legacy built-in tools (available in legacy mode when no `tools:` block is set).
 BUILTIN_TOOL_NAMES = ("calculator", "current_datetime", "word_count")
@@ -71,6 +69,12 @@ def build_tool_gateway(
     context is missing.
     """
     catalog, _sandbox = build_tool_catalog(config)
+    if approval_manager is None and store is not None and config.tools is not None:
+        approval_manager = ApprovalManager(
+            store,
+            expiry_seconds=config.tools.approval.expiry_seconds,
+            preview_bytes=config.tools.approval.preview_bytes,
+        )
     if config.tools is None:
         global_enabled = list(BUILTIN_TOOL_NAMES)
     else:

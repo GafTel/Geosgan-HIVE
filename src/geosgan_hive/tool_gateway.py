@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from .errors import (
+    ApprovalError,
     ApprovalRequiredError,
     ToolBudgetExceededError,
     ToolError,
@@ -20,7 +21,7 @@ from .errors import (
 from .run_context import EventType, utcnow
 from .tool_policy import ToolPolicy
 from .tool_registry import ToolAdapter, ToolCatalog
-from .tool_spec import ToolSpec, validate_args
+from .tool_spec import SideEffect, ToolSpec, args_sha256, validate_args
 
 if TYPE_CHECKING:
     from .approvals import ApprovalManager
@@ -140,7 +141,7 @@ class ToolGateway:
             if self._store is not None and ctx.run_id:
                 # durable reservation BEFORE execution (atomic SQLite increment)
                 if not self._store.reserve_tool_durable(ctx.run_id):
-                    run_context.release_tool_reservation(ctx.agent, spec.name)
+                    run_context.release_tool_reservation(agent=ctx.agent, tool=spec.name)
                     raise ToolPermissionError(
                         f"run {ctx.run_id!r} is no longer active — dispatch blocked (fail closed)"
                     )
@@ -174,11 +175,126 @@ class ToolGateway:
             output += "\n...[truncated]"
         return output, len(output.encode("utf-8")), truncated
 
+    # ---- approval + ledger (Phase 3 T4) ----
+    def _approval_context(self, adapter: ToolAdapter, args: dict[str, Any]) -> dict[str, Any]:
+        fn = getattr(adapter, "approval_context", None)
+        if fn is not None:
+            return fn(args)
+        return {"operation": adapter.spec.name, "target": None, "preconditions": {}}
+
+    def _run_lease(self, ctx: ToolExecutionContext) -> dict[str, Any] | None:
+        """Current run row (for ownership fencing); None when no durable store."""
+        if self._store is None or not ctx.run_id:
+            return None
+        return self._store.get(ctx.run_id)
+
+    def _obtain_approval(self, spec: ToolSpec, ctx: ToolExecutionContext,
+                         args: dict[str, Any], adapter: ToolAdapter,
+                         run_context: RunContext | None, wait) -> tuple[str, Any]:
+        """Create a PENDING approval, wait for the operator (NO semaphore held),
+        revalidate policy/lease/expiry, then consume atomically. Returns
+        (approval_id, run row)."""
+        mgr = self.approval_manager
+        assert mgr is not None
+        actx = self._approval_context(adapter, args)
+        req = mgr.create(
+            ctx=ctx, spec=spec, args=args, operation=actx["operation"],
+            target=actx.get("target"), preconditions=actx.get("preconditions") or {},
+            run_context=run_context,
+        )
+        # wait for the operator decision (bounded by approval expiry)
+        from datetime import UTC, datetime
+
+        def _now():
+            if self._store is not None:
+                return self._store.utcnow()
+            return datetime.now(UTC)
+
+        deadline = datetime.fromisoformat(req.expires_at)
+        while True:
+            row = mgr.get(req.approval_id)
+            status = row["status"] if row else "unknown"
+            if status == "approved":
+                break
+            if status in ("denied", "cancelled", "expired", "unknown"):
+                raise ApprovalError(
+                    f"approval {req.approval_id} was {status}; action not authorized"
+                )
+            if _now() >= deadline:
+                mgr.sweep_expired()
+                raise ApprovalError(f"approval {req.approval_id} expired")
+            wait(0.2)
+        # revalidate EVERYTHING immediately before execution
+        if not self.policy.allows(ctx.agent, spec.name):
+            raise ToolPermissionError("policy changed since request — re-denied")
+        digest = args_sha256(args)
+        run_row = self._run_lease(ctx)
+        if self.strict:
+            if run_row is None or run_row.state.value != "running":
+                raise ToolPermissionError("run not active — fail closed")
+        if not mgr.consume(req.approval_id, expected_args_sha256=digest):
+            raise ApprovalError(
+                "approval consume failed: replay, argument substitution or expiry"
+            )
+        return req.approval_id, run_row
+
+    def _ledger_start(self, spec: ToolSpec, ctx: ToolExecutionContext,
+                      run_context: RunContext | None, execution_id: str,
+                      args: dict[str, Any], approval_id: str,
+                      run_row: Any) -> None:
+        """Persist the execution-start record BEFORE the side effect. Mutating tools
+        REQUIRE a durable ledger and valid ownership — otherwise fail closed."""
+        mutating = spec.side_effect in (SideEffect.LOCAL_MUTATION, SideEffect.EXTERNAL_MUTATION)
+        if self._store is None or not ctx.run_id:
+            if mutating:
+                raise ToolPermissionError(
+                    f"tool '{spec.name}' mutates state but no durable ledger is "
+                    "configured — failing closed"
+                )
+            return
+        if mutating:
+            if run_row is None or run_row.state.value != "running":
+                raise ToolPermissionError(
+                    f"tool '{spec.name}' requires a valid lease owner — failing closed"
+                )
+        from .tool_spec import canonical_args
+
+        ok = self._store.ledger_start(
+            execution_id=execution_id, run_id=ctx.run_id, task_id=ctx.task_id,
+            agent=ctx.agent, tool=spec.name, tool_version=spec.version,
+            args_sha256=args_sha256(args), args_json=canonical_args(args)[: 8_000],
+            status="started" if mutating else "reserved",
+            approval_id=approval_id or None,
+            lease_owner=(run_row.lease_owner if run_row is not None else None),
+            lease_generation=(run_row.lease_generation if run_row is not None else None),
+        )
+        if not ok:
+            raise ToolPermissionError(
+                f"duplicate execution id {execution_id} — refusing to double-dispatch"
+            )
+
+    def _ledger_finish(self, spec: ToolSpec, execution_id: str, status: str,
+                       run_row: Any, *, error: str | None = None,
+                       output: str = "") -> None:
+        if self._store is None:
+            return
+        import hashlib as _hl
+
+        self._store.ledger_update(
+            execution_id, status=status, error=error,
+            result_sha256=_hl.sha256(output.encode()).hexdigest() if output else None,
+            lease_owner=(run_row.lease_owner if run_row is not None else None),
+            lease_generation=(run_row.lease_generation if run_row is not None else None),
+        )
+
     # ---- sync path ----
     def execute(self, tool: str, args: Any, *, ctx: ToolExecutionContext,
                 run_context: RunContext | None = None) -> ToolResult:
         execution_id = uuid4().hex
         started = time.perf_counter()
+        reg = None
+        run_row = None
+        approval_id = ""
         try:
             self._check_context(ctx, run_context)
             reg = self.catalog.get(tool)
@@ -197,16 +313,16 @@ class ToolGateway:
                         f"tool '{tool}' requires approval but no ApprovalManager is "
                         "configured — failing closed"
                     )
-                approval_id = self.approval_manager.request(
-                    ctx, spec, validated, run_context=run_context
+                approval_id, run_row = self._obtain_approval(
+                    spec, ctx, validated, reg.adapter, run_context, self._sleep
                 )
-                raise ApprovalRequiredError(
-                    f"tool '{tool}' requires human approval (pending approval "
-                    f"{approval_id}); waiting for operator",
-                    approval_id=approval_id,
-                )
+            else:
+                run_row = self._run_lease(ctx)
+            self._ledger_start(spec, ctx, run_context, execution_id, validated,
+                               approval_id, run_row)
             output = self._run_sync(reg.adapter, validated, ctx, spec, run_context)
             text, nbytes, truncated = self._shape_output(spec, output)
+            self._ledger_finish(spec, execution_id, "completed", run_row, output=text)
             result = ToolResult(
                 tool=tool, agent=ctx.agent, ok=True, output=text, status="completed",
                 execution_id=execution_id, duration_ms=(time.perf_counter() - started) * 1000,
@@ -218,10 +334,19 @@ class ToolGateway:
                 status = "waiting_approval"
             elif isinstance(exc, ToolTimeoutError):
                 status = "timeout"
+            elif isinstance(exc, ApprovalError):
+                status = "rejected"
             result = ToolResult(
                 tool=tool, agent=ctx.agent, ok=False, error=str(exc), status=status,
                 execution_id=execution_id, duration_ms=(time.perf_counter() - started) * 1000,
             )
+            if reg is not None and self._store is not None and ctx.run_id:
+                mutating = reg.spec.side_effect in (SideEffect.LOCAL_MUTATION,
+                                                    SideEffect.EXTERNAL_MUTATION)
+                final = "unknown" if isinstance(exc, ToolTimeoutError) and mutating else (
+                    "failed" if status == "rejected" and execution_id else "rejected"
+                )
+                self._ledger_finish(reg.spec, execution_id, final, run_row, error=str(exc))
         self._record(ctx, run_context, tool=tool, status=result.status,
                      execution_id=execution_id, error=result.error,
                      duration_ms=result.duration_ms, output_bytes=result.output_bytes)
@@ -272,6 +397,9 @@ class ToolGateway:
                        run_context: RunContext | None = None) -> ToolResult:
         execution_id = uuid4().hex
         started = time.perf_counter()
+        reg = None
+        run_row = None
+        approval_id = ""
         try:
             self._check_context(ctx, run_context)
             reg = self.catalog.get(tool)
@@ -290,16 +418,17 @@ class ToolGateway:
                         f"tool '{tool}' requires approval but no ApprovalManager is "
                         "configured — failing closed"
                     )
-                approval_id = self.approval_manager.request(
-                    ctx, spec, validated, run_context=run_context
+
+                approval_id, run_row = await self._obtain_approval_async(
+                    spec, ctx, validated, reg.adapter, run_context
                 )
-                raise ApprovalRequiredError(
-                    f"tool '{tool}' requires human approval (pending approval "
-                    f"{approval_id}); waiting for operator",
-                    approval_id=approval_id,
-                )
+            else:
+                run_row = self._run_lease(ctx)
+            self._ledger_start(spec, ctx, run_context, execution_id, validated,
+                               approval_id, run_row)
             output = await self._run_async(reg.adapter, validated, ctx, spec, run_context)
             text, nbytes, truncated = self._shape_output(spec, output)
+            self._ledger_finish(spec, execution_id, "completed", run_row, output=text)
             result = ToolResult(
                 tool=tool, agent=ctx.agent, ok=True, output=text, status="completed",
                 execution_id=execution_id, duration_ms=(time.perf_counter() - started) * 1000,
@@ -315,10 +444,67 @@ class ToolGateway:
                 tool=tool, agent=ctx.agent, ok=False, error=str(exc), status=status,
                 execution_id=execution_id, duration_ms=(time.perf_counter() - started) * 1000,
             )
+            if reg is not None and self._store is not None and ctx.run_id:
+                mutating = reg.spec.side_effect in (SideEffect.LOCAL_MUTATION,
+                                                    SideEffect.EXTERNAL_MUTATION)
+                final = "unknown" if isinstance(exc, ToolTimeoutError) and mutating else "failed"
+                self._ledger_finish(reg.spec, execution_id, final, run_row, error=str(exc))
+        except asyncio.CancelledError:
+            if reg is not None and self._store is not None and ctx.run_id:
+                mutating = reg.spec.side_effect in (SideEffect.LOCAL_MUTATION,
+                                                    SideEffect.EXTERNAL_MUTATION)
+                self._ledger_finish(reg.spec, execution_id,
+                                    "unknown" if mutating else "cancelled",
+                                    run_row, error="cancelled")
+            raise
         self._record(ctx, run_context, tool=tool, status=result.status,
                      execution_id=execution_id, error=result.error,
                      duration_ms=result.duration_ms, output_bytes=result.output_bytes)
         return result
+
+    async def _obtain_approval_async(self, spec: ToolSpec, ctx: ToolExecutionContext,
+                                     args: dict[str, Any], adapter: ToolAdapter,
+                                     run_context: RunContext | None) -> tuple[str, Any]:
+        mgr = self.approval_manager
+        assert mgr is not None
+        actx = self._approval_context(adapter, args)
+        req = mgr.create(
+            ctx=ctx, spec=spec, args=args, operation=actx["operation"],
+            target=actx.get("target"), preconditions=actx.get("preconditions") or {},
+            run_context=run_context,
+        )
+        from datetime import UTC, datetime
+
+        def _now():
+            if self._store is not None:
+                return self._store.utcnow()
+            return datetime.now(UTC)
+
+        deadline = datetime.fromisoformat(req.expires_at)
+        while True:
+            row = mgr.get(req.approval_id)
+            status = row["status"] if row else "unknown"
+            if status == "approved":
+                break
+            if status in ("denied", "cancelled", "expired", "unknown"):
+                raise ApprovalError(
+                    f"approval {req.approval_id} was {status}; action not authorized"
+                )
+            if _now() >= deadline:
+                mgr.sweep_expired()
+                raise ApprovalError(f"approval {req.approval_id} expired")
+            await self._async_sleep(0.2)
+        if not self.policy.allows(ctx.agent, spec.name):
+            raise ToolPermissionError("policy changed since request — re-denied")
+        digest = args_sha256(args)
+        run_row = self._run_lease(ctx)
+        if self.strict and (run_row is None or run_row.state.value != "running"):
+            raise ToolPermissionError("run not active — fail closed")
+        if not mgr.consume(req.approval_id, expected_args_sha256=digest):
+            raise ApprovalError(
+                "approval consume failed: replay, argument substitution or expiry"
+            )
+        return req.approval_id, run_row
 
     async def _run_async(self, adapter: ToolAdapter, args: dict[str, Any],
                          ctx: ToolExecutionContext, spec: ToolSpec,
