@@ -21,6 +21,10 @@ def test_calculator_rejects_unsafe_expressions():
     assert tool.run({"expression": "__import__('os').system('ls')"}).startswith("Error")
     assert tool.run({"expression": "open('x.txt')"}).startswith("Error")
     assert tool.run({"expression": "nombre_variable"}).startswith("Error")
+    assert tool.run({"expression": "True + 1"}).startswith("Error")
+    # protección contra DoS: exponentes o resultados enormes deben fallar rápido
+    assert tool.run({"expression": "9**9**9"}).startswith("Error")
+    assert tool.run({"expression": "10**1000000"}).startswith("Error")
 
 
 def test_calculator_division_by_zero():

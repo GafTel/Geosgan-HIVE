@@ -25,17 +25,30 @@ _BIN_OPS = {
 }
 _UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
 
+_MAX_MAGNITUDE = 10**100
+_MAX_EXPONENT = 1000
+
 
 def _eval_node(node: ast.AST) -> float:
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
-    raise ValueError("expresión no permitida")
+        if isinstance(node.value, bool):
+            raise ValueError("expresión no permitida")
+        value = node.value
+    elif isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_EXPONENT:
+            raise ValueError("exponente demasiado grande")
+        value = _BIN_OPS[type(node.op)](left, right)
+    elif isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+        value = _UNARY_OPS[type(node.op)](_eval_node(node.operand))
+    else:
+        raise ValueError("expresión no permitida")
+    if abs(value) > _MAX_MAGNITUDE:
+        raise ValueError("resultado demasiado grande")
+    return value
 
 
 class CalculatorTool:
@@ -53,13 +66,13 @@ class CalculatorTool:
             return "Error: falta el parámetro 'expression'"
         try:
             result = _eval_node(ast.parse(expression, mode="eval"))
+            if isinstance(result, float) and result.is_integer():
+                return str(int(result))
+            return str(result)
         except ZeroDivisionError:
             return "Error: división entre cero"
         except (SyntaxError, ValueError) as exc:
             return f"Error: {exc}"
-        if isinstance(result, float) and result.is_integer():
-            return str(int(result))
-        return str(result)
 
 
 class CurrentDateTimeTool:

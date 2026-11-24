@@ -32,8 +32,14 @@ class AgentResult:
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
     text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:]).removesuffix("```").strip()
     if not (text.startswith("{") and text.endswith("}")):
-        return None
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        text = text[start : end + 1]
     try:
         data = json.loads(text)
     except json.JSONDecodeError:

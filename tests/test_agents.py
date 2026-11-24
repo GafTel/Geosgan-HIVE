@@ -22,6 +22,10 @@ def test_parse_tool_call():
     assert parse_tool_call("texto normal") is None
     assert parse_tool_call('{"tool": "x"}') is None
     assert parse_tool_call("[1, 2]") is None
+    # los modelos reales a veces envuelven el JSON en cercas markdown o texto alrededor
+    fenced = "```json\n" + json.dumps(call) + "\n```"
+    assert parse_tool_call(fenced) == call
+    assert parse_tool_call(f"Aquí está: {json.dumps(call)} fin") == call
 
 
 def test_agent_uses_tool_then_answers():
