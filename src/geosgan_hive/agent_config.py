@@ -11,16 +11,19 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from .errors import ConfigError, HiveError
 from .providers import parse_model
+from .run_context import CollaborationPolicy
 
 #: Core roles of the HIVE. The default config defines exactly these five.
 CORE_ROLES = ("supervisor", "researcher", "developer", "analyst", "reviewer")
 
 
 class Permissions(BaseModel):
-    """Least privilege by default: an agent gets NO tools unless explicitly allowed."""
+    """Least privilege by default: NO tools and NO delegation unless explicit."""
 
     allow_tools: bool = False
     allowed_tools: list[str] = Field(default_factory=list)
+    allow_delegation: bool = False
+    allowed_agents: list[str] = Field(default_factory=list)  # empty = no targets
 
 
 class Limits(BaseModel):
@@ -68,6 +71,7 @@ class HiveConfig(BaseModel):
 
     supervisor: SupervisorSpec
     agents: list[AgentSpec] = Field(min_length=1)
+    collaboration: CollaborationPolicy = Field(default_factory=CollaborationPolicy)
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:
@@ -78,6 +82,13 @@ class HiveConfig(BaseModel):
             raise ValueError(
                 f"supervisor name {self.supervisor.name!r} collides with an agent name"
             )
+        known = set(names)
+        for spec in self.agents:
+            unknown = [t for t in spec.permissions.allowed_agents if t not in known]
+            if unknown:
+                raise ValueError(
+                    f"agent '{spec.name}' may delegate to unknown agents: {unknown}"
+                )
         return self
 
     def agent(self, name: str) -> AgentSpec:
@@ -90,6 +101,7 @@ class HiveConfig(BaseModel):
 #: Scalar fields that can be overridden via env vars (nested models stay YAML-only).
 _AGENT_FIELDS = ("name", "description", "system_prompt", "model", "temperature")
 _SUPERVISOR_FIELDS = _AGENT_FIELDS + ("max_steps",)
+_COLLABORATION_FIELDS = tuple(CollaborationPolicy.model_fields)
 
 
 def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dict[str, Any]:
@@ -114,6 +126,10 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
             if isinstance(agent, dict) and isinstance(agent.get("name"), str):
                 prefix = "HIVE_AGENT_" + agent["name"].upper().replace("-", "_")
                 sections.append((prefix, _AGENT_FIELDS, agent))
+    # always present so HIVE_COLLABORATION_* overrides apply even without a YAML block
+    collaboration = data.setdefault("collaboration", {})
+    if isinstance(collaboration, dict):
+        sections.append(("HIVE_COLLABORATION", _COLLABORATION_FIELDS, collaboration))
     for prefix, fields, section in sections:
         for key in fields:
             env_var = f"{prefix}_{key.upper()}"

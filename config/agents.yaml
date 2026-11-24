@@ -9,6 +9,18 @@
 #   HIVE_AGENT_DEVELOPER_MODEL=ollama/codellama
 #   HIVE_SUPERVISOR_TEMPERATURE=0.1
 #   HIVE_AGENT_REVIEWER_MAX_STEPS... (supervisor only: HIVE_SUPERVISOR_MAX_STEPS)
+#   HIVE_COLLABORATION_MAX_DELEGATION_DEPTH=3
+
+# Run-wide collaboration policy (Phase 2). Conservative defaults; the supervisor
+# retains root authority, agent-to-agent delegation requires BOTH
+# allow_agent_to_agent=true here AND per-agent allow_delegation/allowed_agents.
+collaboration:
+  allow_agent_to_agent: true
+  max_delegation_depth: 2
+  max_handoffs_per_run: 10
+  max_parallel_agents: 3
+  default_delegation_timeout_seconds: 120
+  max_model_calls_per_run: 200
 
 supervisor:
   name: supervisor
@@ -32,7 +44,11 @@ agents:
       when they provide concrete data, and deliver a structured summary.
     model: gemini/gemini-2.0-flash
     temperature: 0.2
-    permissions: {allow_tools: true, allowed_tools: [calculator, current_datetime, word_count]}
+    permissions:
+      allow_tools: true
+      allowed_tools: [calculator, current_datetime, word_count]
+      allow_delegation: true
+      allowed_agents: [analyst, reviewer]
     limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60}
 
   - name: developer
@@ -42,7 +58,11 @@ agents:
       the technical decisions. Use your allowed tools only for concrete data.
     model: mistral/mistral-large-latest
     temperature: 0.1
-    permissions: {allow_tools: true, allowed_tools: [calculator]}
+    permissions:
+      allow_tools: true
+      allowed_tools: [calculator]
+      allow_delegation: true
+      allowed_agents: [researcher]
     limits: {max_tool_steps: 3, max_calls_per_run: 20, timeout_seconds: 90}
 
   - name: analyst
@@ -52,7 +72,11 @@ agents:
       computed with your allowed tools, and report findings with numbers.
     model: anthropic/claude-3-7-sonnet-latest
     temperature: 0.2
-    permissions: {allow_tools: true, allowed_tools: [calculator, word_count]}
+    permissions:
+      allow_tools: true
+      allowed_tools: [calculator, word_count]
+      allow_delegation: true
+      allowed_agents: [researcher]
     limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60}
 
   - name: reviewer
@@ -63,5 +87,9 @@ agents:
       version. You may only measure text with your allowed tools.
     model: ollama/llama3.2
     temperature: 0.2
-    permissions: {allow_tools: true, allowed_tools: [word_count]}
+    permissions:
+      allow_tools: true
+      allowed_tools: [word_count]
+      allow_delegation: false
+      allowed_agents: []
     limits: {max_tool_steps: 2, max_calls_per_run: 10, timeout_seconds: 120}
