@@ -30,6 +30,10 @@ from geosgan_hive.sandbox import WorkspaceSandbox
 from geosgan_hive.tool_factory import build_tool_catalog, build_tool_gateway
 from geosgan_hive.tool_gateway import ToolExecutionContext
 
+posix_writes = pytest.mark.skipif(
+    os.name != "posix", reason="file writes are disabled by default on Windows"
+)
+
 
 def sha(data: str) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
@@ -41,6 +45,7 @@ def make_sandbox(tmp_path, **kwargs) -> WorkspaceSandbox:
 
 # ---- sandbox write primitives ----
 
+@posix_writes
 def test_write_creates_file_atomically_and_cleans_tmp(tmp_path):
     sb = make_sandbox(tmp_path)
     (tmp_path / "ws" / "notes").mkdir()
@@ -51,6 +56,7 @@ def test_write_creates_file_atomically_and_cleans_tmp(tmp_path):
     assert leftovers == []  # tmp file replaced, not left behind
 
 
+@posix_writes
 def test_write_refuses_existing_file_and_update_requires_existing(tmp_path):
     sb = make_sandbox(tmp_path)
     sb.write_text("a.txt", "v1")
@@ -61,6 +67,7 @@ def test_write_refuses_existing_file_and_update_requires_existing(tmp_path):
     assert (tmp_path / "ws" / "a.txt").read_text() == "v1"
 
 
+@posix_writes
 def test_update_binds_to_expected_sha256(tmp_path):
     sb = make_sandbox(tmp_path)
     sb.write_text("a.txt", "v1")
@@ -93,6 +100,7 @@ def test_write_rejects_traversal_outside_denied_names_extensions_symlinks(tmp_pa
     assert (tmp_path / "ws" / "real.txt").read_text() == "real"
 
 
+@posix_writes
 def test_write_size_cap_and_extension_allowlist_configurable(tmp_path):
     sb = make_sandbox(tmp_path, write_extensions=[".txt"])
     with pytest.raises(SandboxViolationError, match="allowlist"):
@@ -125,10 +133,14 @@ def test_write_tools_not_registered_unless_allow_write(tmp_path, monkeypatch):
                                                         workspace_root=str(tmp_path / "ws"))))
     assert "fs_write" not in catalog.names() and "fs_update" not in catalog.names()
     assert "fs_read" in catalog.names()
-    catalog2, _ = build_tool_catalog(_config(ToolsConfig(enabled=["fs_write", "fs_update"],
-                                                         allow_write=True,
-                                                         workspace_root=str(tmp_path / "ws"))))
-    assert "fs_write" in catalog2.names() and "fs_update" in catalog2.names()
+    catalog2, sb2 = build_tool_catalog(_config(ToolsConfig(enabled=["fs_write", "fs_update"],
+                                                            allow_write=True,
+                                                            workspace_root=str(tmp_path / "ws"))))
+    if os.name == "posix":
+        assert "fs_write" in catalog2.names() and "fs_update" in catalog2.names()
+    else:  # Windows: writes are disabled by default, so they stay unregistered
+        assert sb2.platform == "nt"
+        assert "fs_write" not in catalog2.names() and "fs_update" not in catalog2.names()
     spec = catalog2.get("fs_update").spec
     assert spec.side_effect.value == "local_mutation" and spec.approval_required is True
 
@@ -182,6 +194,7 @@ def _wait_pending(gw, timeout=5.0):
     raise AssertionError("no pending approval appeared")
 
 
+@posix_writes
 def test_fs_write_full_approval_flow_writes_file(tmp_path):
     store, gw, rc = make_env(tmp_path)
     box = {}
@@ -213,6 +226,7 @@ def test_fs_write_full_approval_flow_writes_file(tmp_path):
     store.close()
 
 
+@posix_writes
 def test_fs_write_denied_means_no_file(tmp_path):
     store, gw, rc = make_env(tmp_path)
     box = {}
@@ -229,6 +243,7 @@ def test_fs_write_denied_means_no_file(tmp_path):
     store.close()
 
 
+@posix_writes
 def test_fs_update_rejected_when_file_changed_after_approval(tmp_path):
     store, gw, rc = make_env(tmp_path)
     target = tmp_path / "ws" / "doc.txt"
@@ -252,6 +267,7 @@ def test_fs_update_rejected_when_file_changed_after_approval(tmp_path):
     store.close()
 
 
+@posix_writes
 def test_fs_update_happy_path_with_hash_precondition(tmp_path):
     store, gw, rc = make_env(tmp_path)
     target = tmp_path / "ws" / "doc.txt"
@@ -271,6 +287,7 @@ def test_fs_update_happy_path_with_hash_precondition(tmp_path):
     store.close()
 
 
+@posix_writes
 def test_fs_write_strict_arg_validation_rejects_extra_args(tmp_path):
     store, gw, rc = make_env(tmp_path)
     r = gw.execute("fs_write", {"path": "a.txt", "content": "x", "mode": "777"},
@@ -282,6 +299,7 @@ def test_fs_write_strict_arg_validation_rejects_extra_args(tmp_path):
     store.close()
 
 
+@posix_writes
 def test_policy_requires_approval_for_mutating_file_tools(tmp_path):
     store, gw, rc = make_env(tmp_path)
     spec = gw.catalog.get("fs_write").spec

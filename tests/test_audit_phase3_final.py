@@ -390,6 +390,7 @@ gw.execute("mut", {"path": "out.txt", "content": "data"},
 """
 
 
+@pytest.mark.skipif(os.name != "posix", reason="write path is disabled on Windows")
 def test_crash_during_file_replacement_leaves_no_partial_target_and_no_replay(tmp_path):
     db = str(tmp_path / "crash.db")
     wsdir = tmp_path / "ws"
