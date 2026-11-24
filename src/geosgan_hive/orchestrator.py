@@ -257,19 +257,14 @@ class Supervisor:
 
     async def _acomplete(self, messages: list[Message], *, run_id: str | None,
                          run_context: RunContext | None = None) -> str:
+        # request-level concurrency is bounded at the gateway dispatch boundary
         acomplete = getattr(self.llm, "acomplete", None)
         if acomplete is not None:
-            async def call():
-                return await acomplete(messages, temperature=self.temperature, run_id=run_id)
-        else:  # legacy sync-only adapter: thread fallback only
-            async def call():
-                return await asyncio.to_thread(
-                    self.llm.complete, messages, temperature=self.temperature, run_id=run_id
-                )
-        if run_context is not None:
-            async with run_context.semaphore():  # bound active model requests
-                return await call()
-        return await call()
+            return await acomplete(messages, temperature=self.temperature, run_id=run_id)
+        # legacy sync-only adapter: thread fallback only
+        return await asyncio.to_thread(
+            self.llm.complete, messages, temperature=self.temperature, run_id=run_id
+        )
 
     async def arun(self, task: str, *, run_id: str | None = None) -> OrchestratorResult:
         """Native async twin of `run` (sequential routing; agents run via arun)."""
@@ -304,7 +299,7 @@ class Supervisor:
                 )
             try:
                 raw = await self._acomplete(
-                    [self._system_message(), *transcript], run_id=run_id, run_context=ctx
+                    [self._system_message(), *transcript], run_id=run_id
                 )
             except GatewayError as exc:
                 return OrchestratorResult(

@@ -15,15 +15,17 @@ from .errors import (
     BadRequestError as HiveBadRequestError,
 )
 from .errors import (
-    ContextWindowExceededError as HiveContextWindowError,
-)
-from .errors import (
+    BudgetExceededError,
     GatewayConnectionError,
     GatewayError,
     GatewayTimeoutError,
+    HiveError,
     PermanentGatewayError,
     RateLimitError,
     ServiceUnavailableError,
+)
+from .errors import (
+    ContextWindowExceededError as HiveContextWindowError,
 )
 from .errors import (
     QuotaExhaustedError as HiveQuotaError,
@@ -65,8 +67,8 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
 
 def _map_litellm_error(exc: BaseException) -> GatewayError:
     """Map a LiteLLM exception to the HIVE error hierarchy."""
-    if isinstance(exc, GatewayError):
-        return exc
+    if isinstance(exc, HiveError):
+        return exc  # already a HIVE error (incl. terminal BudgetExceededError)
     import litellm.exceptions as litellm_exc
 
     if isinstance(exc, litellm_exc.ContextWindowExceededError):
@@ -109,6 +111,7 @@ class ModelGateway:
         environ: Mapping[str, str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         async_sleep: Callable[[float], Any] = asyncio.sleep,
+        context_lookup: Callable[[str], Any] | None = None,
     ) -> None:
         self.tracker = tracker if tracker is not None else UsageTracker()
         self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -117,6 +120,58 @@ class ModelGateway:
         self._sleep = sleep
         self._async_sleep = async_sleep
         self._credentials: dict[Provider, Credentials] = {}
+        self._context_lookup = context_lookup
+
+    def set_context_lookup(self, lookup: Callable[[str], Any]) -> None:
+        """Wire the gateway to the run contexts (e.g. engine.context_for) so every
+        dispatch can reserve its physical attempt and request slot atomically."""
+        self._context_lookup = lookup
+
+    def _run_context(self, run_id: str | None) -> Any:
+        if run_id and self._context_lookup is not None:
+            return self._context_lookup(run_id)
+        return None
+
+    def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
+        """One physical dispatch: reserve the physical attempt atomically, acquire
+        the request slot ONLY around the in-flight request (never during backoff,
+        cooldown, checkpointing or delegation waits), then call LiteLLM."""
+        ctx = self._run_context(run_id)
+        import litellm
+
+        if ctx is None:
+            return litellm.completion(**kwargs)
+        if not ctx.reserve_physical_request():
+            raise BudgetExceededError(
+                f"Physical provider-request limit "
+                f"({ctx.policy.max_provider_requests_per_run}) reached for this run."
+            )
+        sem = ctx.sync_semaphore()
+        sem.acquire()
+        try:
+            return litellm.completion(**kwargs)
+        finally:
+            sem.release()
+
+    async def _dispatch_async(
+        self, kwargs: dict[str, Any], *, model: str, run_id: str | None
+    ) -> Any:
+        ctx = self._run_context(run_id)
+        import litellm
+
+        if ctx is None:
+            return await litellm.acompletion(**kwargs)
+        if not ctx.reserve_physical_request():
+            raise BudgetExceededError(
+                f"Physical provider-request limit "
+                f"({ctx.policy.max_provider_requests_per_run}) reached for this run."
+            )
+        sem = ctx.semaphore()
+        await sem.acquire()
+        try:
+            return await litellm.acompletion(**kwargs)
+        finally:
+            sem.release()
 
     def bind(
         self,
@@ -178,18 +233,20 @@ class ModelGateway:
         for attempt in range(1, policy.max_attempts + 1):
             started = time.perf_counter()
             try:
-                import litellm
-
-                response = litellm.completion(**kwargs)
+                response = self._dispatch_sync(kwargs, model=model, run_id=run_id)
             except Exception as exc:
                 error = _map_litellm_error(exc)
                 if is_retryable(error) and attempt < policy.max_attempts:
                     self._sleep(policy.delay_for_attempt(attempt, _retry_after_seconds(exc)))
                     continue
-                self._record_failure(
-                    model=model, agent=agent, run_id=run_id, attempts=attempt,
-                    error=type(error).__name__, latency_ms=(time.perf_counter() - started) * 1000,
-                )
+                if not getattr(error, "terminal", False):
+                    # terminal errors (budget/cancelled) never reached a provider:
+                    # reserved-but-not-dispatched is not a confirmed request
+                    self._record_failure(
+                        model=model, agent=agent, run_id=run_id, attempts=attempt,
+                        error=type(error).__name__,
+                        latency_ms=(time.perf_counter() - started) * 1000,
+                    )
                 raise error from exc
             latency_ms = (time.perf_counter() - started) * 1000
             return self._to_response(
@@ -240,9 +297,7 @@ class ModelGateway:
         for attempt in range(1, policy.max_attempts + 1):
             started = time.perf_counter()
             try:
-                import litellm
-
-                response = await litellm.acompletion(**kwargs)
+                response = await self._dispatch_async(kwargs, model=model, run_id=run_id)
             except asyncio.CancelledError:
                 self._record_failure(
                     model=model, agent=agent, run_id=run_id, attempts=attempt,
@@ -255,10 +310,14 @@ class ModelGateway:
                     delay = policy.delay_for_attempt(attempt, _retry_after_seconds(exc))
                     await self._async_sleep(delay)
                     continue
-                self._record_failure(
-                    model=model, agent=agent, run_id=run_id, attempts=attempt,
-                    error=type(error).__name__, latency_ms=(time.perf_counter() - started) * 1000,
-                )
+                if not getattr(error, "terminal", False):
+                    # terminal errors (budget/cancelled) never reached a provider:
+                    # reserved-but-not-dispatched is not a confirmed request
+                    self._record_failure(
+                        model=model, agent=agent, run_id=run_id, attempts=attempt,
+                        error=type(error).__name__,
+                        latency_ms=(time.perf_counter() - started) * 1000,
+                    )
                 raise error from exc
             latency_ms = (time.perf_counter() - started) * 1000
             return self._to_response(

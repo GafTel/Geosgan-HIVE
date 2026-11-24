@@ -108,7 +108,9 @@ class RunContext:
         self._model_calls = 0
         self._handoffs = 0
         self._agent_calls: dict[str, int] = {}
+        self._physical_reserved = 0
         self._semaphore: asyncio.Semaphore | None = None
+        self._sync_semaphore: threading.Semaphore | None = None
 
     # ---- model-call budget (run-wide, atomic) ----
     def reserve_model_call(self, task_id: str | None = None) -> bool:
@@ -167,6 +169,47 @@ class RunContext:
         so per-agent limits cannot be bypassed by repeated delegation."""
         with self._lock:
             return self._agent_calls.get(agent, 0)
+
+    def reserve_physical_request(self) -> bool:
+        """Atomically reserve one PHYSICAL dispatch attempt (initial request, retry,
+        fallback attempt or recovery probe) BEFORE the request is sent.
+
+        Separate from the logical-call reservation. If the process crashes after
+        reserving, the consumed reservation is conservatively retained (never
+        re-granted on restart). Reserved dispatch attempts are distinct from
+        confirmed HTTP requests (tracker `attempts`) and from provider billing.
+        """
+        with self._lock:
+            cap = self.policy.max_provider_requests_per_run
+            if cap is not None and self._physical_reserved >= cap:
+                return False
+            self._physical_reserved += 1
+            return True
+
+    @property
+    def physical_reserved(self) -> int:
+        """Physical dispatch attempts reserved so far (pre-dispatch)."""
+        with self._lock:
+            return self._physical_reserved
+
+    def counters_snapshot(self) -> dict:
+        """Persistable budget counters (for durable checkpoints)."""
+        with self._lock:
+            return {
+                "model_calls": self._model_calls,
+                "physical_reserved": self._physical_reserved,
+                "handoffs": self._handoffs,
+                "agent_calls": dict(self._agent_calls),
+            }
+
+    def restore_counters(self, snapshot: dict) -> None:
+        """Restore persisted counters after a restart WITHOUT re-reserving: a
+        resumed logical call must not be counted again."""
+        with self._lock:
+            self._model_calls = int(snapshot.get("model_calls", 0))
+            self._physical_reserved = int(snapshot.get("physical_reserved", 0))
+            self._handoffs = int(snapshot.get("handoffs", 0))
+            self._agent_calls = {k: int(v) for k, v in snapshot.get("agent_calls", {}).items()}
 
     @property
     def physical_requests(self) -> int:
@@ -303,11 +346,18 @@ class RunContext:
 
     # ---- bounded concurrency (async runs; one event loop per run) ----
     def semaphore(self) -> asyncio.Semaphore:
-        """Bounds ACTIVE model requests (acquired per model call, never while an
-        agent waits for its delegated subtasks, so it cannot deadlock)."""
+        """Bounds ACTIVE model requests on the async path (acquired at the gateway
+        dispatch boundary only, never while waiting/backing off, so it cannot
+        deadlock and is never double-acquired)."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.policy.max_parallel_agents)
         return self._semaphore
+
+    def sync_semaphore(self) -> threading.Semaphore:
+        """Same bound for the synchronous dispatch path."""
+        if self._sync_semaphore is None:
+            self._sync_semaphore = threading.Semaphore(self.policy.max_parallel_agents)
+        return self._sync_semaphore
 
     def close(self) -> None:
         with self._lock:

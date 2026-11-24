@@ -59,48 +59,58 @@ def delegated(handler):
 
 # ---------- E1: active model requests never exceed the concurrency limit ----------
 
-def test_nested_parallel_never_exceeds_active_model_request_limit():
+def test_nested_parallel_never_exceeds_active_model_request_limit(monkeypatch):
+    """max_parallel_agents bounds ACTIVE model requests at the gateway dispatch
+    boundary, even with nested parallel delegation (no slot is held while an
+    agent waits for its subtasks, so this can also never deadlock)."""
+    from types import SimpleNamespace
+
+    import litellm
+
+    from geosgan_hive.gateway import ModelGateway
+
     peak = {"cur": 0, "max": 0}
+    plans = {
+        "root": ["b", "c"],
+        "b": ["d", "e"],
+        "c": ["f", "g"],
+    }
 
-    def leaf(name):
-        async def handler(messages):
-            peak["cur"] += 1
-            peak["max"] = max(peak["max"], peak["cur"])
-            await asyncio.sleep(0.02)  # inside the model call
-            peak["cur"] -= 1
-            return f"{name} ok"
-
-        return handler
-
-    def mid(name, children):
-        async def handler(messages):
-            if any("Delegation result from" in m.content for m in messages):
-                return f"{name} final"
-            return json.dumps({"delegations": [
-                {"target": c, "task": f"{name}->{c}"} for c in children
+    async def fake_acompletion(**kwargs):
+        name = kwargs["model"].split("/", 1)[1]
+        peak["cur"] += 1
+        peak["max"] = max(peak["max"], peak["cur"])
+        await asyncio.sleep(0.02)
+        peak["cur"] -= 1
+        msgs = kwargs["messages"]
+        if any("Delegation result from" in m["content"] for m in msgs):
+            content = f"{name} final"
+        elif name in plans:
+            content = json.dumps({"delegations": [
+                {"target": t, "task": f"{name}->{t}"} for t in plans[name]
             ]})
+        else:
+            content = f"{name} ok"
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            model=kwargs["model"],
+        )
 
-        return handler
-
-    async def root(messages):
-        if any("Delegation result from" in m.content for m in messages):
-            return "root final"
-        return json.dumps({"delegations": [
-            {"target": "b", "task": "b"}, {"target": "c", "task": "c"},
-        ]})
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
 
     engine = CollaborationEngine(policy=policy(max_parallel_agents=2, max_delegation_depth=2))
+    gateway = ModelGateway(tracker=engine.tracker)
+    gateway.set_context_lookup(engine.context_for)
+    names = ["root", "b", "c", "d", "e", "f", "g"]
+    allowed = {"root": ["b", "c"], "b": ["d", "e"], "c": ["f", "g"]}
     agents = {
-        "root": make_agent("root", FakeLLM(handler=root), engine,
-                           allow_delegation=True, allowed_agents=["b", "c"]),
-        "b": make_agent("b", FakeLLM(handler=mid("b", ["d", "e"])), engine,
-                        allow_delegation=True, allowed_agents=["d", "e"]),
-        "c": make_agent("c", FakeLLM(handler=mid("c", ["f", "g"])), engine,
-                        allow_delegation=True, allowed_agents=["f", "g"]),
-        "d": make_agent("d", FakeLLM(handler=leaf("d")), engine),
-        "e": make_agent("e", FakeLLM(handler=leaf("e")), engine),
-        "f": make_agent("f", FakeLLM(handler=leaf("f")), engine),
-        "g": make_agent("g", FakeLLM(handler=leaf("g")), engine),
+        name: make_agent(
+            name, gateway.bind(f"ollama/{name}", agent=name), engine,
+            allow_delegation=name in allowed, allowed_agents=allowed.get(name, []),
+        )
+        for name in names
     }
     engine.register(agents)
     ctx = engine.context_for("e1")
@@ -120,6 +130,8 @@ def test_nested_parallel_never_exceeds_active_model_request_limit():
     assert peak["max"] == 2  # parallelism was actually used
     leaves = [t for t in ctx.tasks() if t.agent in ("d", "e", "f", "g")]
     assert len(leaves) == 4 and all(t.status == TaskStatus.COMPLETED for t in leaves)
+    # root/b/c make 2 calls each (delegate, then final), leaves 1 each: 3*2+4 = 10
+    assert ctx.physical_reserved == 10
 
 
 # ---------- E2: atomic per-agent check+reserve under concurrency ----------
