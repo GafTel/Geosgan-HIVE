@@ -141,8 +141,9 @@ def test_write_tools_not_registered_unless_allow_write(tmp_path, monkeypatch):
     else:  # Windows: writes are disabled by default, so they stay unregistered
         assert sb2.platform == "nt"
         assert "fs_write" not in catalog2.names() and "fs_update" not in catalog2.names()
-    spec = catalog2.get("fs_update").spec
-    assert spec.side_effect.value == "local_mutation" and spec.approval_required is True
+    if os.name == "posix":
+        spec = catalog2.get("fs_update").spec
+        assert spec.side_effect.value == "local_mutation" and spec.approval_required is True
 
 
 def test_legacy_mode_denies_all_non_builtin_tools(tmp_path, monkeypatch):
