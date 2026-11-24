@@ -5,9 +5,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .agent_config import Limits, Permissions
+from .errors import ConfigError
 from .llm import LLMClient
 from .messages import Message
 from .tools import ToolRegistry
+from .usage import UsageTracker
 
 TOOL_CALL_INSTRUCTIONS = """\
 When you need to use a tool, reply ONLY with a JSON like:
@@ -54,8 +57,38 @@ def parse_tool_call(text: str) -> dict[str, Any] | None:
     return None
 
 
+def check_run_limits(
+    tracker: UsageTracker | None,
+    run_id: str | None,
+    calls: int,
+    limits: Limits,
+) -> str | None:
+    """Return a stop message when a hard per-run limit is reached.
+
+    The cost budget is a soft limit: it is only enforced while the run's cost is
+    reliably known (`cost_for_run` returns None when any call of the run has an
+    unknown cost, e.g. a local model), so we never claim budget enforcement on
+    unreliable cost data.
+    """
+    if calls >= limits.max_calls_per_run:
+        return f"Execution limit reached: max {limits.max_calls_per_run} model calls per run."
+    if tracker is not None and run_id is not None and limits.max_cost_usd_per_run is not None:
+        cost = tracker.cost_for_run(run_id)
+        if cost is not None and cost >= limits.max_cost_usd_per_run:
+            return (
+                f"Cost budget reached: known spend ${cost:.4f} >= "
+                f"limit ${limits.max_cost_usd_per_run:.4f}."
+            )
+    return None
+
+
 class Agent:
-    """Individual agent with a tool-calling loop until it gives its answer."""
+    """Individual agent with a bounded tool-calling loop until it answers.
+
+    Least privilege: only the tools explicitly allowed in `permissions` are
+    visible to the model. Any other tool call is rejected by the filtered
+    registry ("unknown tool"), never executed.
+    """
 
     def __init__(
         self,
@@ -65,16 +98,34 @@ class Agent:
         llm: LLMClient,
         tools: ToolRegistry | None = None,
         *,
-        max_tool_steps: int = 5,
+        permissions: Permissions | None = None,
+        limits: Limits | None = None,
+        usage_tracker: UsageTracker | None = None,
         temperature: float = 0.2,
     ) -> None:
         self.name = name
         self.description = description
         self.system_prompt = system_prompt
         self.llm = llm
-        self.tools = tools or ToolRegistry()
-        self.max_tool_steps = max_tool_steps
+        self.permissions = permissions or Permissions()
+        self.limits = limits or Limits()
+        self.usage_tracker = usage_tracker
         self.temperature = temperature
+        self.tools = self._effective_registry(tools or ToolRegistry())
+
+    def _effective_registry(self, registry: ToolRegistry) -> ToolRegistry:
+        if not self.permissions.allow_tools:
+            return ToolRegistry()
+        allowed = []
+        for name in self.permissions.allowed_tools:
+            tool = registry.get(name)
+            if tool is None:
+                raise ConfigError(
+                    f"Agent '{self.name}' allows unknown tool '{name}'. "
+                    f"Registered tools: {registry.names()}"
+                )
+            allowed.append(tool)
+        return ToolRegistry(allowed)
 
     def _system_message(self) -> Message:
         prompt = self.system_prompt
@@ -85,17 +136,26 @@ class Agent:
             prompt += "\n\n" + TOOL_CALL_INSTRUCTIONS
         return Message(role="system", content=prompt, agent=self.name)
 
-    def run(self, task: str, context: Sequence[Message] = ()) -> AgentResult:
+    def run(
+        self, task: str, context: Sequence[Message] = (), *, run_id: str | None = None
+    ) -> AgentResult:
         messages = [self._system_message(), *context, Message(role="user", content=task)]
         tool_calls: list[ToolCall] = []
-        max_iterations = self.max_tool_steps + 2
+        calls = 0
+        max_iterations = self.limits.max_tool_steps + 2
         raw = ""
         for step in range(1, max_iterations + 1):
-            raw = self.llm.complete(messages, temperature=self.temperature)
+            stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
+            if stop is not None:
+                return AgentResult(
+                    agent=self.name, answer=stop, tool_calls=tool_calls, steps=step - 1
+                )
+            raw = self.llm.complete(messages, temperature=self.temperature, run_id=run_id)
+            calls += 1
             call = parse_tool_call(raw)
             if call is None:
                 return AgentResult(agent=self.name, answer=raw, tool_calls=tool_calls, steps=step)
-            if len(tool_calls) >= self.max_tool_steps:
+            if len(tool_calls) >= self.limits.max_tool_steps:
                 messages.append(Message(role="assistant", content=raw, agent=self.name))
                 messages.append(
                     Message(

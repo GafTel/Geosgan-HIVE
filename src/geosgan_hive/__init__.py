@@ -1,6 +1,16 @@
 """GEOSGAN HIVE: base of a hybrid multi-agent AI system."""
 
-from .agents import Agent, AgentResult, ToolCall, parse_tool_call
+from .agent_config import (
+    CORE_ROLES,
+    AgentSpec,
+    HiveConfig,
+    Limits,
+    Permissions,
+    SupervisorSpec,
+    apply_env_overrides,
+    load_hive_config,
+)
+from .agents import Agent, AgentResult, ToolCall, check_run_limits, parse_tool_call
 from .config import Settings, load_settings
 from .errors import (
     AuthenticationError,
@@ -18,8 +28,9 @@ from .errors import (
     TransientGatewayError,
     UnknownProviderError,
 )
+from .factory import build_agent, build_supervisor, build_team
 from .gateway import GatewayLLMClient, LLMResponse, ModelGateway
-from .llm import FakeLLM, LiteLLMClient, LLMClient
+from .llm import FakeLLM, LLMClient
 from .messages import Message
 from .orchestrator import FINISH, OrchestratorResult, Supervisor
 from .providers import Credentials, Provider, ProviderSpec, parse_model, resolve_credentials
@@ -32,9 +43,11 @@ __version__ = "0.2.0"
 __all__ = [
     "Agent",
     "AgentResult",
+    "AgentSpec",
     "AuthenticationError",
     "BadRequestError",
     "BudgetExceededError",
+    "CORE_ROLES",
     "ConfigError",
     "Credentials",
     "FakeLLM",
@@ -43,15 +56,17 @@ __all__ = [
     "GatewayError",
     "GatewayLLMClient",
     "GatewayTimeoutError",
+    "HiveConfig",
     "HiveError",
     "LLMClient",
     "LLMResponse",
-    "LiteLLMClient",
+    "Limits",
     "Message",
     "MissingCredentialsError",
     "ModelGateway",
     "OrchestratorResult",
     "PermanentGatewayError",
+    "Permissions",
     "Provider",
     "ProviderSpec",
     "RateLimitError",
@@ -59,6 +74,7 @@ __all__ = [
     "ServiceUnavailableError",
     "Settings",
     "Supervisor",
+    "SupervisorSpec",
     "ToolCall",
     "ToolRegistry",
     "TransientGatewayError",
@@ -66,8 +82,14 @@ __all__ = [
     "UsageRecord",
     "UsageSummary",
     "UsageTracker",
+    "apply_env_overrides",
+    "build_agent",
+    "build_supervisor",
+    "build_team",
+    "check_run_limits",
     "default_registry",
     "is_retryable",
+    "load_hive_config",
     "load_settings",
     "parse_model",
     "parse_tool_call",

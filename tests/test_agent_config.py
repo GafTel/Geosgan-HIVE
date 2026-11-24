@@ -164,4 +164,4 @@ def test_supervisor_spec_extends_agent_spec():
     )
     assert isinstance(spec, AgentSpec)
     assert spec.max_steps == 8
-    assert isinstance(spec, HiveConfig.__fields__["supervisor"].annotation)
+    assert isinstance(spec, HiveConfig.model_fields["supervisor"].annotation)

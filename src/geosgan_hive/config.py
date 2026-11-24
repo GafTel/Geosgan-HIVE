@@ -7,17 +7,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Global settings read from environment variables with prefix HIVE_ (or a .env file)."""
+    """Global settings read from environment variables with prefix HIVE_ (or a .env file).
+
+    Per-agent model/permissions/limits live in the YAML config (see agent_config),
+    not here. Provider API keys are read from their own env vars at call time.
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="HIVE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    model: str = "openai/gpt-4o-mini"
-    api_key: str | None = None
-    max_steps: int = 8
-    max_tool_steps: int = 5
-    temperature: float = 0.2
     config_path: Path = Path("config/agents.yaml")
     usage_log: Path | None = None
     default_timeout_seconds: float = 60.0
