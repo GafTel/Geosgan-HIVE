@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from .agents import Agent
+from .checkpoints import CheckpointStore
 from .collaboration import CollaborationEngine
 from .fallback import FallbackPolicy, effective_policy
 from .gateway import ModelGateway
@@ -51,6 +52,8 @@ def build_supervisor(
     tracker: UsageTracker,
     collaboration: CollaborationEngine | None = None,
     global_fallback: FallbackPolicy | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    checkpoint_config_json: str | None = None,
 ) -> Supervisor:
     policy = effective_policy(spec.fallback, global_fallback or FallbackPolicy())
     llm = gateway.bind(
@@ -70,6 +73,10 @@ def build_supervisor(
         usage_tracker=tracker,
         limits=spec.limits,
         collaboration=collaboration,
+        checkpoint_store=checkpoint_store,
+        checkpoint_config_json=checkpoint_config_json,
+        suspend_cooldown_seconds=policy.cooldown_seconds,
+        max_wait_seconds=policy.max_wait_seconds,
     )
 
 
@@ -87,6 +94,19 @@ def build_team(
     # attempt and request slot atomically at the dispatch boundary
     if hasattr(gateway, "set_context_lookup"):
         gateway.set_context_lookup(engine.context_for)
+    # the global fallback policy also configures the gateway health registry
+    # (in-memory; in-process cooldowns use a monotonic clock)
+    if hasattr(gateway, "health"):
+        gateway.health.failure_threshold = config.fallback.failure_threshold
+        gateway.health.cooldown_seconds = config.fallback.cooldown_seconds
+        gateway.health.half_open_max_probes = config.fallback.half_open_max_probes
+    store = None
+    if config.checkpoint is not None:
+        store = CheckpointStore(
+            config.checkpoint.path,
+            persist_mode=config.checkpoint.persist_mode,
+            lease_ttl_seconds=config.checkpoint.lease_ttl_seconds,
+        )
     tools = default_registry()
     agents = {
         spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback)
@@ -94,6 +114,8 @@ def build_team(
     }
     engine.register(agents)
     supervisor = build_supervisor(
-        config.supervisor, agents, gateway, tracker, engine, config.fallback
+        config.supervisor, agents, gateway, tracker, engine, config.fallback,
+        checkpoint_store=store,
+        checkpoint_config_json=config.model_dump_json(),
     )
     return supervisor, agents

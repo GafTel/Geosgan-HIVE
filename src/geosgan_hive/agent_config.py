@@ -9,8 +9,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from .checkpoints import PersistMode
 from .errors import ConfigError, HiveError
-from .fallback import FallbackPolicy
+from .fallback import FallbackMode, FallbackPolicy
 from .providers import parse_model
 from .run_context import CollaborationPolicy
 
@@ -70,6 +71,28 @@ class SupervisorSpec(AgentSpec):
     max_steps: int = Field(default=8, ge=1)
 
 
+class CheckpointConfig(BaseModel):
+    """Durable checkpoint store (SQLite, stdlib only). No credentials are ever stored.
+
+    `persist_mode=metadata_only` stores state/counters/completed-step metadata but
+    NOT the transcript (no durable-resume claim); `resumable` additionally stores
+    the transcript in plaintext SQLite (protect the file locally; no encryption at
+    rest is claimed). Durable resume requires `resumable`.
+    """
+
+    path: str = ".geosgan_hive/checkpoints.db"
+    persist_mode: PersistMode = PersistMode.METADATA_ONLY
+    lease_ttl_seconds: float = Field(default=60.0, gt=0)
+    worker_poll_seconds: float = Field(default=5.0, ge=1.0)  # recovery worker cadence
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("checkpoint.path must be non-empty")
+        return value
+
+
 class HiveConfig(BaseModel):
     """Whole team configuration: one supervisor plus the specialist agents."""
 
@@ -77,6 +100,7 @@ class HiveConfig(BaseModel):
     agents: list[AgentSpec] = Field(min_length=1)
     collaboration: CollaborationPolicy = Field(default_factory=CollaborationPolicy)
     fallback: FallbackPolicy = Field(default_factory=FallbackPolicy)  # global default: OFF
+    checkpoint: CheckpointConfig | None = None  # required for WAIT/HYBRID modes
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:
@@ -93,6 +117,14 @@ class HiveConfig(BaseModel):
             if unknown:
                 raise ValueError(
                     f"agent '{spec.name}' may delegate to unknown agents: {unknown}"
+                )
+        # incompatible configurations are rejected at load time, never silently fixed
+        if self.fallback.mode in (FallbackMode.WAIT, FallbackMode.HYBRID):
+            if self.checkpoint is None:
+                raise ValueError(
+                    f"fallback mode {self.fallback.mode.value!r} suspends runs and therefore "
+                    "requires a checkpoint store: set a 'checkpoint:' block in the config "
+                    "(durable resume additionally requires checkpoint.persist_mode=resumable)"
                 )
         return self
 

@@ -11,6 +11,10 @@ class Tool(Protocol):
     name: str
     description: str
     parameters: dict[str, Any]  # JSON Schema of the arguments
+    #: True for pure/read-only tools (no external side effects). Checkpointing may
+    #: safely persist and replay their results; side-effecting tools (readonly=False)
+    #: are never claimed exactly-once and must not be blindly replayed.
+    readonly: bool
 
     def run(self, args: dict[str, Any]) -> str: ...
 
@@ -54,6 +58,7 @@ def _eval_node(node: ast.AST) -> float:
 class CalculatorTool:
     name = "calculator"
     description = "Evaluates a math expression (e.g. '2 + 3 * 4'). Basic arithmetic only."
+    readonly = True
     parameters = {
         "type": "object",
         "properties": {"expression": {"type": "string", "description": "Math expression"}},
@@ -78,6 +83,7 @@ class CalculatorTool:
 class CurrentDateTimeTool:
     name = "current_datetime"
     description = "Returns the current date and time in UTC (ISO 8601 format)."
+    readonly = True
     parameters = {"type": "object", "properties": {}}
 
     def run(self, args: dict[str, Any]) -> str:
@@ -87,6 +93,7 @@ class CurrentDateTimeTool:
 class WordCountTool:
     name = "word_count"
     description = "Counts words and characters of a text."
+    readonly = True
     parameters = {
         "type": "object",
         "properties": {"text": {"type": "string", "description": "Text to measure"}},
@@ -125,6 +132,11 @@ class ToolRegistry:
             return tool.run(args)
         except Exception as exc:
             return f"Error running '{name}': {exc}"
+
+    def is_readonly(self, name: str) -> bool:
+        """True when the tool is pure/read-only (safe to persist+replay results)."""
+        tool = self.get(name)
+        return bool(getattr(tool, "readonly", False)) if tool is not None else False
 
 
 def default_registry() -> ToolRegistry:

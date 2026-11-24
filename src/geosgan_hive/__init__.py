@@ -3,6 +3,7 @@
 from .agent_config import (
     CORE_ROLES,
     AgentSpec,
+    CheckpointConfig,
     HiveConfig,
     Limits,
     Permissions,
@@ -18,6 +19,12 @@ from .agents import (
     check_run_limits,
     parse_delegation_call,
     parse_tool_call,
+)
+from .checkpoints import (
+    CheckpointStore,
+    ExecutionState,
+    PersistMode,
+    RunCheckpoint,
 )
 from .collaboration import (
     CollaborationEngine,
@@ -101,7 +108,9 @@ __all__ = [
     "CORE_ROLES",
     "CandidateDecision",
     "CapabilityMismatchError",
+    "CheckpointConfig",
     "CheckpointError",
+    "CheckpointStore",
     "CircuitBreaker",
     "CircuitState",
     "CollaborationEngine",
@@ -116,6 +125,7 @@ __all__ = [
     "DelegationStatus",
     "ErrorClass",
     "EventType",
+    "ExecutionState",
     "FakeLLM",
     "FINISH",
     "FallbackEngine",
@@ -141,12 +151,14 @@ __all__ = [
     "OrchestratorResult",
     "PermanentGatewayError",
     "Permissions",
+    "PersistMode",
     "Provider",
     "ProviderSpec",
     "ProviderUnavailableError",
     "QuotaExhaustedError",
     "RateLimitError",
     "RetryPolicy",
+    "RunCheckpoint",
     "RunContext",
     "ServiceUnavailableError",
     "Settings",
