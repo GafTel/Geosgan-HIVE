@@ -69,7 +69,8 @@ class FakeGateway:
         self.calls = []
         self.tracker = UsageTracker()
 
-    def bind(self, model, *, agent=None, temperature=0.2, max_tokens=None, timeout_seconds=None):
+    def bind(self, model, *, agent=None, temperature=0.2, max_tokens=None,
+             timeout_seconds=None, fallback=None, needs_tools=False):
         return RecordingClient(self, model, agent)
 
 

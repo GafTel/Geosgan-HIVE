@@ -45,6 +45,16 @@ class EventType(StrEnum):
     TASK_COMPLETED = "task_completed"
     TASK_FAILED = "task_failed"
     RESULT_RETURNED = "result_returned"
+    # Phase 2.5: fallback / provider-health / budget / suspension events
+    FALLBACK_SELECTED = "fallback_selected"
+    FALLBACK_REJECTED = "fallback_rejected"
+    PROVIDER_FAILED = "provider_failed"
+    CIRCUIT_OPENED = "circuit_opened"
+    CIRCUIT_HALF_OPEN = "circuit_half_open"
+    RECOVERY_PROBE = "recovery_probe"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    TASK_SUSPENDED = "task_suspended"
+    TASK_RESUMED = "task_resumed"
 
 
 class CollaborationEvent(BaseModel):

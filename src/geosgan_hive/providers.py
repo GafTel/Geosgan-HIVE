@@ -70,6 +70,65 @@ def parse_model(model: str) -> tuple[Provider, str]:
 
 
 @dataclass(frozen=True)
+class ModelCapabilities:
+    """Best-effort static capability info for a model.
+
+    `context_window=None` means UNKNOWN (never blocks a candidate); unknown is
+    not treated as unlimited for cost/capability claims, only as "no data".
+    """
+
+    context_window: int | None = None
+    supports_tools: bool = True
+
+
+#: Small table of well-known public context windows. Everything not listed gets
+#: context_window=None (unknown -> the capability gate does not reject on it).
+_KNOWN_CAPABILITIES: dict[str, ModelCapabilities] = {
+    "openai/gpt-4o": ModelCapabilities(context_window=128_000),
+    "openai/gpt-4o-mini": ModelCapabilities(context_window=128_000),
+    "openai/gpt-4-turbo": ModelCapabilities(context_window=128_000),
+    "mistral/mistral-large-latest": ModelCapabilities(context_window=128_000),
+    "mistral/mistral-small-latest": ModelCapabilities(context_window=128_000),
+    "anthropic/claude-3-5-sonnet-latest": ModelCapabilities(context_window=200_000),
+    "anthropic/claude-3-5-haiku-latest": ModelCapabilities(context_window=200_000),
+    "anthropic/claude-3-opus-latest": ModelCapabilities(context_window=200_000),
+    "gemini/gemini-2.0-flash": ModelCapabilities(context_window=1_048_576),
+    "gemini/gemini-1.5-pro": ModelCapabilities(context_window=2_097_152),
+}
+
+
+def model_capabilities(model: str) -> ModelCapabilities:
+    """Capability lookup with conservative defaults for unknown models."""
+    return _KNOWN_CAPABILITIES.get(model, ModelCapabilities())
+
+
+#: Provider-level cost tier. Ollama runs locally (no per-token billing) = free.
+#: Hosted API providers = paid. Anything else = unknown (and unknown is NOT zero).
+_PROVIDER_COST_TIER: dict[Provider, str] = {
+    Provider.OLLAMA: "free",
+    Provider.OPENAI: "paid",
+    Provider.MISTRAL: "paid",
+    Provider.ANTHROPIC: "paid",
+    Provider.GEMINI: "paid",
+}
+
+#: Explicit per-model overrides (checked before the provider default).
+_MODEL_COST_OVERRIDES: dict[str, str] = {}
+
+
+def cost_tier(model: str) -> str:
+    """Return 'free', 'paid' or 'unknown' for a '<provider>/<model>' string.
+
+    Never inferred from the model NAME alone: it is derived from the provider's
+    billing model plus explicit overrides. Unknown pricing is 'unknown', not 0.
+    """
+    provider, _ = parse_model(model)
+    if model in _MODEL_COST_OVERRIDES:
+        return _MODEL_COST_OVERRIDES[model]
+    return _PROVIDER_COST_TIER.get(provider, "unknown")
+
+
+@dataclass(frozen=True)
 class Credentials:
     provider: Provider
     api_key: str | None

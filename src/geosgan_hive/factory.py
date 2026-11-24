@@ -3,6 +3,7 @@ from __future__ import annotations
 from .agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from .agents import Agent
 from .collaboration import CollaborationEngine
+from .fallback import FallbackPolicy, effective_policy
 from .gateway import ModelGateway
 from .orchestrator import Supervisor
 from .tools import ToolRegistry, default_registry
@@ -15,15 +16,19 @@ def build_agent(
     tracker: UsageTracker,
     tools: ToolRegistry | None = None,
     collaboration: CollaborationEngine | None = None,
+    global_fallback: FallbackPolicy | None = None,
 ) -> Agent:
     """Build one specialist agent from its spec: own model, permissions, limits."""
     registry = tools if tools is not None else default_registry()
+    policy = effective_policy(spec.fallback, global_fallback or FallbackPolicy())
     llm = gateway.bind(
         spec.model,
         agent=spec.name,
         temperature=spec.temperature,
         max_tokens=spec.limits.max_tokens,
         timeout_seconds=spec.limits.timeout_seconds,
+        fallback=policy,
+        needs_tools=spec.permissions.allow_tools and bool(spec.permissions.allowed_tools),
     )
     return Agent(
         spec.name,
@@ -45,13 +50,17 @@ def build_supervisor(
     gateway: ModelGateway,
     tracker: UsageTracker,
     collaboration: CollaborationEngine | None = None,
+    global_fallback: FallbackPolicy | None = None,
 ) -> Supervisor:
+    policy = effective_policy(spec.fallback, global_fallback or FallbackPolicy())
     llm = gateway.bind(
         spec.model,
         agent=spec.name,
         temperature=spec.temperature,
         max_tokens=spec.limits.max_tokens,
         timeout_seconds=spec.limits.timeout_seconds,
+        fallback=policy,
+        needs_tools=False,
     )
     return Supervisor(
         agents,
@@ -74,10 +83,17 @@ def build_team(
     """
     tracker = tracker if tracker is not None else gateway.tracker
     engine = CollaborationEngine(policy=config.collaboration, tracker=tracker)
+    # wire the gateway to the run contexts so every dispatch reserves its physical
+    # attempt and request slot atomically at the dispatch boundary
+    if hasattr(gateway, "set_context_lookup"):
+        gateway.set_context_lookup(engine.context_for)
     tools = default_registry()
     agents = {
-        spec.name: build_agent(spec, gateway, tracker, tools, engine) for spec in config.agents
+        spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback)
+        for spec in config.agents
     }
     engine.register(agents)
-    supervisor = build_supervisor(config.supervisor, agents, gateway, tracker, engine)
+    supervisor = build_supervisor(
+        config.supervisor, agents, gateway, tracker, engine, config.fallback
+    )
     return supervisor, agents

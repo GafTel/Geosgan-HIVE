@@ -10,6 +10,7 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .errors import ConfigError, HiveError
+from .fallback import FallbackPolicy
 from .providers import parse_model
 from .run_context import CollaborationPolicy
 
@@ -51,6 +52,9 @@ class AgentSpec(BaseModel):
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     permissions: Permissions = Field(default_factory=Permissions)
     limits: Limits = Field(default_factory=Limits)
+    # None = inherit the global `fallback` block; an explicit block (even mode=off)
+    # overrides it for this agent. Fallback is opt-in: OFF by default.
+    fallback: FallbackPolicy | None = None
 
     @field_validator("model")
     @classmethod
@@ -72,6 +76,7 @@ class HiveConfig(BaseModel):
     supervisor: SupervisorSpec
     agents: list[AgentSpec] = Field(min_length=1)
     collaboration: CollaborationPolicy = Field(default_factory=CollaborationPolicy)
+    fallback: FallbackPolicy = Field(default_factory=FallbackPolicy)  # global default: OFF
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:

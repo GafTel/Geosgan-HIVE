@@ -151,6 +151,12 @@ class HealthRegistry:
             breaker.probe_in_flight = True
             return True
 
+    def release_probe(self, key: str) -> None:
+        """Release a probe claim WITHOUT a result (e.g. when another key's probe
+        claim failed and the caller must back off); the circuit stays HALF_OPEN."""
+        with self._lock:
+            self._breaker(key).probe_in_flight = False
+
     def end_probe(self, key: str, *, success: bool) -> CircuitState:
         """HALF_OPEN probe result: success closes the circuit, failure reopens it."""
         with self._lock:
