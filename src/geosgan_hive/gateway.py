@@ -15,12 +15,18 @@ from .errors import (
     BadRequestError as HiveBadRequestError,
 )
 from .errors import (
+    ContextWindowExceededError as HiveContextWindowError,
+)
+from .errors import (
     GatewayConnectionError,
     GatewayError,
     GatewayTimeoutError,
     PermanentGatewayError,
     RateLimitError,
     ServiceUnavailableError,
+)
+from .errors import (
+    QuotaExhaustedError as HiveQuotaError,
 )
 from .messages import Message
 from .providers import Credentials, Provider, parse_model, resolve_credentials
@@ -63,6 +69,10 @@ def _map_litellm_error(exc: BaseException) -> GatewayError:
         return exc
     import litellm.exceptions as litellm_exc
 
+    if isinstance(exc, litellm_exc.ContextWindowExceededError):
+        return HiveContextWindowError(str(exc))
+    if isinstance(exc, litellm_exc.BudgetExceededError):
+        return HiveQuotaError(str(exc))
     if isinstance(exc, litellm_exc.RateLimitError):
         return RateLimitError(str(exc))
     if isinstance(exc, (litellm_exc.ServiceUnavailableError, litellm_exc.InternalServerError)):
