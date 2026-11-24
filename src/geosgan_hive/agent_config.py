@@ -139,6 +139,13 @@ class HiveConfig(BaseModel):
 _AGENT_FIELDS = ("name", "description", "system_prompt", "model", "temperature")
 _SUPERVISOR_FIELDS = _AGENT_FIELDS + ("max_steps",)
 _COLLABORATION_FIELDS = tuple(CollaborationPolicy.model_fields)
+_FALLBACK_FIELDS = tuple(FallbackPolicy.model_fields)
+_CHECKPOINT_FIELDS = tuple(CheckpointConfig.model_fields)
+#: List-valued fields arrive as comma-separated env strings and are split pre-validation.
+_LIST_FIELDS = {"fallback_models", "allowed_providers", "allowed_fallback_providers"}
+#: Per-agent fallback overrides (Phase 2.5): HIVE_AGENT_<NAME>_FALLBACK_MODE and
+#: HIVE_AGENT_<NAME>_FALLBACK_MODELS (comma-separated) -> agent fallback block
+_AGENT_FALLBACK_ENV = (("MODE", "mode"), ("MODELS", "fallback_models"))
 
 
 def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dict[str, Any]:
@@ -146,11 +153,15 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
 
     - `HIVE_SUPERVISOR_<FIELD>` overrides a supervisor field (e.g. HIVE_SUPERVISOR_MODEL)
     - `HIVE_AGENT_<NAME>_<FIELD>` overrides an agent field (e.g. HIVE_AGENT_DEVELOPER_MODEL)
+    - Phase 2.5: `HIVE_FALLBACK_<FIELD>` (global fallback block),
+      `HIVE_CHECKPOINT_<FIELD>` (checkpoint block; only applied when at least one
+      HIVE_CHECKPOINT_* var is set), and per-agent `HIVE_AGENT_<NAME>_FALLBACK_MODE` /
+      `HIVE_AGENT_<NAME>_FALLBACK_MODELS` (comma-separated)
 
     Overrides apply even when the field is absent from the YAML (pydantic
     defaults fill it); values are strings and pydantic coerces them on final
-    validation. API keys are never read from YAML: they come from the provider
-    env vars at call time.
+    validation (list fields are split on commas first). API keys are never read
+    from YAML: they come from the provider env vars at call time.
     """
     data = copy.deepcopy(data)
     sections: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
@@ -158,20 +169,56 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
     if isinstance(supervisor, dict):
         sections.append(("HIVE_SUPERVISOR", _SUPERVISOR_FIELDS, supervisor))
     agents = data.get("agents")
+    agent_prefixes: list[tuple[str, dict[str, Any]]] = []
     if isinstance(agents, list):
         for agent in agents:
             if isinstance(agent, dict) and isinstance(agent.get("name"), str):
                 prefix = "HIVE_AGENT_" + agent["name"].upper().replace("-", "_")
                 sections.append((prefix, _AGENT_FIELDS, agent))
+                agent_prefixes.append((prefix, agent))
     # always present so HIVE_COLLABORATION_* overrides apply even without a YAML block
     collaboration = data.setdefault("collaboration", {})
     if isinstance(collaboration, dict):
         sections.append(("HIVE_COLLABORATION", _COLLABORATION_FIELDS, collaboration))
+    # Phase 2.5 global blocks
+    fallback = data.setdefault("fallback", {})
+    if isinstance(fallback, dict):
+        sections.append(("HIVE_FALLBACK", _FALLBACK_FIELDS, fallback))
+    if any(k.startswith("HIVE_CHECKPOINT_") for k in environ):
+        checkpoint = data.setdefault("checkpoint", {})
+        if isinstance(checkpoint, dict):
+            sections.append(("HIVE_CHECKPOINT", _CHECKPOINT_FIELDS, checkpoint))
     for prefix, fields, section in sections:
         for key in fields:
             env_var = f"{prefix}_{key.upper()}"
             if env_var in environ:
-                section[key] = environ[env_var]
+                value = environ[env_var]
+                section[key] = (
+                    [v.strip() for v in value.split(",") if v.strip()]
+                    if key in _LIST_FIELDS
+                    else value
+                )
+    # per-agent fallback overrides; an agent block without an explicit mode
+    # inherits the global fallback mode (default: off)
+    global_mode = (
+        fallback.get("mode", FallbackMode.OFF.value)
+        if isinstance(fallback, dict)
+        else FallbackMode.OFF.value
+    )
+    for prefix, agent in agent_prefixes:
+        fb: dict[str, Any] | None = None
+        for env_key, field in _AGENT_FALLBACK_ENV:
+            env_var = f"{prefix}_FALLBACK_{env_key}"
+            if env_var in environ:
+                fb = agent.setdefault("fallback", {})
+                value = environ[env_var]
+                fb[field] = (
+                    [v.strip() for v in value.split(",") if v.strip()]
+                    if field == "fallback_models"
+                    else value
+                )
+        if fb is not None:
+            fb.setdefault("mode", global_mode)
     return data
 
 

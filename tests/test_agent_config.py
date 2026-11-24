@@ -232,3 +232,80 @@ def test_collaboration_env_overrides(tmp_path):
     assert config.collaboration.max_delegation_depth == 3
     assert config.collaboration.allow_agent_to_agent is True
     assert config.collaboration.max_parallel_agents == 5
+
+
+# ---- Phase 2.5: fallback / checkpoint env overrides ----
+
+def test_fallback_env_overrides_global_block(tmp_path):
+    from geosgan_hive.fallback import FallbackMode
+
+    path = write_yaml(tmp_path, MINIMAL_YAML)
+    env = {
+        "HIVE_FALLBACK_MODE": "continuity",
+        "HIVE_FALLBACK_FALLBACK_MODELS": "ollama/llama3.2, ollama/mistral",
+        "HIVE_FALLBACK_MAX_FALLBACK_ATTEMPTS": "3",
+        "HIVE_FALLBACK_ALLOW_PAID_FALLBACK": "true",
+        "HIVE_FALLBACK_ALLOWED_FALLBACK_PROVIDERS": "ollama",
+    }
+    config = load_hive_config(path, environ=env)
+    assert config.fallback.mode == FallbackMode.CONTINUITY
+    assert config.fallback.fallback_models == ["ollama/llama3.2", "ollama/mistral"]
+    assert config.fallback.max_fallback_attempts == 3
+    assert config.fallback.allow_paid_fallback is True
+    assert config.fallback.allowed_fallback_providers == ["ollama"]
+
+
+def test_fallback_disabled_by_default_without_env(tmp_path):
+    from geosgan_hive.fallback import FallbackMode
+
+    path = write_yaml(tmp_path, MINIMAL_YAML)
+    config = load_hive_config(path, environ={})
+    assert config.fallback.mode == FallbackMode.OFF
+    assert config.checkpoint is None
+
+
+def test_per_agent_fallback_env_override_inherits_global_mode(tmp_path):
+    from geosgan_hive.fallback import FallbackMode
+
+    path = write_yaml(tmp_path, MINIMAL_YAML + "\nfallback: {mode: continuity}\n")
+    env = {
+        "HIVE_AGENT_RESEARCHER_FALLBACK_MODELS": "ollama/llama3.2",
+    }
+    config = load_hive_config(path, environ=env)
+    agent = config.agent("researcher")
+    assert agent.fallback is not None
+    assert agent.fallback.fallback_models == ["ollama/llama3.2"]
+    assert agent.fallback.mode == FallbackMode.CONTINUITY  # inherited from global
+    # the supervisor has no explicit block -> inherits the global policy
+    assert config.supervisor.fallback is None
+
+
+def test_checkpoint_env_overrides_only_when_set(tmp_path):
+    path = write_yaml(tmp_path, MINIMAL_YAML)
+    config = load_hive_config(path, environ={})
+    assert config.checkpoint is None  # no HIVE_CHECKPOINT_* -> stays None
+    env = {
+        "HIVE_FALLBACK_MODE": "wait",
+        "HIVE_CHECKPOINT_PATH": str(tmp_path / "cp.db"),
+        "HIVE_CHECKPOINT_PERSIST_MODE": "resumable",
+        "HIVE_CHECKPOINT_LEASE_TTL_SECONDS": "30",
+    }
+    config = load_hive_config(path, environ=env)
+    assert config.checkpoint is not None
+    assert config.checkpoint.persist_mode.value == "resumable"
+    assert config.checkpoint.lease_ttl_seconds == 30.0
+    assert config.checkpoint.path == str(tmp_path / "cp.db")
+
+
+def test_wait_mode_without_checkpoint_block_is_rejected(tmp_path):
+    path = write_yaml(tmp_path, MINIMAL_YAML + "\nfallback: {mode: wait}\n")
+    with pytest.raises(ConfigError, match="checkpoint"):
+        load_hive_config(path, environ={})
+
+
+def test_default_repo_config_still_loads_and_fallback_is_off():
+    from geosgan_hive.fallback import FallbackMode
+
+    config = load_hive_config(DEFAULT_CONFIG, environ={})
+    assert config.fallback.mode == FallbackMode.OFF
+    assert config.checkpoint is None

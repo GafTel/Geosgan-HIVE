@@ -322,3 +322,145 @@ the native path. `geosgan-hive "task" --async` runs the whole team asynchronousl
 ```bash
 python examples/demo_collaboration.py   # offline: parallel delegation + run history
 ```
+
+## Phase 2.5: INTELLIGENT MODEL FALLBACK ENGINE (v0.4.0)
+
+Fallback lives inside the centralized `ModelGateway`, per logical call, so every
+agent (including the supervisor) gets it through its bound client. It is **opt-in:
+`mode=off` by default**, and the `off` path is behavior-identical to v0.3.0.
+
+### Modes
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No fallback. Exactly the pre-2.5 behavior. |
+| `continuity` | On a fallback-eligible error, serve the call from the next eligible model in the ordered chain; if the chain is exhausted, raise `FallbackExhaustedError`. |
+| `wait` | Never switch models. On a fallback-eligible error, raise `ProviderUnavailableError` and suspend the run at a safe supervisor boundary (durable checkpoint). |
+| `hybrid` | Try eligible alternatives first; if none is available, suspend like `wait`; after the cooldown a single-flight probe recovers the preferred primary model. |
+
+### Error taxonomy and health
+
+Every provider error is normalized (`ErrorClass`: `rate_limit`, `quota`, `outage`,
+`network`, `timeout`, `auth`, `invalid_request`, `capability`, `context_window`,
+`budget`, `provider_unavailable`, `fallback_exhausted`, `cancelled`, `unknown`) with
+`retryable` / `fallback_eligible` / `terminal` flags. Retries (bounded, backoff +
+jitter, `Retry-After` respected) happen only on the same model; fallback only on
+fallback-eligible errors; cancellation, exhausted budgets and malformed requests
+are terminal and never retried or fallen back. Unknown errors fail conservatively.
+
+`HealthRegistry` keeps per-provider (`p:<provider>`) and per-model (`m:<model>`)
+circuit breakers (CLOSED/OPEN/HALF_OPEN, monotonic clock, injectable for tests,
+single-flight HALF_OPEN probes). Failure scope is correct by class: auth never
+opens a provider-wide circuit (it is credential-specific); quota is account-wide;
+outage/network are provider-wide; timeout is model-scoped. Quota reset timestamps
+are never invented. On recovery the primary is preferred again on later calls.
+
+### Fallback gates (restrictive by default)
+
+- provider allowlist (`allowed_providers`); cross-provider transfer additionally
+  requires the target provider in `allowed_fallback_providers` (context may not be
+  sent to another provider without explicit eligibility);
+- cost: `cost_tier()` (ollama=local/free, hosted=paid, else unknown). Unknown cost
+  is **not zero**: unknown-cost candidates need `allow_unknown_cost_fallback`;
+  switching to a paid model from a non-paid primary needs `allow_paid_fallback`;
+- capability: tool support and a rough context-window token estimate are checked
+  before dispatch;
+- health: OPEN circuits are skipped;
+- agent permissions, delegation rules, run/task ids are never altered by a fallback;
+  no credentials or full prompts are logged.
+
+### Budgets and concurrency (all Phase 2 guarantees preserved)
+
+One logical model call = one `RunContext.reserve_model_call_for` reservation; every
+physical dispatch (initial, retry, fallback, probe, failed, cancelled) reserves
+atomically via `reserve_physical_request()` **before** the request, capped
+optionally by `max_provider_requests_per_run`. Request-level concurrency is bounded
+by the per-run semaphore acquired only around the in-flight request at the gateway
+dispatch boundary — never during backoff, cooldowns, checkpoints, probe waits or
+delegation waits — so nested collaboration cannot deadlock and slots are never
+double-acquired. Reserved attempts are distinct from confirmed requests and from
+provider billing. On resume, counters are restored from the checkpoint without
+double counting; a crash after reservation conservatively retains it.
+
+### Durable suspension and resumption (SQLite, stdlib only)
+
+`CheckpointStore` (WAL, `schema_version` checked, one atomic transaction per
+mutation) persists runs in states `running`, `waiting_for_provider`,
+`ready_to_resume`, `completed`, `failed`, `cancelled`. Two privacy modes:
+
+- `metadata_only`: state/counters/completed-step metadata only — **no**
+  durable-resume claim; `resume()` rejects such checkpoints instead of silently
+  reconstructing missing context;
+- `resumable`: additionally stores the transcript (plaintext SQLite — **no
+  encryption at rest is claimed**; protect the file with local permissions, delete
+  when done; `*.db*` and `.geosgan_hive/` are gitignored). Credentials are never
+  stored.
+
+Suspension happens only at safe supervisor step boundaries — never while child
+tasks are active; unsupported nested suspension fails safely with an explicit
+diagnostic. Completed steps are persisted and never repeated on resume. Leases are
+transactional (`UPDATE ... WHERE lease free/expired`), renewed during execution, and
+all terminal commits are ownership-fenced, so duplicate/stale workers cannot commit.
+Crashes during `RUNNING` are marked `FAILED` on next open; stale `WAITING` leases are
+cleared and the run stays eligible. No exactly-once claim is made for side-effecting
+tools (`Tool.readonly` distinguishes pure/read-only tools; built-ins are read-only).
+
+```yaml
+fallback:
+  mode: hybrid                      # off | continuity | wait | hybrid
+  fallback_models: [ollama/llama3.2, ollama/mistral]   # ordered chain
+  max_fallback_attempts: 2
+  max_wait_seconds: 300
+  cooldown_seconds: 60
+  failure_threshold: 3
+  allowed_providers: [openai, ollama]
+  allowed_fallback_providers: [ollama]
+  allow_paid_fallback: false
+  allow_unknown_cost_fallback: false
+checkpoint:                         # required for wait/hybrid
+  path: .geosgan_hive/checkpoints.db
+  persist_mode: resumable           # metadata_only | resumable
+  lease_ttl_seconds: 60
+  worker_poll_seconds: 5
+```
+
+Env overrides: `HIVE_FALLBACK_*`, `HIVE_CHECKPOINT_*`, and per-agent
+`HIVE_AGENT_<NAME>_FALLBACK_MODE` / `HIVE_AGENT_<NAME>_FALLBACK_MODELS`
+(comma-separated; mode defaults to the global one). See `.env.example`.
+
+### Recovery worker and CLI
+
+Automatic recovery is opt-in and needs a running HIVE process (nothing is installed
+as an OS service). The worker discovers eligible suspended runs (persisted
+`next_attempt_at` and deadline honored, no busy polling, clean shutdown, same lease
+mechanism as manual resume):
+
+```bash
+geosgan-hive --recovery-worker                 # run the worker until Ctrl+C
+geosgan-hive --list-suspended                  # list suspended runs
+geosgan-hive --show <run_id>                   # checkpoint details
+geosgan-hive --resume <run_id>                 # manual resume (needs resumable mode)
+geosgan-hive --cancel-run <run_id>             # cancel a run (terminal)
+```
+
+### Events
+
+New structured run events (identifiers/metadata only, never secrets):
+`fallback_selected`, `fallback_rejected`, `provider_failed`, `circuit_opened`,
+`circuit_half_open`, `recovery_probe`, `budget_exhausted`, `task_suspended`,
+`task_resumed`.
+
+```bash
+python examples/demo_fallback.py    # offline: fallback chain, circuit breaker, WAIT suspend + resume
+```
+
+### Known limitations
+
+- The health registry is in-memory per process (by design in 2.5); restart-safe
+  scheduling uses the persisted UTC timestamps in checkpoints.
+- Durable resumption is supervisor-level only; nested agent suspension fails safely
+  with a diagnostic instead of checkpointing mid-flight state.
+- Legacy sync-only LLM adapters run in threads on the async path and cannot be
+  interrupted mid-call (the wrapper still times out; the call stays counted).
+- RESUMABLE checkpoints store the transcript in plaintext SQLite; protect the file
+  locally. Reserved dispatch attempts are not provider billing.
