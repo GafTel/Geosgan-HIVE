@@ -106,16 +106,21 @@ class RunContext:
         self._semaphore: asyncio.Semaphore | None = None
 
     # ---- model-call budget (run-wide, atomic) ----
-    def reserve_model_call(self) -> bool:
+    def reserve_model_call(self, task_id: str | None = None) -> bool:
         """Atomically reserve one model call before the actual LLM request.
 
         Returns False when the run-wide budget is exhausted. Every actual model
         request (supervisor, specialists, delegated and nested) must reserve first.
+        When `task_id` is given, the reservation is also counted on that task node,
+        so per-task counts stay exact even under parallel execution.
         """
         with self._lock:
             if self._model_calls >= self.policy.max_model_calls_per_run:
                 return False
             self._model_calls += 1
+            node = self._tasks.get(task_id) if task_id else None
+            if node is not None:
+                node.model_calls += 1
             return True
 
     @property

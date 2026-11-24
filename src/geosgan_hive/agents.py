@@ -185,12 +185,13 @@ class Agent:
         return Message(role="system", content=prompt, agent=self.name)
 
     def _check_limits(
-        self, run_id: str | None, calls: int, run_context: RunContext | None
+        self, run_id: str | None, calls: int, run_context: RunContext | None,
+        task_id: str | None = None,
     ) -> str | None:
         stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
         if stop is not None:
             return stop
-        if run_context is not None and not run_context.reserve_model_call():
+        if run_context is not None and not run_context.reserve_model_call(task_id):
             # reserve immediately before each actual model request; counts every
             # supervisor/agent/delegated/nested LLM request run-wide
             return (
@@ -353,7 +354,7 @@ class Agent:
         max_iterations = self.limits.max_tool_steps + 2
         raw = ""
         for step in range(1, max_iterations + 1):
-            stop = self._check_limits(run_id, calls, run_context)
+            stop = self._check_limits(run_id, calls, run_context, task_id)
             if stop is not None:
                 return AgentResult(self.name, stop, tool_calls, step - 1, handoffs)
             raw = self.llm.complete(messages, temperature=self.temperature, run_id=run_id)
@@ -399,7 +400,7 @@ class Agent:
         raw = ""
         acomplete = getattr(self.llm, "acomplete", None)
         for step in range(1, max_iterations + 1):
-            stop = self._check_limits(run_id, calls, run_context)
+            stop = self._check_limits(run_id, calls, run_context, task_id)
             if stop is not None:
                 return AgentResult(self.name, stop, tool_calls, step - 1, handoffs)
             if acomplete is not None:

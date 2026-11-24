@@ -111,8 +111,8 @@ class Supervisor:
         if self.collaboration is not None:
             self.collaboration.close_run(run_id)
 
-    def _budget_stop(self, ctx: RunContext | None) -> str | None:
-        if ctx is not None and not ctx.reserve_model_call():
+    def _budget_stop(self, ctx: RunContext | None, task_id: str | None = None) -> str | None:
+        if ctx is not None and not ctx.reserve_model_call(task_id):
             return f"Run-wide model-call limit ({ctx.policy.max_model_calls_per_run}) reached."
         return None
 
@@ -170,7 +170,7 @@ class Supervisor:
         for step in range(1, self.max_steps + 1):
             stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
             if stop is None:
-                stop = self._budget_stop(ctx)
+                stop = self._budget_stop(ctx, root_task_id)
             if stop is not None:
                 return OrchestratorResult(
                     task=task, final_answer=stop, route=route, transcript=transcript,
@@ -280,7 +280,7 @@ class Supervisor:
         for step in range(1, self.max_steps + 1):
             stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
             if stop is None:
-                stop = self._budget_stop(ctx)
+                stop = self._budget_stop(ctx, root_task_id)
             if stop is not None:
                 return OrchestratorResult(
                     task=task, final_answer=stop, route=route, transcript=transcript,

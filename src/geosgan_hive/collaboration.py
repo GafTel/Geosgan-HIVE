@@ -319,7 +319,10 @@ class CollaborationEngine:
         record_result: bool = True,
     ) -> HandoffResult:
         finished = utcnow()
-        model_calls = ctx.model_calls - before
+        node = ctx.task(req.task_id)
+        # exact per-task count: reservations were counted on the node atomically,
+        # so this stays correct even when sibling tasks run in parallel
+        model_calls = node.model_calls if node is not None else ctx.model_calls - before
         ctx.update_task(
             req.task_id,
             status=status,
