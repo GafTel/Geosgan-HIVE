@@ -27,7 +27,10 @@ def ws(tmp_path):
     if os.name == "posix":  # symlink creation needs privileges on Windows
         os.symlink(outside, root / "escape_link.txt")  # symlink escaping the workspace
         os.symlink(root / "sub", root / "inside_link")  # symlink staying inside
-    return WorkspaceSandbox(str(root))
+    # These tests verify path-validation logic on every platform; on platforms
+    # without fd re-verification the fail-closed DEFAULT is proven separately
+    # (test_audit_phase3_final.py), so here we use the explicit override.
+    return WorkspaceSandbox(str(root), allow_insecure_fs=True)
 
 
 def make_gw(sandbox):

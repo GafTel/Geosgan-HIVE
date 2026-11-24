@@ -154,11 +154,15 @@ def test_current_policy_revalidated_on_resume(tmp_path, monkeypatch):
     (tmp_path / "ws").mkdir(exist_ok=True)
     (tmp_path / "ws" / "f.txt").write_text("data")
     r = gw_a.execute("fs_read", {"path": "f.txt"}, ctx=ctx(), run_context=rc)
-    assert r.ok and "data" in r.output
+    if gw_a.catalog.get("fs_read") is not None:
+        assert r.ok and "data" in r.output  # race-resistant platform
+    else:
+        # non-race-resistant platform: fs tools are not even registered (fail closed)
+        assert r.ok is False and "unknown tool" in r.error
     # resume under the CURRENT configuration which no longer enables fs_read
     gw_b = build_tool_gateway(config_with([]), store)  # explicit empty = deny all
     r2 = gw_b.execute("fs_read", {"path": "f.txt"}, ctx=ctx(), run_context=rc)
-    assert r2.ok is False and "not allowed" in r2.error
+    assert r2.ok is False and ("not allowed" in r2.error or "unknown tool" in r2.error)
     store.close()
 
 

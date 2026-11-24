@@ -127,21 +127,23 @@ def _config(tools: ToolsConfig | None) -> HiveConfig:
 
 def test_write_tools_not_registered_unless_allow_write(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    catalog, _ = build_tool_catalog(_config(ToolsConfig(enabled=["fs_write", "fs_update",
-                                                                "fs_read"],
-                                                        allow_write=False,
-                                                        workspace_root=str(tmp_path / "ws"))))
+    catalog, sb = build_tool_catalog(_config(ToolsConfig(enabled=["fs_write", "fs_update",
+                                                                 "fs_read"],
+                                                         allow_write=False,
+                                                         workspace_root=str(tmp_path / "ws"))))
+    if sb.race_resistant:  # Linux: read tools registered, write tools gated
+        assert "fs_read" in catalog.names()
+    else:  # non-race-resistant platform: ALL file tools unregistered (fail closed)
+        assert not any(n.startswith("fs_") for n in catalog.names())
     assert "fs_write" not in catalog.names() and "fs_update" not in catalog.names()
-    assert "fs_read" in catalog.names()
     catalog2, sb2 = build_tool_catalog(_config(ToolsConfig(enabled=["fs_write", "fs_update"],
                                                             allow_write=True,
                                                             workspace_root=str(tmp_path / "ws"))))
-    if os.name == "posix":
+    if sb2.race_resistant:
         assert "fs_write" in catalog2.names() and "fs_update" in catalog2.names()
-    else:  # Windows: writes are disabled by default, so they stay unregistered
-        assert sb2.platform == "nt"
-        assert "fs_write" not in catalog2.names() and "fs_update" not in catalog2.names()
-    if os.name == "posix":
+    else:  # non-race-resistant platform: no file tools registered at all
+        assert not any(n.startswith("fs_") for n in catalog2.names())
+    if sb2.race_resistant:
         spec = catalog2.get("fs_update").spec
         assert spec.side_effect.value == "local_mutation" and spec.approval_required is True
 
