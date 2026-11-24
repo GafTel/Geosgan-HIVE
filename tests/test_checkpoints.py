@@ -234,6 +234,18 @@ def ok_response(model, content):
     )
 
 
+
+
+def valid_config_json():
+    from geosgan_hive.agent_config import AgentSpec, HiveConfig, SupervisorSpec
+    return HiveConfig(
+        supervisor=SupervisorSpec(name="supervisor", description="d", system_prompt="s",
+                                  model="ollama/sup"),
+        agents=[AgentSpec(name="analyst", description="d", system_prompt="s",
+                          model="ollama/analyst")],
+    ).model_dump_json()
+
+
 def make_team(tmp_path, monkeypatch, *, persist_mode=PersistMode.RESUMABLE, clock=None):
     monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
     clock = clock or FakeClock()
@@ -259,7 +271,8 @@ def make_team(tmp_path, monkeypatch, *, persist_mode=PersistMode.RESUMABLE, cloc
     engine.register({"analyst": analyst})
     supervisor = Supervisor(
         {"analyst": analyst}, sup_llm, collaboration=engine, checkpoint_store=store,
-        checkpoint_config_json="{}", suspend_cooldown_seconds=60.0, max_wait_seconds=300.0,
+        checkpoint_config_json=valid_config_json(), suspend_cooldown_seconds=60.0,
+        max_wait_seconds=300.0,
     )
     return supervisor, store, engine, gateway, clock
 

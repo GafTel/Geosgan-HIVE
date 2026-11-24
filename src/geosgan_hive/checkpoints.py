@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any
 
 from .errors import CheckpointError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ExecutionState(StrEnum):
@@ -63,6 +64,7 @@ class RunCheckpoint:
     lease_expires_at: str | None
     created_at: str
     updated_at: str
+    root_task_id: str | None = field(default=None)
 
 
 _SCHEMA = """
@@ -91,7 +93,8 @@ CREATE TABLE IF NOT EXISTS runs (
     lease_owner TEXT,
     lease_expires_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    root_task_id TEXT
 );
 """
 
@@ -149,7 +152,19 @@ class CheckpointStore:
                     f"checkpoint database {self.path!r} has schema_version {row['value']}, "
                     f"expected {SCHEMA_VERSION}; refusing to open an incompatible store"
                 )
+        self._harden_permissions()
         self._recover_crashed()
+
+    def _harden_permissions(self) -> None:
+        """Best-effort: owner-only permissions on the database files (POSIX).
+        Plaintext storage is documented; this limits local read access."""
+        if self.path == ":memory:" or os.name != "posix":
+            return
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(self.path + suffix, 0o600)
+            except OSError:
+                pass  # file may not exist yet (WAL/SHM) or FS may not support it
 
     # ---- time helpers (persisted timestamps are UTC ISO strings) ----
     def utcnow(self) -> datetime:
@@ -184,8 +199,14 @@ class CheckpointStore:
             )
             self._conn.execute(
                 "UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL, updated_at=? "
-                "WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
-                (now, ExecutionState.WAITING_FOR_PROVIDER.value, now),
+                "WHERE state IN (?, ?) AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at <= ?",
+                (
+                    now,
+                    ExecutionState.WAITING_FOR_PROVIDER.value,
+                    ExecutionState.READY_TO_RESUME.value,
+                    now,
+                ),
             )
 
     # ---- row mapping ----
@@ -213,6 +234,7 @@ class CheckpointStore:
             lease_expires_at=row["lease_expires_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            root_task_id=row["root_task_id"],
         )
 
     def get(self, run_id: str) -> RunCheckpoint | None:
@@ -271,6 +293,7 @@ class CheckpointStore:
         agent: str,
         model: str,
         config_json: str = "",
+        root_task_id: str | None = None,
     ) -> RunCheckpoint:
         now = self.now_iso()
         with self._lock, self._conn:
@@ -278,9 +301,9 @@ class CheckpointStore:
                 "INSERT INTO runs (run_id, state, persist_mode, task, agent, model, "
                 "config_json, counters_json, steps_json, route_json, transcript_json, "
                 "step_count, attempts, next_attempt_at, deadline_at, error, result, "
-                "lease_owner, lease_expires_at, created_at, updated_at) "
+                "lease_owner, lease_expires_at, created_at, updated_at, root_task_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, '{}', '[]', '[]', NULL, 0, 0, NULL, NULL, "
-                "NULL, NULL, ?, ?, ?, ?)",
+                "NULL, NULL, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     ExecutionState.RUNNING.value,
@@ -293,11 +316,30 @@ class CheckpointStore:
                     self._lease_expiry(),
                     now,
                     now,
+                    root_task_id,
                 ),
             )
         cp = self.get(run_id)
         assert cp is not None
         return cp
+
+    def update_progress(
+        self, run_id: str, *, owner: str, counters_json: str, step_count: int
+    ) -> None:
+        """Persist budget counters + step progress at a step boundary (called before
+        each supervisor model call for durable runs), fenced by lease ownership so a
+        stale worker cannot overwrite newer state. One atomic transaction."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET counters_json=?, step_count=?, updated_at=? "
+                "WHERE run_id=? AND lease_owner=?",
+                (counters_json, step_count, now, run_id, owner),
+            )
+            if cur.rowcount != 1:
+                raise CheckpointError(
+                    f"cannot update progress of run {run_id!r}: lease lost (stale worker)"
+                )
 
     def _transcript_or_none(self, transcript_json: str | None) -> str | None:
         # RESUMABLE stores the transcript; METADATA_ONLY never does (no silent

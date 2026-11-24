@@ -142,6 +142,22 @@ class ModelGateway:
             default_fallback if default_fallback is not None else FallbackPolicy()
         )
         self._half_open_emitted: set[str] = set()
+        # provider -> max Retry-After hint seen (seconds); used to extend the
+        # persisted next_attempt_at of suspended runs (never invents reset times)
+        self._retry_after_hints: dict[str, float] = {}
+
+    def retry_after_hint(self, provider: Provider | str) -> float:
+        """Largest Retry-After hint (seconds) observed for this provider, 0 if none."""
+        key = provider.value if isinstance(provider, Provider) else str(provider)
+        return self._retry_after_hints.get(key, 0.0)
+
+    def _record_retry_after(self, model: str, exc: BaseException) -> float | None:
+        hint = _retry_after_seconds(exc)
+        if hint is not None and hint > 0:
+            provider, _ = parse_model(model)
+            key = provider.value
+            self._retry_after_hints[key] = max(self._retry_after_hints.get(key, 0.0), hint)
+        return hint
 
     def set_context_lookup(self, lookup: Callable[[str], Any]) -> None:
         """Wire the gateway to the run contexts (e.g. engine.context_for) so every
@@ -298,8 +314,9 @@ class ModelGateway:
                 response = self._dispatch_sync(kwargs, model=model, run_id=run_id)
             except Exception as exc:
                 error = _map_litellm_error(exc)
+                hint = self._record_retry_after(model, exc)
                 if is_retryable(error) and attempt < policy.max_attempts:
-                    self._sleep(policy.delay_for_attempt(attempt, _retry_after_seconds(exc)))
+                    self._sleep(policy.delay_for_attempt(attempt, hint))
                     continue
                 if not getattr(error, "terminal", False):
                     # terminal errors (budget/cancelled) never reached a provider:
@@ -570,8 +587,9 @@ class ModelGateway:
                 raise
             except Exception as exc:
                 error = _map_litellm_error(exc)
+                hint = self._record_retry_after(model, exc)
                 if is_retryable(error) and attempt < policy.max_attempts:
-                    delay = policy.delay_for_attempt(attempt, _retry_after_seconds(exc))
+                    delay = policy.delay_for_attempt(attempt, hint)
                     await self._async_sleep(delay)
                     continue
                 if not getattr(error, "terminal", False):

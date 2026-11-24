@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import litellm
 import litellm.exceptions as litellm_exc
 
+from geosgan_hive.agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from geosgan_hive.agents import Agent
 from geosgan_hive.checkpoints import CheckpointStore, PersistMode
 from geosgan_hive.collaboration import CollaborationEngine
@@ -127,9 +128,15 @@ def main() -> None:
         analyst_agent = Agent("analyst", "demo analyst", "You are a demo analyst.",
                               analyst_llm, collaboration=engine)
         engine.register({"analyst": analyst_agent})
+        config_json = HiveConfig(
+            supervisor=SupervisorSpec(name="supervisor", description="d",
+                                      system_prompt="s", model=PRIMARY),
+            agents=[AgentSpec(name="analyst", description="d", system_prompt="s",
+                              model=BACKUP)],
+        ).model_dump_json()
         analyst = Supervisor(
             {"analyst": analyst_agent}, sup_llm, collaboration=engine,
-            checkpoint_store=store, checkpoint_config_json="{}",
+            checkpoint_store=store, checkpoint_config_json=config_json,
             suspend_cooldown_seconds=30.0, max_wait_seconds=300.0,
         )
         state["fail_primary"] = True

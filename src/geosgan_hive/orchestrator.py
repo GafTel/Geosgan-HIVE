@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from .agent_config import Limits
+from .agent_config import HiveConfig, Limits
 from .agents import Agent, arun_agent, check_run_limits, parse_json_object
 from .checkpoints import (
     CheckpointStore,
@@ -20,6 +20,7 @@ from .checkpoints import (
 from .errors import CheckpointError, GatewayError, ProviderUnavailableError
 from .llm import LLMClient
 from .messages import Message
+from .providers import parse_model
 from .run_context import EventType, RunContext, TaskStatus, utcnow
 from .usage import UsageTracker
 
@@ -47,6 +48,7 @@ class OrchestratorResult:
     run_id: str | None = None
     suspended: bool = False  # WAIT/HYBRID: no eligible model; checkpointed as WAITING
     failed: bool = False  # terminal gateway/budget error
+    root_task_id: str | None = None  # stable across suspend/resume (checkpointed)
 
 
 def parse_decision(text: str) -> dict[str, Any] | None:
@@ -280,9 +282,19 @@ class Supervisor:
                 steps=step, run_id=run_id, failed=True,
             )
         now = store.utcnow()
-        next_attempt = (now + timedelta(seconds=self.suspend_cooldown_seconds)).isoformat(
-            timespec="milliseconds"
-        )
+        # cooldown = max(configured cooldown, largest Retry-After hint the provider
+        # sent); the hint is persisted via next_attempt_at, so it is honored even
+        # after a process restart. Quota reset times are never invented.
+        cooldown = self.suspend_cooldown_seconds
+        gw = getattr(self.llm, "gateway", None)
+        hint_fn = getattr(gw, "retry_after_hint", None)
+        if hint_fn is not None:
+            try:
+                provider, _ = parse_model(getattr(self.llm, "model", "") or "")
+                cooldown = max(cooldown, float(hint_fn(provider)))
+            except Exception:
+                pass
+        next_attempt = (now + timedelta(seconds=cooldown)).isoformat(timespec="milliseconds")
         deadline = (now + timedelta(seconds=self.max_wait_seconds)).isoformat(
             timespec="milliseconds"
         )
@@ -313,8 +325,11 @@ class Supervisor:
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
+                    root_task_id=root_task_id,
                 )
-            return self._run_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
+            result = self._run_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
+            result.root_task_id = root_task_id
+            return result
         finally:
             self._close_run(run_id, ctx, root_task_id)
 
@@ -343,6 +358,19 @@ class Supervisor:
                 "resume requires persist_mode=resumable (missing context is never "
                 "silently reconstructed)"
             )
+        if cp.transcript_json is None:
+            raise CheckpointError(
+                f"run {run_id!r} is an INCOMPLETE checkpoint (resumable mode but no "
+                "transcript stored); refusing to restart the task from missing context"
+            )
+        if cp.config_json:
+            try:
+                HiveConfig.model_validate_json(cp.config_json)
+            except Exception as exc:
+                raise CheckpointError(
+                    f"run {run_id!r} has a corrupt config snapshot; refusing to resume "
+                    f"from it: {exc}"
+                ) from exc
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
@@ -350,7 +378,7 @@ class Supervisor:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
         ctx = self.collaboration.context_for(run_id)
-        root_task_id = uuid4().hex
+        root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",
             description=cp.task, depth=0,
@@ -373,11 +401,13 @@ class Supervisor:
         transcript = [Message(**m) for m in json.loads(cp.transcript_json or "[]")]
         route = json.loads(cp.route_json or "[]")
         try:
-            return self._run_loop(
+            result = self._run_loop(
                 cp.task, run_id, ctx, root_task_id,
                 transcript=transcript, route=route, start_step=cp.step_count + 1,
                 resume_owner=owner,
             )
+            result.root_task_id = root_task_id
+            return result
         finally:
             self._close_run(run_id, ctx, root_task_id)
 
@@ -396,6 +426,14 @@ class Supervisor:
                     raise CheckpointError(
                         f"run {run_id!r}: lease lost during execution (stale worker fencing)"
                     )
+                # persist consumed budget counters at each step boundary, so a crash
+                # mid-run conservatively retains them in the durable store
+                self.checkpoint_store.update_progress(
+                    run_id, owner=resume_owner,
+                    counters_json=counters_to_json(ctx.counters_snapshot())
+                    if ctx is not None else "{}",
+                    step_count=step,
+                )
             stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
             if stop is None:
                 stop = self._budget_stop(ctx, root_task_id)
@@ -529,8 +567,11 @@ class Supervisor:
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
+                    root_task_id=root_task_id,
                 )
-            return await self._arun_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
+            result = await self._arun_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
+            result.root_task_id = root_task_id
+            return result
         except asyncio.CancelledError:
             if ctx is not None and root_task_id is not None:
                 ctx.update_task(root_task_id, status=TaskStatus.CANCELLED, finished_at=utcnow())
@@ -562,6 +603,19 @@ class Supervisor:
                 "resume requires persist_mode=resumable (missing context is never "
                 "silently reconstructed)"
             )
+        if cp.transcript_json is None:
+            raise CheckpointError(
+                f"run {run_id!r} is an INCOMPLETE checkpoint (resumable mode but no "
+                "transcript stored); refusing to restart the task from missing context"
+            )
+        if cp.config_json:
+            try:
+                HiveConfig.model_validate_json(cp.config_json)
+            except Exception as exc:
+                raise CheckpointError(
+                    f"run {run_id!r} has a corrupt config snapshot; refusing to resume "
+                    f"from it: {exc}"
+                ) from exc
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
@@ -569,7 +623,7 @@ class Supervisor:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
         ctx = self.collaboration.context_for(run_id)
-        root_task_id = uuid4().hex
+        root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",
             description=cp.task, depth=0,
@@ -592,11 +646,13 @@ class Supervisor:
         transcript = [Message(**m) for m in json.loads(cp.transcript_json or "[]")]
         route = json.loads(cp.route_json or "[]")
         try:
-            return await self._arun_loop(
+            result = await self._arun_loop(
                 cp.task, run_id, ctx, root_task_id,
                 transcript=transcript, route=route, start_step=cp.step_count + 1,
                 resume_owner=owner,
             )
+            result.root_task_id = root_task_id
+            return result
         except asyncio.CancelledError:
             if ctx is not None:
                 ctx.update_task(root_task_id, status=TaskStatus.CANCELLED, finished_at=utcnow())
@@ -619,6 +675,12 @@ class Supervisor:
                     raise CheckpointError(
                         f"run {run_id!r}: lease lost during execution (stale worker fencing)"
                     )
+                self.checkpoint_store.update_progress(
+                    run_id, owner=resume_owner,
+                    counters_json=counters_to_json(ctx.counters_snapshot())
+                    if ctx is not None else "{}",
+                    step_count=step,
+                )
             stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
             if stop is None:
                 stop = self._budget_stop(ctx, root_task_id)
