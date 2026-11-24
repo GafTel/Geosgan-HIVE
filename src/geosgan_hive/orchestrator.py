@@ -312,17 +312,21 @@ class Supervisor:
         steps = steps_to_json(self._steps_payload(ctx))
         route_json = json.dumps(result.route)
         transcript_json = self._transcript_json(transcript)
+        gen = None
+        cp = store.get(run_id)
+        if cp is not None:
+            gen = cp.lease_generation
         if failed:
             store.mark_failed(
                 run_id, owner=owner, error=result.final_answer, counters_json=counters,
                 steps_json=steps, route_json=route_json, transcript_json=transcript_json,
-                step_count=result.steps,
+                step_count=result.steps, lease_generation=gen,
             )
         else:
             store.mark_completed(
                 run_id, owner=owner, result=result.final_answer, counters_json=counters,
                 steps_json=steps, route_json=route_json, transcript_json=transcript_json,
-                step_count=result.steps,
+                step_count=result.steps, lease_generation=gen,
             )
         return result
 

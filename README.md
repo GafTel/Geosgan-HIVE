@@ -599,28 +599,53 @@ See the commented `tools:` block in `config/agents.yaml` and the `HIVE_TOOLS_*`
 overrides in `.env.example`. `HIVE_TOOLS_ENABLED` etc. create an explicit
 tools block; absent env vars keep legacy mode.
 
+### Supported platform capabilities (Phase 3, exact)
+
+| Capability | Linux (with /proc) | macOS | Windows |
+|---|---|---|---|
+| Race-resistant file open (O_NOFOLLOW + /proc/self/fd re-verify) | yes | no | no |
+| fs_list / fs_read / fs_metadata | yes | **disabled by default** | **disabled by default** |
+| fs_write / fs_update (atomic replace, hash-bound) | yes | **disabled by default** | **disabled by default** |
+| Deny-name / traversal / symlink / hard-link checks | yes | realpath only (see below) | realpath only (see below) |
+
+On platforms without post-open fd re-verification, realpath containment alone is
+not a race-resistant guarantee, so ALL file tools fail closed (not even
+registered) unless the operator explicitly sets `allow_insecure_fs=True` on the
+sandbox (documented residual TOCTOU risk; reads can leak via parent-directory
+swaps). POSIX-only tests self-skip on Windows CI.
+
+### Data flow: what may reach model providers (Phase 3)
+
+Tool outputs — including file contents read via `fs_read` — are sent to the
+agent's configured model provider as ordinary message content, but ONLY content
+the agent was authorized to read through the gateway policy. Cross-provider
+fallback remains gated by the Phase 2.5 provider allowlists
+(`allowed_fallback_providers`), so unauthorized providers never receive
+conversation content. Logs, audit events, approval records and the ledger never
+contain raw tool payloads: they are bounded, secret-redacted, and in
+`metadata_only` persist mode the ledger/approvals store the args hash only (no
+payload at all); the CLI preview is bounded and redacted but always shows the
+FULL args sha256.
+
 ### Known limitations (Phase 3)
 
 - No network tools, HTTP transport, MCP or external API adapters yet (3.1/3.2);
   the adapter interfaces are in place but expose no nonfunctional capability.
-- Windows: fd-level re-verification after open is unavailable and realpath
-  containment alone is not race-resistant, so **write tools (fs_write/fs_update)
-  are disabled by default on Windows** (not even registered; the sandbox also
-  fails closed if called). Reads remain available with the documented residual
-  TOCTOU limitation. A Windows CI job runs the suite (POSIX-only tests self-skip).
-- Files with more than one hard link (`st_nlink > 1`) are refused for read and
-  write, because a second link may point outside the workspace and path
-  containment cannot see it.
+- Filesystem: see the platform matrix above — non-Linux platforms disable file
+  tools by default (fail closed). Hard-linked files (`st_nlink > 1`) are refused
+  everywhere (a second link may point outside the workspace).
 - Regex secret redaction cannot catch every secret shape (documented; it is a
   mitigation, not a boundary). The authorization hash is always computed on the
   ORIGINAL arguments; only persisted payloads/previews are redacted.
 - Sync-thread timeout cannot kill the underlying thread: its tool semaphore
   occupancy is held until the thread actually ends, and a mutating tool in
   that state is recorded UNKNOWN, never "safely cancelled".
-- Durable reserves (`tool_reservations`, `physical_reserved`) require RUNNING
-  state AND an unexpired lease — ownership fencing beyond mere state.
+- Durable reserves (`tool_reservations`, `physical_reserved`) and every
+  execution-start transition are atomically fenced by RUNNING state + unexpired
+  lease + actual lease owner + lease generation; terminal commits are fenced by
+  owner + generation. Resume revalidates the CURRENT policy/config.
 - Approval consumption and the ledger execution-start row commit in ONE atomic
   SQLite transaction, bound to approval id + args hash + tool version + run +
-  agent + tool + expiry; replay/substitution leave no partial state.
-- Resume revalidates the CURRENT policy/config; completed tool executions are
-  never replayed; UNKNOWN mutations need operator resolution.
+  task + agent + tool + expiry; replay/substitution leave no partial state.
+- Completed tool executions are never replayed; UNKNOWN mutations require
+  operator resolution and are never auto-replayed. No exactly-once claims.

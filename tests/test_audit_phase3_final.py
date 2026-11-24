@@ -99,17 +99,32 @@ def ctx(agent="alice", run_id="r1"):
 
 # ================= §2 workspace security =================
 
-def test_windows_writes_disabled_by_default_but_reads_allowed(tmp_path):
-    sb = WorkspaceSandbox(str(tmp_path / "ws"), platform="nt")
-    (tmp_path / "ws" / "a.txt").write_text("x")
-    assert sb.read_text("a.txt", max_bytes=100) == "x"  # reads still work
-    with pytest.raises(SandboxViolationError, match="disabled by default on Windows"):
-        sb.write_text("b.txt", "y")
-    # explicit override re-enables (operator accepts the documented limitation)
-    sb2 = WorkspaceSandbox(str(tmp_path / "ws2"), platform="nt",
-                           allow_writes_on_windows=True)
-    sb2.write_text("b.txt", "y")
-    assert (tmp_path / "ws2" / "b.txt").read_text() == "y"
+def test_non_race_resistant_platforms_disable_all_file_ops_by_default(tmp_path):
+    # Windows AND any platform without /proc fd re-verification (e.g. macOS):
+    # reads are disabled too — read-only access can still leak via TOCTOU races
+    for platform, fd in (("nt", False), ("darwin", False)):
+        sb = WorkspaceSandbox(str(tmp_path / f"ws_{platform}"), platform=platform,
+                              fd_reverify=fd)  # constructor creates the root
+        (tmp_path / f"ws_{platform}" / "a.txt").write_text("x")
+        with pytest.raises(SandboxViolationError, match="disabled by default"):
+            sb.read_text("a.txt", max_bytes=100)
+        with pytest.raises(SandboxViolationError, match="disabled by default"):
+            sb.list_dir(".", max_entries=10)
+        with pytest.raises(SandboxViolationError, match="disabled by default"):
+            sb.metadata("a.txt")
+        with pytest.raises(SandboxViolationError, match="disabled by default"):
+            sb.write_text("b.txt", "y")
+        assert sb.race_resistant is False
+    # explicit operator override re-enables (documented residual TOCTOU risk)
+    sb2 = WorkspaceSandbox(str(tmp_path / "ws_override"), platform="nt",
+                           fd_reverify=False, allow_insecure_fs=True)
+    (tmp_path / "ws_override" / "a.txt").write_text("x")
+    assert sb2.read_text("a.txt", max_bytes=100) == "x"
+    # Linux with /proc: fully race-resistant, everything enabled
+    sb3 = WorkspaceSandbox(str(tmp_path / "ws_linux"))
+    (tmp_path / "ws_linux" / "a.txt").write_text("x")
+    if sb3.race_resistant:
+        assert sb3.read_text("a.txt", max_bytes=100) == "x"
 
 
 def test_factory_does_not_register_write_tools_on_windows(tmp_path, monkeypatch):
@@ -125,8 +140,9 @@ def test_factory_does_not_register_write_tools_on_windows(tmp_path, monkeypatch)
     )
     catalog, sandbox = build_tool_catalog(config)
     assert sandbox.platform == "nt"
-    assert "fs_write" not in catalog.names() and "fs_update" not in catalog.names()
-    assert "fs_read" in catalog.names()
+    assert sandbox.race_resistant is False
+    # on a non-race-resistant platform NO file tools are registered at all
+    assert not any(n.startswith("fs_") for n in catalog.names())
 
 
 @pytest.mark.skipif(not POSIX, reason="hard links need a POSIX filesystem")

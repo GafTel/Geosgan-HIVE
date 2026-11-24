@@ -417,23 +417,33 @@ class CheckpointStore:
         assert cp is not None
         return cp
 
-    def reserve_tool_durable(self, run_id: str) -> bool:
+    def reserve_tool_durable(self, run_id: str, *, lease_owner: str | None = None,
+                             lease_generation: int | None = None) -> bool:
         """Durably reserve ONE tool execution BEFORE the side effect is dispatched
-        (Phase 3). Same guarantees as reserve_physical_durable: single atomic
-        transaction, monotonic SQL increment (never decreases), only while RUNNING
-        AND the lease is still valid (ownership fencing beyond mere RUNNING state:
-        an expired lease blocks dispatch even if crash recovery has not flipped the
-        state yet). A crash after this commit conservatively retains the reservation."""
+        (Phase 3). Single atomic transaction, monotonic SQL increment (never
+        decreases). Fenced by expected execution state (RUNNING), lease validity
+        (unexpired) AND — when provided — the ACTUAL lease owner and generation, so
+        a stale worker cannot dispatch after another worker acquired a fresh lease.
+        A crash after this commit conservatively retains the reservation."""
         now = self.now_iso()
+        cond = ["run_id=?", "state=?", "lease_expires_at > ?"]
+        params: list[Any] = [run_id, ExecutionState.RUNNING.value, now]
+        if lease_owner is not None:
+            cond.append("lease_owner=?")
+            params.append(lease_owner)
+        if lease_generation is not None:
+            cond.append("lease_generation=?")
+            params.append(lease_generation)
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE runs SET tool_reservations = tool_reservations + 1, updated_at=? "
-                "WHERE run_id=? AND state=? AND lease_expires_at > ?",
-                (now, run_id, ExecutionState.RUNNING.value, now),
+                "WHERE " + " AND ".join(cond),
+                [now, *params],
             )
             return cur.rowcount == 1
 
-    def reserve_physical_durable(self, run_id: str) -> bool:
+    def reserve_physical_durable(self, run_id: str, *, lease_owner: str | None = None,
+                                 lease_generation: int | None = None) -> bool:
         """Durably commit ONE physical dispatch reservation to SQLite BEFORE the
         provider request is sent. Single atomic transaction; the counter is
         monotonic (SQL increment, never a read-modify-write), so concurrent
@@ -445,11 +455,19 @@ class CheckpointStore:
         reservation. Returns False when the run row is gone, not RUNNING, or the
         lease has expired (ownership fencing beyond mere RUNNING state)."""
         now = self.now_iso()
+        cond = ["run_id=?", "state=?", "lease_expires_at > ?"]
+        params: list[Any] = [run_id, ExecutionState.RUNNING.value, now]
+        if lease_owner is not None:
+            cond.append("lease_owner=?")
+            params.append(lease_owner)
+        if lease_generation is not None:
+            cond.append("lease_generation=?")
+            params.append(lease_generation)
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE runs SET physical_reserved = physical_reserved + 1, updated_at=? "
-                "WHERE run_id=? AND state=? AND lease_expires_at > ?",
-                (now, run_id, ExecutionState.RUNNING.value, now),
+                "WHERE " + " AND ".join(cond),
+                [now, *params],
             )
             return cur.rowcount == 1
 
@@ -553,6 +571,7 @@ class CheckpointStore:
         run_id: str,
         *,
         owner: str,
+        lease_generation: int | None = None,
         result: str,
         counters_json: str,
         steps_json: str,
@@ -566,7 +585,8 @@ class CheckpointStore:
                 "UPDATE runs SET state=?, result=?, error=NULL, counters_json=?, "
                 "steps_json=?, route_json=?, transcript_json=?, step_count=?, "
                 "lease_owner=NULL, lease_expires_at=NULL, updated_at=? "
-                "WHERE run_id=? AND lease_owner=?",
+                "WHERE run_id=? AND lease_owner=?"
+                + (" AND lease_generation=?" if lease_generation is not None else ""),
                 (
                     ExecutionState.COMPLETED.value,
                     result,
@@ -578,6 +598,7 @@ class CheckpointStore:
                     now,
                     run_id,
                     owner,
+                    *([lease_generation] if lease_generation is not None else []),
                 ),
             )
             if cur.rowcount != 1:
@@ -591,6 +612,7 @@ class CheckpointStore:
         *,
         owner: str | None,
         error: str,
+        lease_generation: int | None = None,
         counters_json: str = "{}",
         steps_json: str = "[]",
         route_json: str = "[]",
@@ -614,11 +636,13 @@ class CheckpointStore:
                 cur = self._conn.execute(
                     "UPDATE runs SET state=?, error=?, counters_json=?, steps_json=?, "
                     "route_json=?, transcript_json=?, step_count=?, lease_owner=NULL, "
-                    "lease_expires_at=NULL, updated_at=? WHERE run_id=? AND lease_owner=?",
+                    "lease_expires_at=NULL, updated_at=? WHERE run_id=? AND lease_owner=?"
+                    + (" AND lease_generation=?" if lease_generation is not None else ""),
                     (
                         ExecutionState.FAILED.value, error, counters_json, steps_json,
                         route_json, self._transcript_or_none(transcript_json),
                         step_count, now, run_id, owner,
+                        *([lease_generation] if lease_generation is not None else []),
                     ),
                 )
             if cur.rowcount != 1:
@@ -688,6 +712,29 @@ class CheckpointStore:
             )
 
     # ---- Phase 3: tool execution ledger ----
+
+    def _verify_lease_locked(self, run_id: str, lease_owner: str | None,
+                             lease_generation: int | None) -> bool:
+        """Inside an open transaction: the run must be RUNNING with an unexpired
+        lease AND (when given) match the expected owner AND generation. This is the
+        atomic ownership-fencing check used by every durable tool dispatch and
+        execution-start transition."""
+        row = self._conn.execute(
+            "SELECT state, lease_owner, lease_generation, lease_expires_at FROM runs "
+            "WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["state"] != ExecutionState.RUNNING.value:
+            return False
+        if row["lease_expires_at"] is not None and row["lease_expires_at"] <= self.now_iso():
+            return False
+        if lease_owner is not None and row["lease_owner"] != lease_owner:
+            return False
+        if lease_generation is not None and int(row["lease_generation"]) != int(lease_generation):
+            return False
+        return True
+
     def ledger_start(
         self,
         *,
@@ -710,6 +757,10 @@ class CheckpointStore:
         dispatch). For mutating ops the row is fenced by lease owner+generation."""
         now = self.now_iso()
         with self._lock, self._conn:
+            if lease_owner is not None and not self._verify_lease_locked(
+                run_id, lease_owner, lease_generation
+            ):
+                return False  # stale worker / lost lease: no dispatch, no ledger row
             try:
                 self._conn.execute(
                     "INSERT INTO tool_executions (execution_id, run_id, task_id, agent, "
@@ -879,6 +930,7 @@ class CheckpointStore:
         self, approval_id: str, *, expected_args_sha256: str, now_iso: str | None = None,
         expected_tool_version: str | None = None, expected_run_id: str | None = None,
         expected_agent: str | None = None, expected_tool: str | None = None,
+        expected_task_id: str | None = None,
     ) -> bool:
         """Atomically consume an APPROVED approval: single transaction, single-use,
         bound to the exact argument hash (substitution -> rejected), not expired.
@@ -903,6 +955,9 @@ class CheckpointStore:
         if expected_tool is not None:
             cond.append("tool=?")
             params.append(expected_tool)
+        if expected_task_id is not None:
+            cond.append("task_id=?")
+            params.append(expected_task_id)
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE approvals SET status=?, consumed_at=? WHERE " + " AND ".join(cond),
@@ -915,6 +970,7 @@ class CheckpointStore:
         args_sha256: str, status: str, approval_id: str, expected_args_sha256: str,
         task_id: str | None = None, tool_version: str = "1", args_json: str = "{}",
         lease_owner: str | None = None, lease_generation: int | None = None,
+        expected_task_id: str | None = None,
     ) -> bool:
         """Atomic durable execution-start: consume the approval AND insert the ledger
         row in ONE transaction (both succeed or neither). The approval consume is
@@ -927,15 +983,23 @@ class CheckpointStore:
                 "SELECT 1 FROM tool_executions WHERE execution_id=?", (execution_id,)
             ).fetchone():
                 return False
+            # atomic ownership fencing: state + lease expiry + owner + generation
+            if not self._verify_lease_locked(run_id, lease_owner, lease_generation):
+                return False
+            cond = [
+                "approval_id=?", "status=?", "args_sha256=?", "tool_version=?",
+                "run_id=?", "agent=?", "tool=?", "expires_at > ?",
+            ]
+            params: list[Any] = [
+                approval_id, ApprovalState.APPROVED.value, expected_args_sha256,
+                tool_version, run_id, agent, tool, now,
+            ]
+            if expected_task_id is not None:
+                cond.append("task_id=?")
+                params.append(expected_task_id)
             cur = self._conn.execute(
-                "UPDATE approvals SET status=?, consumed_at=? "
-                "WHERE approval_id=? AND status=? AND args_sha256=? AND tool_version=? "
-                "AND run_id=? AND agent=? AND tool=? AND expires_at > ?",
-                (
-                    ApprovalState.CONSUMED.value, now, approval_id,
-                    ApprovalState.APPROVED.value, expected_args_sha256, tool_version,
-                    run_id, agent, tool, now,
-                ),
+                "UPDATE approvals SET status=?, consumed_at=? WHERE " + " AND ".join(cond),
+                [ApprovalState.CONSUMED.value, now, *params],
             )
             if cur.rowcount != 1:
                 return False

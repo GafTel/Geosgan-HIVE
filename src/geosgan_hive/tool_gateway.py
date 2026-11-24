@@ -139,8 +139,14 @@ class ToolGateway:
             if not ok:
                 raise ToolBudgetExceededError(reason or "tool budget exhausted")
             if self._store is not None and ctx.run_id:
-                # durable reservation BEFORE execution (atomic SQLite increment)
-                if not self._store.reserve_tool_durable(ctx.run_id):
+                # durable reservation BEFORE execution (atomic SQLite increment),
+                # fenced by the ACTUAL lease owner + generation + validity
+                row = self._store.get(ctx.run_id)
+                if not self._store.reserve_tool_durable(
+                    ctx.run_id,
+                    lease_owner=row.lease_owner if row is not None else None,
+                    lease_generation=row.lease_generation if row is not None else None,
+                ):
                     run_context.release_tool_reservation(agent=ctx.agent, tool=spec.name)
                     raise ToolPermissionError(
                         f"run {ctx.run_id!r} is no longer active — dispatch blocked (fail closed)"
@@ -244,6 +250,17 @@ class ToolGateway:
             raise ToolPermissionError("run not active — fail closed")
         return req, run_row
 
+    def _args_payload(self, args: dict[str, Any]) -> str:
+        """Persisted ledger payload: bounded + secret-redacted; in metadata_only
+        persist mode only the hash is kept (no tool payloads retained)."""
+        from .tool_spec import canonical_args
+
+        if self._store is not None and getattr(self._store.persist_mode, "value", "") == (
+            "metadata_only"
+        ):
+            return ""
+        return redact_secrets(canonical_args(args))[: 8_000]
+
     def _start_execution(self, spec: ToolSpec, ctx: ToolExecutionContext,
                          execution_id: str, args: dict[str, Any],
                          req: Any, run_row: Any) -> str:
@@ -261,18 +278,18 @@ class ToolGateway:
             raise ToolPermissionError(
                 f"tool '{spec.name}' requires a valid lease owner — failing closed"
             )
-        from .tool_spec import canonical_args
 
         digest = args_sha256(args)
         ok = self._store.start_execution(
             execution_id=execution_id, run_id=ctx.run_id, task_id=ctx.task_id,
             agent=ctx.agent, tool=spec.name, tool_version=spec.version,
             args_sha256=digest,
-            args_json=redact_secrets(canonical_args(args))[: 8_000],
+            args_json=self._args_payload(args),
             status="started" if mutating else "reserved",
             approval_id=req.approval_id, expected_args_sha256=digest,
             lease_owner=(run_row.lease_owner if run_row is not None else None),
             lease_generation=(run_row.lease_generation if run_row is not None else None),
+            expected_task_id=ctx.task_id,
         )
         if not ok:
             raise ApprovalError(
@@ -299,15 +316,15 @@ class ToolGateway:
             raise ToolPermissionError(
                 f"tool '{spec.name}' requires a valid lease owner — failing closed"
             )
-        from .tool_spec import canonical_args
 
         ok = self._store.ledger_start(
             execution_id=execution_id, run_id=ctx.run_id, task_id=ctx.task_id,
             agent=ctx.agent, tool=spec.name, tool_version=spec.version,
             args_sha256=args_sha256(args),
             # hash is computed on the ORIGINAL args (authoritative binding); the
-            # persisted payload is bounded AND secret-redacted
-            args_json=redact_secrets(canonical_args(args))[: 8_000],
+            # persisted payload is bounded AND secret-redacted (hash-only in
+            # metadata_only mode)
+            args_json=self._args_payload(args),
             status="started" if mutating else "reserved",
             approval_id=approval_id or None,
             lease_owner=(run_row.lease_owner if run_row is not None else None),

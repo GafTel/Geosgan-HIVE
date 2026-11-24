@@ -92,8 +92,13 @@ class ApprovalManager:
             tool_version=spec.version,
             operation=operation,
             target=target,
-            # bounded + secret-redacted payload; the hash is authoritative
-            args_json=redact_secrets(canonical)[: 8_000],
+            # bounded + secret-redacted payload; the hash is authoritative.
+            # In metadata_only mode no tool payload is persisted at all (hash only).
+            args_json=(
+                ""
+                if getattr(self.store.persist_mode, "value", "") == "metadata_only"
+                else redact_secrets(canonical)[: 8_000]
+            ),
             args_sha256=digest,
             preconditions_json=_json.dumps(preconditions or {}, default=str)[: 4_000],
             preview=preview,
@@ -122,15 +127,23 @@ class ApprovalManager:
         from .tool_gateway import redact_secrets
 
         arg_text = redact_secrets(_json.dumps(args, ensure_ascii=False, default=str))
-        if len(arg_text) > self.preview_bytes:
+        truncated = len(arg_text) > self.preview_bytes
+        if truncated:
             arg_text = arg_text[: self.preview_bytes] + "...[truncated]"
         lines = [
             f"tool={spec.name} v{spec.version}  operation={operation}",
             f"target={target or '-'}",
             f"side_effect={spec.side_effect.value} idempotent={spec.idempotent}",
             f"args={arg_text}",
-            f"args_sha256={args_sha256(args)[:16]}...",
         ]
+        if truncated:
+            lines.append(
+                f"NOTE: args preview truncated at {self.preview_bytes} bytes; the FULL "
+                "sha256 below binds the complete original arguments"
+            )
+        # the FULL hash is always shown: redaction/truncation can never change the
+        # authorization identity (the hash is computed on the ORIGINAL args)
+        lines.append(f"args_sha256={args_sha256(args)}")
         return "\n".join(lines)
 
     # ---- operator decisions (trusted CLI path only) ----
@@ -174,14 +187,15 @@ class ApprovalManager:
                 expected_tool_version: str | None = None,
                 expected_run_id: str | None = None,
                 expected_agent: str | None = None,
-                expected_tool: str | None = None) -> bool:
+                expected_tool: str | None = None,
+                expected_task_id: str | None = None) -> bool:
         """Atomically consume (single-use, hash-bound, expiry-checked, and bound to
         the expected tool version / run / agent / tool when given)."""
         return self.store.consume_approval(
             approval_id, expected_args_sha256=expected_args_sha256,
             expected_tool_version=expected_tool_version,
             expected_run_id=expected_run_id, expected_agent=expected_agent,
-            expected_tool=expected_tool,
+            expected_tool=expected_tool, expected_task_id=expected_task_id,
         )
 
     def sweep_expired(self) -> int:

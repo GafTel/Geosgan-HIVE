@@ -48,17 +48,19 @@ class WorkspaceSandbox:
       the pre-open realpath is the fallback);
     - size caps are enforced before reading.
 
-    Platform notes: O_NOFOLLOW and /proc/self/fd verification are POSIX. On Windows,
-    realpath resolves junctions/reparse points and containment is enforced, but
-    fd-level re-verification is NOT available, and realpath containment alone is
-    not a race-resistant guarantee — therefore WRITE operations (fs_write/fs_update)
-    are DISABLED BY DEFAULT on Windows (fail closed) unless explicitly overridden;
-    reads remain available with the documented residual TOCTOU limitation.
+    Platform notes: race-resistant containment requires O_NOFOLLOW plus post-open
+    fd re-verification via /proc/self/fd (Linux). On platforms where that mechanism
+    is unavailable (Windows, macOS, ...), realpath containment alone is NOT
+    sufficient — therefore ALL file operations (fs_read/fs_list/fs_metadata/
+    fs_write/fs_update) are DISABLED BY DEFAULT on such platforms (fail closed,
+    tools are not even registered) unless the operator explicitly passes
+    allow_insecure_fs=True, accepting the documented residual TOCTOU risk.
     """
 
     def __init__(self, root: str, deny_patterns: list[str] | None = None,
                  write_extensions: list[str] | None = None, *,
-                 platform: str | None = None, allow_writes_on_windows: bool = False) -> None:
+                 platform: str | None = None, fd_reverify: bool | None = None,
+                 allow_insecure_fs: bool = False) -> None:
         if not root or "\x00" in root:
             raise SandboxViolationError("invalid workspace root")
         self.root = os.path.realpath(root)
@@ -69,7 +71,25 @@ class WorkspaceSandbox:
             else (".txt", ".md")
         )
         self.platform = platform or os.name
-        self.allow_writes_on_windows = bool(allow_writes_on_windows)
+        if fd_reverify is None:
+            fd_reverify = self.platform == "posix" and os.path.isdir("/proc/self/fd")
+        #: race-resistant containment is only claimed when post-open fd
+        #: re-verification is available (Linux /proc/self/fd)
+        self.fd_reverify = bool(fd_reverify)
+        self.race_resistant = self.fd_reverify
+        self.allow_insecure_fs = bool(allow_insecure_fs)
+
+    def _fs_guard(self) -> None:
+        """Fail closed when race-resistant containment cannot be guaranteed on this
+        platform (no post-open fd re-verification), unless the operator explicitly
+        accepted the residual TOCTOU risk with allow_insecure_fs=True."""
+        if not self.race_resistant and not self.allow_insecure_fs:
+            raise SandboxViolationError(
+                f"file operations are disabled by default on platform {self.platform!r}: "
+                "race-resistant containment requires post-open fd re-verification "
+                "(/proc/self/fd), which is unavailable here; realpath containment alone "
+                "is not sufficient (fail closed)"
+            )
 
     # ---- path resolution ----
     def _deny_check(self, resolved: str) -> None:
@@ -107,6 +127,7 @@ class WorkspaceSandbox:
     def open_read(self, relpath: str, *, max_bytes: int) -> tuple[int, str]:
         """Open a file for reading race-resistently. Returns (fd, resolved_path).
         Raises SandboxViolationError on any violation (fail closed)."""
+        self._fs_guard()
         resolved = self.resolve(relpath)
         # pre-check BEFORE opening: reject non-regular files (fifos/devices would
         # otherwise block or misbehave on open)
@@ -141,8 +162,8 @@ class WorkspaceSandbox:
                 raise SandboxViolationError(
                     f"{relpath!r} is {st.st_size} bytes > limit {max_bytes}"
                 )
-            # re-verify the OPENED file (TOCTOU): on Linux check the fd's real path
-            if os.path.isdir("/proc/self/fd"):
+            # re-verify the OPENED file (TOCTOU): check the fd's real path via /proc
+            if self.fd_reverify:
                 fd_target = os.path.realpath(f"/proc/self/fd/{fd}")
                 if os.path.commonpath([fd_target, self.root]) != self.root:
                     raise SandboxViolationError("opened file escaped the workspace (race)")
@@ -153,6 +174,7 @@ class WorkspaceSandbox:
             raise
 
     def read_text(self, relpath: str, *, max_bytes: int) -> str:
+        self._fs_guard()
         fd, _ = self.open_read(relpath, max_bytes=max_bytes)
         try:
             data = os.read(fd, max_bytes + 1)
@@ -163,6 +185,7 @@ class WorkspaceSandbox:
         return data.decode("utf-8", errors="replace")
 
     def metadata(self, relpath: str) -> FileInfo:
+        self._fs_guard()
         resolved = self.resolve(relpath)
         try:
             st = os.stat(resolved, follow_symlinks=False)
@@ -195,6 +218,7 @@ class WorkspaceSandbox:
 
     # ---- writes (atomic replace; approval-bound preconditions) ----
     def sha256_file(self, relpath: str) -> str:
+        self._fs_guard()
         fd, _ = self.open_read(relpath, max_bytes=MAX_HASH_BYTES)
         h = hashlib.sha256()
         try:
@@ -221,12 +245,7 @@ class WorkspaceSandbox:
         write is rejected and a fresh approval is required). The replace itself is
         atomic (tmp file in the same directory + os.replace), so readers never see a
         partially written file."""
-        if self.platform == "nt" and not self.allow_writes_on_windows:
-            raise SandboxViolationError(
-                "write operations are disabled by default on Windows: fd-level "
-                "re-verification is unavailable there and realpath containment alone "
-                "is not race-resistant"
-            )
+        self._fs_guard()
         resolved = self.resolve(relpath)
         data = content.encode("utf-8")
         if len(data) > max_bytes:
@@ -302,6 +321,7 @@ class WorkspaceSandbox:
         return hashlib.sha256(data).hexdigest()
 
     def list_dir(self, relpath: str, *, max_entries: int) -> list[dict[str, Any]]:
+        self._fs_guard()
         resolved = self.resolve(relpath)
         if not os.path.isdir(resolved):
             raise SandboxViolationError(f"{relpath!r} is not a directory")
