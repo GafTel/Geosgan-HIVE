@@ -103,6 +103,8 @@ class RunContext:
         self._results: dict[str, Any] = {}
         self._model_calls = 0
         self._handoffs = 0
+        self._agent_calls: dict[str, int] = {}
+        self._slot_holders: set[str] = set()  # task_ids whose subtree holds a semaphore slot
         self._semaphore: asyncio.Semaphore | None = None
 
     # ---- model-call budget (run-wide, atomic) ----
@@ -121,12 +123,29 @@ class RunContext:
             node = self._tasks.get(task_id) if task_id else None
             if node is not None:
                 node.model_calls += 1
+                self._agent_calls[node.agent] = self._agent_calls.get(node.agent, 0) + 1
             return True
 
     @property
     def model_calls(self) -> int:
+        """Logical model calls reserved in this run (one per llm.complete/acomplete)."""
         with self._lock:
             return self._model_calls
+
+    def agent_calls(self, agent: str) -> int:
+        """Logical model calls made by one agent across the WHOLE run (all its tasks),
+        so per-agent limits cannot be bypassed by repeated delegation."""
+        with self._lock:
+            return self._agent_calls.get(agent, 0)
+
+    @property
+    def physical_requests(self) -> int:
+        """Physical provider requests in this run (sum of retry attempts from usage
+        records). Distinct from `model_calls`: one logical call may produce several
+        physical requests when the gateway retries transient errors."""
+        if self.tracker is None:
+            return 0
+        return self.tracker.physical_requests(self.run_id)
 
     # ---- handoff budget ----
     def reserve_handoff(self) -> bool:
@@ -257,6 +276,30 @@ class RunContext:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.policy.max_parallel_agents)
         return self._semaphore
+
+    def has_slot_ancestor(self, task_id: str | None) -> bool:
+        """True if any task in `task_id`'s ancestor chain (inclusive) holds a
+        semaphore slot. Nested delegations inherit the ancestor's slot instead of
+        acquiring a new one, so a full semaphore can never deadlock on agents that
+        are merely waiting for their own delegated subtasks."""
+        with self._lock:
+            current = task_id
+            while current is not None:
+                if current in self._slot_holders:
+                    return True
+                node = self._tasks.get(current)
+                if node is None:
+                    return False
+                current = node.parent_task_id
+            return False
+
+    def mark_slot(self, task_id: str) -> None:
+        with self._lock:
+            self._slot_holders.add(task_id)
+
+    def unmark_slot(self, task_id: str) -> None:
+        with self._lock:
+            self._slot_holders.discard(task_id)
 
     def close(self) -> None:
         with self._lock:

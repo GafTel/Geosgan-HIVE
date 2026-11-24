@@ -191,13 +191,20 @@ class Agent:
         stop = check_run_limits(self.usage_tracker, run_id, calls, self.limits)
         if stop is not None:
             return stop
-        if run_context is not None and not run_context.reserve_model_call(task_id):
-            # reserve immediately before each actual model request; counts every
-            # supervisor/agent/delegated/nested LLM request run-wide
-            return (
-                f"Run-wide model-call limit "
-                f"({run_context.policy.max_model_calls_per_run}) reached."
-            )
+        if run_context is not None:
+            # per-agent limit across the WHOLE run (not per delegation)
+            if run_context.agent_calls(self.name) >= self.limits.max_calls_per_run:
+                return (
+                    f"Per-agent limit reached: max {self.limits.max_calls_per_run} "
+                    f"model calls for '{self.name}' in this run."
+                )
+            if not run_context.reserve_model_call(task_id):
+                # reserve immediately before each actual model request; counts every
+                # supervisor/agent/delegated/nested LLM request run-wide
+                return (
+                    f"Run-wide model-call limit "
+                    f"({run_context.policy.max_model_calls_per_run}) reached."
+                )
         return None
 
     def _delegation_allowed(self, run_context: RunContext | None) -> bool:

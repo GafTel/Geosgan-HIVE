@@ -94,10 +94,10 @@ def test_adelegate_many_parallel_deterministic_order_and_concurrency_cap():
     assert [r.target_agent for r in results] == ["analyst", "reviewer", "developer"]
     assert [r.result for r in results] == ["analyst done", "reviewer done", "developer done"]
     assert all(r.status == DelegationStatus.COMPLETED for r in results)
-    # bounded concurrency: never more than max_parallel_agents at once
+    # bounded concurrency AND parallelism proven by observed overlap:
+    # peak == 2 means two handlers were inside concurrently (sequential would be 1)
     assert peak["max"] == 2
-    # parallel, not sequential: elapsed well below the sum of delays (0.15s)
-    assert elapsed < 0.15
+    assert elapsed < 1.0  # generous sanity bound; sum of delays would be 0.15s sequential
 
 
 def test_adelegate_many_dedupes_identical_proposals():

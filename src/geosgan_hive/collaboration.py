@@ -457,49 +457,63 @@ class CollaborationEngine:
         )
         if early is not None or req is None:
             return early  # type: ignore[return-value]
+        # A nested delegation inherits the ancestor's semaphore slot instead of
+        # acquiring a new one: with every slot held by an agent waiting on its own
+        # subtask, no circular wait can occur (no deadlock).
+        if ctx.has_slot_ancestor(req.parent_task_id):
+            return await self._execute_async(ctx, req, timeout)
         sem = ctx.semaphore()
         async with sem:  # bounded by policy.max_parallel_agents
-            self._start_task(ctx, req)
-            target = self.agents[req.target_agent]
-            before = ctx.model_calls
-            started = utcnow()
-            effective = (
-                timeout if timeout is not None else self.policy.default_delegation_timeout_seconds
-            )
-            coro = arun_agent(
-                target,
-                req.task_description,
-                context=req.relevant_context,
-                run_id=ctx.run_id,
-                task_id=req.task_id,
-                run_context=ctx,
-            )
+            ctx.mark_slot(req.task_id)
             try:
-                result = await asyncio.wait_for(coro, timeout=effective)
-            except TimeoutError:  # asyncio.TimeoutError
-                return self._finish(
-                    ctx, req, TaskStatus.CANCELLED,
-                    error=f"delegation timed out after {effective}s",
-                    before=before, started=started,
-                )
-            except asyncio.CancelledError:
-                self._finish(
-                    ctx, req, TaskStatus.CANCELLED, error="delegation cancelled",
-                    before=before, started=started, record_result=False,
-                )
-                raise
-            except GatewayError as exc:
-                return self._finish(
+                return await self._execute_async(ctx, req, timeout)
+            finally:
+                ctx.unmark_slot(req.task_id)
+
+    async def _execute_async(
+        self, ctx: RunContext, req: HandoffRequest, timeout: float | None
+    ) -> HandoffResult:
+        self._start_task(ctx, req)
+        target = self.agents[req.target_agent]
+        before = ctx.model_calls
+        started = utcnow()
+        effective = (
+            timeout if timeout is not None else self.policy.default_delegation_timeout_seconds
+        )
+        coro = arun_agent(
+            target,
+            req.task_description,
+            context=req.relevant_context,
+            run_id=ctx.run_id,
+            task_id=req.task_id,
+            run_context=ctx,
+        )
+        try:
+            result = await asyncio.wait_for(coro, timeout=effective)
+        except TimeoutError:  # asyncio.TimeoutError (== TimeoutError on 3.11+)
+            return self._finish(
+                ctx, req, TaskStatus.CANCELLED,
+                error=f"delegation timed out after {effective}s",
+                before=before, started=started,
+            )
+        except asyncio.CancelledError:
+            self._finish(
+                ctx, req, TaskStatus.CANCELLED, error="delegation cancelled",
+                before=before, started=started, record_result=False,
+            )
+            raise
+        except GatewayError as exc:
+            return self._finish(
                 ctx, req, TaskStatus.FAILED, error=str(exc), before=before, started=started
             )
-            except Exception as exc:  # never silently ignore a failed subtask
-                return self._finish(
-                    ctx, req, TaskStatus.FAILED, error=f"{type(exc).__name__}: {exc}",
-                    before=before, started=started,
-                )
+        except Exception as exc:  # never silently ignore a failed subtask
             return self._finish(
-                ctx, req, TaskStatus.COMPLETED, result=result.answer, before=before, started=started
+                ctx, req, TaskStatus.FAILED, error=f"{type(exc).__name__}: {exc}",
+                before=before, started=started,
             )
+        return self._finish(
+            ctx, req, TaskStatus.COMPLETED, result=result.answer, before=before, started=started
+        )
 
     async def adelegate_many(
         self,
@@ -523,7 +537,9 @@ class CollaborationEngine:
             if key not in unique:
                 unique[key] = prop
                 order.append(key)
-        # asyncio.gather preserves input order; each adelegate acquires the semaphore
+        # asyncio.gather preserves input order; each adelegate acquires the semaphore.
+        # return_exceptions=True + explicit CancelledError re-raise: cancelling the
+        # batch cancels every child, so no orphaned coroutines are left running.
         results = await asyncio.gather(
             *(
                 self.adelegate(
@@ -531,8 +547,12 @@ class CollaborationEngine:
                     source_agent=source_agent, timeout=timeout,
                 )
                 for key in order
-            )
+            ),
+            return_exceptions=True,
         )
+        for res in results:
+            if isinstance(res, asyncio.CancelledError):
+                raise res
         by_key = dict(zip(order, results, strict=True))
         return [by_key[(p.target, p.task)] for p in normalized]
 

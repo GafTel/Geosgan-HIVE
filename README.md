@@ -274,8 +274,24 @@ full transcripts (subtask context is scoped to the ancestor task chain).
 
 Every actual model request (supervisor, specialists, delegated, nested) atomically
 reserves one unit of the run-wide `max_model_calls_per_run` budget **before** the
-call — exact counts under concurrency, per task and per run. Per-agent limits and
-the soft cost budget are unchanged (unknown costs stay `None`).
+call — exact counts under concurrency, per task and per run. Per-agent limits are
+enforced across the **whole run** (`RunContext.agent_calls`), so they cannot be
+bypassed by repeatedly delegating to the same agent. The soft cost budget is
+unchanged (unknown costs stay `None`).
+
+**Logical vs physical requests**: `RunContext.model_calls` counts *logical* model
+calls (one per `llm.complete`/`acomplete`, reserved pre-call). `RunContext.physical_requests`
+counts *physical provider requests* — the sum of retry `attempts` in the usage
+records — so a call the gateway retried 3 times counts as 1 logical call but 3
+physical requests. Both are exact under concurrency.
+
+**Deadlock safety**: the `max_parallel_agents` semaphore is acquired per top-level
+delegation; nested delegations inherit the ancestor's slot (`has_slot_ancestor`),
+so a fully occupied semaphore can never deadlock on agents waiting for their own
+subtasks. Batch cancellation uses `gather(return_exceptions=True)` + re-raise, so
+no orphaned coroutines survive. Legacy sync-only LLM adapters run in a thread and
+cannot be interrupted mid-call — the delegation wrapper is still cancelled on
+timeout, and the eventual physical call remains counted.
 
 ### Async execution
 

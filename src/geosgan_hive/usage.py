@@ -94,5 +94,16 @@ class UsageTracker:
         records = [r for r in self.records() if r.run_id == run_id]
         return self._summarize(records).cost_usd if records else None
 
+    def physical_requests(self, run_id: str | None = None) -> int:
+        """Physical provider requests: sum of retry `attempts` over the records.
+
+        This is distinct from logical model calls — a logical call that the
+        gateway retried 3 times produced 3 physical provider requests.
+        """
+        records = self.records()
+        if run_id is not None:
+            records = [r for r in records if r.run_id == run_id]
+        return sum(r.attempts for r in records)
+
     def total_cost(self) -> float | None:
         return self._summarize(self.records()).cost_usd
