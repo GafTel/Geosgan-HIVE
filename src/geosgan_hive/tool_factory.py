@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .agent_config import HiveConfig
+from .sandbox import WorkspaceSandbox
 from .tool_gateway import BuiltinToolAdapter, ToolGateway
 from .tool_policy import build_policy
 from .tool_registry import ToolCatalog
@@ -37,16 +38,23 @@ def register_builtin_tools(catalog: ToolCatalog) -> None:
         catalog.register(spec, BuiltinToolAdapter(tool, spec))
 
 
-def build_tool_catalog() -> ToolCatalog:
+def build_tool_catalog(config: HiveConfig | None = None) -> tuple[ToolCatalog, WorkspaceSandbox]:
     """Catalog with all compiled-in tools. Registration != availability: the
     ToolPolicy decides what each agent may use (deny-by-default)."""
     catalog = ToolCatalog()
     register_builtin_tools(catalog)
     from .tools_data import register_data_tools
 
-    register_data_tools(catalog)  # T2: registered but denied unless enabled
-    # T3/T5 add sandboxed file tools here (registered but denied unless enabled)
-    return catalog
+    register_data_tools(catalog)  # registered but denied unless enabled
+    from .sandbox import WorkspaceSandbox
+    from .tools_files import register_file_tools
+
+    has_tools = config is not None and config.tools is not None
+    root = config.tools.workspace_root if has_tools else "workspace"
+    deny = config.tools.deny_name_patterns if has_tools else None
+    sandbox = WorkspaceSandbox(root, deny)
+    register_file_tools(catalog, sandbox)
+    return catalog, sandbox
 
 
 def build_tool_gateway(
@@ -62,7 +70,7 @@ def build_tool_gateway(
     listed. `strict` fails closed when the durable store is wired but the run
     context is missing.
     """
-    catalog = build_tool_catalog()
+    catalog, _sandbox = build_tool_catalog(config)
     if config.tools is None:
         global_enabled = list(BUILTIN_TOOL_NAMES)
     else:

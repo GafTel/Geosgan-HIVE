@@ -78,7 +78,7 @@ def test_unexpected_argument_rejected():
 
 
 def test_catalog_registers_data_tools_but_policy_denies_by_default():
-    catalog = build_tool_catalog()
+    catalog, _sb = build_tool_catalog()
     assert "json_parse" in catalog.names() and "csv_validate" in catalog.names()
     from geosgan_hive.tool_policy import build_policy
     policy = build_policy(global_enabled=[], agent_permissions={"a": (True, ["json_parse"])})
