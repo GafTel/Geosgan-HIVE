@@ -20,6 +20,7 @@ from geosgan_hive.agent_config import (
     apply_env_overrides,
 )
 from geosgan_hive.cloud_profiles import (
+    AdapterCapabilities,
     BillingModel,
     CloudProfile,
     CloudProfileRegistry,
@@ -27,6 +28,8 @@ from geosgan_hive.cloud_profiles import (
     QuotaPeriod,
     QuotaSpec,
     TokenEstimate,
+    TokenEstimationMode,
+    VerificationEvidence,
     bounded_token_estimate,
 )
 from geosgan_hive.errors import (
@@ -52,6 +55,14 @@ def free_profile(**overrides) -> dict:
         verified_at=(NOW - timedelta(days=1)).isoformat(),
         account_label="main",
         account_fingerprint="a" * 64,
+        verification_evidence={
+            "source": "provider_billing_console_export",
+            "evidence_ref": "ev-2026-01-14",
+            "collected_at": (NOW - timedelta(days=1)).isoformat(),
+            "collected_by": "operator-1",
+            "credential_bound": True,
+            "account_fingerprint": "a" * 64,
+        },
         quotas=[{"pool": "gemini:acct:" + "a" * 64, "max_requests": 1500,
                  "max_tokens": 1_000_000, "period": "day"}],
     )
@@ -60,6 +71,7 @@ def free_profile(**overrides) -> dict:
 
 
 def registry(profiles, *, zero_cost=True, **kw) -> CloudProfileRegistry:
+    kw.setdefault("max_spend_usd", 0.0 if zero_cost else None)
     return CloudProfileRegistry(
         profiles=[CloudProfile.model_validate(p) for p in profiles],
         zero_cost=zero_cost,
@@ -189,6 +201,8 @@ def test_different_accounts_get_different_pools():
     p2 = free_profile(account_label="other", account_fingerprint="b" * 64,
                       models=["gemini/gemini-2.0-flash-alt"])
     p2["quotas"] = [{"pool": "gemini:acct:" + "b" * 64, "max_requests": 100}]
+    p2["verification_evidence"] = dict(p2["verification_evidence"],
+                                        account_fingerprint="b" * 64)
     reg = registry([p1, p2], zero_cost=True)
     assert reg.quota_pool("gemini/gemini-2.0-flash") != reg.quota_pool(
         "gemini/gemini-2.0-flash-alt")
@@ -329,6 +343,8 @@ def test_duplicate_model_registration_rejected():
 def test_conflicting_profiles_for_same_account_rejected():
     p2 = free_profile(account_fingerprint="b" * 64)  # same provider+label, other fp
     p2["quotas"] = [{"pool": "gemini:acct:" + "b" * 64, "max_requests": 5}]
+    p2["verification_evidence"] = dict(p2["verification_evidence"],
+                                        account_fingerprint="b" * 64)
     with pytest.raises(CloudConfigError):
         registry([free_profile(), p2])
 
@@ -463,11 +479,176 @@ def test_absent_cloud_config_preserves_legacy():
 # --- issue 10: attestation != independently verified billing guarantee ---
 
 def test_operator_attestation_alone_does_not_enable_live_dispatch():
-    p = free_profile(billing_verified=False)  # attested but NOT independently verified
+    p = free_profile(billing_verified=False)
+    p["verification_evidence"] = None  # attestation only, no trusted evidence
     reg = registry([p], zero_cost=True)
     ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
-    assert ok is False and "verified" in reason.lower()
-    # with independent verification as well, zero-cost live dispatch is allowed
+    assert ok is False and "evidence" in reason.lower()
+    # evidence contract satisfied as well -> allowed
     reg2 = registry([free_profile(billing_verified=True)], zero_cost=True)
     ok, _ = reg2.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is True
+    # billing_verified=True WITHOUT evidence is still just an assertion -> blocked
+    no_ev = free_profile(billing_verified=True)
+    no_ev["verification_evidence"] = None
+    reg3 = registry([no_ev], zero_cost=True)
+    ok, reason = reg3.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "evidence" in reason.lower()
+
+
+# ================= C2 final hardening (failing-first) =================
+
+# --- issue 1: deep immutability ---
+
+def test_deep_immutability_nested_mutation_blocked():
+    from types import MappingProxyType
+
+    p = CloudProfile.model_validate(free_profile())
+    assert isinstance(p.models, tuple) and isinstance(p.quotas, tuple)
+    with pytest.raises(AttributeError):
+        p.models.append("gemini/evil")  # tuple: no append
+    with pytest.raises(AttributeError):
+        p.quotas.append(p.quotas[0])
+    with pytest.raises(ValidationError):
+        p.quotas[0].max_requests = 1  # frozen QuotaSpec
+    reg = registry([free_profile()])
+    assert isinstance(reg._by_model, MappingProxyType)
+    with pytest.raises(TypeError):
+        reg._by_model["gemini/evil"] = p  # read-only mapping
+    assert isinstance(reg.profiles, tuple)
+    # defensive input handling: plain lists/dicts are copied+validated on construction
+    reg2 = CloudProfileRegistry(profiles=[free_profile()], zero_cost=True,
+                                max_spend_usd=0.0)
+    assert isinstance(reg2.profiles, tuple) and isinstance(reg2.profiles[0].models, tuple)
+
+
+# --- issue 2: zero-cost spend rule enforced inside the registry itself ---
+
+def test_registry_rejects_nonzero_spend_in_zero_cost_direct_construction():
+    with pytest.raises(CloudConfigError):
+        CloudProfileRegistry(profiles=[], zero_cost=True, max_spend_usd=5.0)
+    with pytest.raises(CloudConfigError):
+        CloudProfileRegistry(profiles=[], zero_cost=True, max_spend_usd=None)
+    reg = CloudProfileRegistry(profiles=[], zero_cost=True, max_spend_usd=0.0)
+    assert reg.max_spend_usd == 0.0
+
+
+# --- issue 3: account-wide quota aggregation by canonical fingerprint ---
+
+def test_account_wide_quota_aggregation_across_models():
+    fp = "a" * 64
+    p1 = free_profile(models=["gemini/gemini-2.0-flash"],
+                      quotas=[{"pool": f"gemini:acct:{fp}", "max_requests": 1500,
+                               "period": "day"}])
+    p2 = free_profile(models=["gemini/gemini-2.0-flash-lite"],
+                      quotas=[{"pool": f"gemini:acct:{fp}", "max_tokens": 1_000_000,
+                               "period": "day"},
+                              {"pool": f"gemini:acct:{fp}", "max_requests": 1500,
+                               "period": "day"}])  # duplicate of p1's constraint
+    reg = registry([p1, p2], zero_cost=True)
+    agg = reg.account_quotas(fp)
+    # deduplicated union of ALL account constraints (day requests + day tokens)
+    assert len(agg) == 2
+    # every model of the account sees the account-wide limits (no bypass)
+    for m in ("gemini/gemini-2.0-flash", "gemini/gemini-2.0-flash-lite"):
+        assert {q.key() for q in reg.quotas_for(m)} == {q.key() for q in agg}
+    assert reg.account_fingerprint_for("gemini/gemini-2.0-flash-lite") == fp
+
+
+# --- issue 4: canonical identity conflicts by fingerprint ---
+
+def test_conflicting_account_identity_by_fingerprint_rejected():
+    # same fingerprint, different label -> conflicting identity
+    p2 = free_profile(account_label="other")  # same fingerprint "a"*64
+    with pytest.raises(CloudConfigError):
+        registry([free_profile(), p2])
+    # same fingerprint, different billing -> conflict
+    p3 = free_profile(billing="paid", verified_free=False,
+                      overage_billing_disabled=False, verified_at=None,
+                      verification_evidence=None,
+                      models=["gemini/gemini-paid"])
+    with pytest.raises(CloudConfigError):
+        registry([free_profile(), p3])
+
+
+# --- issue 5: explicit verification evidence contract ---
+
+def test_evidence_contract_required_and_bound_to_account():
+    base = free_profile(billing_verified=True)
+    # missing evidence -> blocked
+    no_ev = dict(base)
+    no_ev["verification_evidence"] = None
+    reg = registry([no_ev], zero_cost=True)
+    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "evidence" in reason.lower()
+    # evidence bound to a DIFFERENT account fingerprint -> construction error
+    bad = dict(base)
+    bad["verification_evidence"] = dict(base["verification_evidence"],
+                                        account_fingerprint="b" * 64)
+    with pytest.raises(ValidationError):
+        CloudProfile.model_validate(bad)
+    # naive collected_at -> validation error
+    bad2 = dict(base)
+    bad2["verification_evidence"] = dict(base["verification_evidence"],
+                                         collected_at="2026-01-14T12:00:00")
+    with pytest.raises(ValidationError):
+        CloudProfile.model_validate(bad2)
+    # unbound credential -> construction ok but eligibility blocks (live blocked)
+    unb = dict(base)
+    unb["verification_evidence"] = dict(base["verification_evidence"], credential_bound=False)
+    reg2 = registry([unb], zero_cost=True)
+    ok, reason = reg2.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "credential" in reason.lower()
+    # stale evidence (beyond ttl) -> blocked
+    old = dict(base)
+    old["verification_evidence"] = dict(base["verification_evidence"],
+                                        collected_at=(NOW - timedelta(days=40)).isoformat())
+    reg3 = registry([old], zero_cost=True)
+    ok, _ = reg3.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False
+    # proper evidence -> allowed
+    reg4 = registry([base], zero_cost=True)
+    ok, _ = reg4.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is True
+
+
+# --- issue 6: live token estimation capability flags ---
+
+class LiveStubAdapter(FakeCloudAdapter):
+    is_test_only = False
+    capabilities = AdapterCapabilities(live_supported=True,
+                                       token_estimation=TokenEstimationMode.BOUNDED_HEURISTIC)
+
+    def estimate_tokens(self, model, *, prompt_chars, max_output_tokens):
+        import math
+        return TokenEstimate(prompt_tokens=max(1, math.ceil(prompt_chars / 4)),
+                             max_output_tokens=max_output_tokens)
+
+
+class NoCapsAdapter(FakeCloudAdapter):
+    pass  # no explicit capabilities
+
+
+def test_live_estimation_requires_explicit_capability_flags():
+    with pytest.raises(CostUnknownError):
+        bounded_token_estimate(NoCapsAdapter(), "fake/mini", prompt_chars=10,
+                               max_output_tokens=64, live=True)  # missing flags
+    with pytest.raises(CostUnknownError):
+        bounded_token_estimate(FakeCloudAdapter(), "fake/mini", prompt_chars=10,
+                               max_output_tokens=64, live=True)  # live_supported=False
+    stub = LiveStubAdapter()
+    est = bounded_token_estimate(stub, "fake/mini", prompt_chars=100,
+                                 max_output_tokens=64, live=True)
+    assert est.max_output_tokens == 64 and est.prompt_tokens >= 25  # conservative ceil
+
+
+def test_verification_evidence_model_valid():
+    ev = VerificationEvidence.model_validate({
+        "source": "provider_billing_console_export",
+        "evidence_ref": "ev-1",
+        "collected_at": NOW.isoformat(),
+        "collected_by": "operator-1",
+        "credential_bound": True,
+        "account_fingerprint": "a" * 64,
+    })
+    assert ev.credential_bound is True

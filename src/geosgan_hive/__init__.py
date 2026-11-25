@@ -27,6 +27,7 @@ from .checkpoints import (
     RunCheckpoint,
 )
 from .cloud_profiles import (
+    AdapterCapabilities,
     BillingModel,
     CloudProfile,
     CloudProfileRegistry,
@@ -35,6 +36,8 @@ from .cloud_profiles import (
     QuotaPeriod,
     QuotaSpec,
     TokenEstimate,
+    TokenEstimationMode,
+    VerificationEvidence,
     bounded_token_estimate,
 )
 from .collaboration import (
@@ -123,7 +126,10 @@ from .usage import UsageRecord, UsageSummary, UsageTracker
 __version__ = "0.5.0"
 
 __all__ = [
+    "AdapterCapabilities",
     "BillingModel",
+    "TokenEstimationMode",
+    "VerificationEvidence",
     "CloudConfigError",
     "CloudOfflineError",
     "CloudProfile",
