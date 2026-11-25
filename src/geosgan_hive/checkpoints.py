@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from .errors import CheckpointError
+from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -60,6 +62,40 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 """
 
+#: Phase 4 C3: durable, cross-process quota reservations + usage pools.
+#: - quota_reservations: one row per unique dispatch_id (idempotent reconciliation).
+#:   items_json holds the normalized [{"kind","period","amount"}] batch.
+#: - quota_usage: consumed usage per (pool, kind, period, window_start); historical
+#:   windows are retained forever, so config changes never reset consumed quotas.
+#:   Usage is only ever INCREMENTED at reservation time; there is deliberately no
+#:   refund path (a crash after reservation conservatively retains the usage).
+_QUOTA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS quota_reservations (
+    dispatch_id TEXT PRIMARY KEY,
+    pool TEXT NOT NULL,
+    anchor_iso TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    run_id TEXT,
+    lease_owner TEXT,
+    lease_generation INTEGER,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quota_usage (
+    pool TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    period TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (pool, kind, period, window_start)
+);
+"""
+
+_QUOTA_KINDS = ("requests", "tokens")
+_QUOTA_PERIODS = ("day", "week", "month")
+#: bounded retries on SQLite write-lock contention (busy_timeout also applies)
+_QUOTA_TX_ATTEMPTS = 3
+
 
 class ExecutionState(StrEnum):
     RUNNING = "running"
@@ -84,6 +120,14 @@ class PersistMode(StrEnum):
 
     METADATA_ONLY = "metadata_only"
     RESUMABLE = "resumable"
+
+
+class ReservationStatus(StrEnum):
+    """Phase 4 C3 quota-reservation lifecycle. reserved -> dispatched is the only
+    transition; there is no refund/cancel path that decrements quota_usage."""
+
+    RESERVED = "reserved"
+    DISPATCHED = "dispatched"
 
 
 @dataclass
@@ -150,6 +194,111 @@ CREATE TABLE IF NOT EXISTS runs (
 """
 
 
+def _add_months(dt: datetime, months: int) -> datetime:
+    total = dt.month - 1 + months
+    year = dt.year + total // 12
+    month = total % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def quota_window_for(anchor_iso: str, period: str, at_iso: str) -> str:
+    """Start of the quota window of `period` that contains `at`, anchored at the
+    explicitly configured `anchor_iso`. Day = +1d steps, week = +7d steps,
+    month = calendar-month arithmetic (day clamped). Unknown reset semantics fail
+    closed: unparseable/naive timestamps, unknown periods and a FUTURE anchor
+    (at < anchor) all raise CheckpointError — reset times are never invented."""
+    try:
+        anchor = datetime.fromisoformat(anchor_iso)
+        at = datetime.fromisoformat(at_iso)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError(f"unparseable ISO-8601 timestamp: {exc}") from exc
+    if anchor.tzinfo is None or at.tzinfo is None:
+        raise CheckpointError(
+            "quota window timestamps must be timezone-aware (naive rejected)"
+        )
+    anchor = anchor.astimezone(UTC)
+    at = at.astimezone(UTC)
+    if at < anchor:
+        raise CheckpointError(
+            "quota window anchor is after 'at' — unknown reset semantics fail "
+            "closed (reset times are never invented)"
+        )
+    if period == "day":
+        k = int((at - anchor).total_seconds() // 86400)
+        window = anchor + timedelta(days=k)
+    elif period == "week":
+        k = int((at - anchor).total_seconds() // (7 * 86400))
+        window = anchor + timedelta(days=7 * k)
+    elif period == "month":
+        k = (at.year - anchor.year) * 12 + (at.month - anchor.month)
+        window = _add_months(anchor, k)
+        if window > at:
+            window = _add_months(anchor, k - 1)
+    else:
+        raise CheckpointError(f"unknown quota period {period!r} — fail closed")
+    return window.isoformat(timespec="milliseconds")
+
+
+def _normalize_quota_items(items: Any) -> list[dict[str, Any]]:
+    """Strict validation + dedupe of a quota batch by (kind, period). Integer
+    accounting only: bools/floats/strings/None and negative amounts are rejected
+    (nonfinite values are non-int and therefore rejected too)."""
+    if not isinstance(items, (list, tuple)) or not items:
+        raise CheckpointError("at least one quota item is required")
+    out: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], int] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            raise CheckpointError("quota items must be dicts")
+        kind, period, amount = it.get("kind"), it.get("period"), it.get("amount")
+        if kind not in _QUOTA_KINDS:
+            raise CheckpointError(f"unknown quota kind {kind!r} — fail closed")
+        if period not in _QUOTA_PERIODS:
+            raise CheckpointError(f"unknown quota period {period!r} — fail closed")
+        if type(amount) is not int:  # bool/float/str/None rejected
+            raise CheckpointError(
+                f"quota amount must be a strict int, got {type(amount).__name__}"
+            )
+        if amount < 0:
+            raise CheckpointError("negative quota amount rejected")
+        key = (kind, period)
+        if key in seen:
+            if seen[key] != amount:
+                raise CheckpointError(f"conflicting duplicate quota items for {key}")
+            continue
+        seen[key] = amount
+        out.append({"kind": kind, "period": period, "amount": amount})
+    return out
+
+
+def _normalize_quota_limits(limits: Any, items: list[dict[str, Any]]) -> dict[tuple[str, str], int]:
+    """Every item must have an explicit strict-int limit (>= 1); missing limits
+    fail closed."""
+    if not isinstance(limits, dict):
+        raise CheckpointError("limits must be a mapping of (kind, period) -> int")
+    norm: dict[tuple[str, str], int] = {}
+    for it in items:
+        key = (it["kind"], it["period"])
+        if key not in limits:
+            raise CheckpointError(f"no limit provided for {key} — fail closed")
+        v = limits[key]
+        if type(v) is not int:
+            raise CheckpointError(
+                f"quota limit must be a strict int, got {type(v).__name__}"
+            )
+        if v < 1:
+            raise CheckpointError("quota limit must be >= 1")
+        norm[key] = v
+    return norm
+
+
+def _quota_items_equal(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
+    def key(items: list[dict[str, Any]]) -> list:
+        return sorted((i["kind"], i["period"], i["amount"]) for i in items)
+    return key(a) == key(b)
+
+
 class CheckpointStore:
     """Durable run checkpoints in SQLite (Python standard library only).
 
@@ -189,8 +338,11 @@ class CheckpointStore:
         with self._lock, self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            # cross-process write contention: wait instead of failing immediately
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._conn.executescript(_LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
+            self._conn.executescript(_QUOTA_SCHEMA)    # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -212,6 +364,8 @@ class CheckpointStore:
                         self._migrate_3_to_4()
                     elif v == 4:
                         self._migrate_4_to_5()
+                    elif v == 5:
+                        self._migrate_5_to_6()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -242,6 +396,15 @@ class CheckpointStore:
     def _migrate_4_to_5(self) -> None:
         """v4 -> v5: durable tool-execution ledger + approval records (Phase 3 T4)."""
         self._conn.executescript(_LEDGER_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_5_to_6(self) -> None:
+        """v5 -> v6 (Phase 4 C3): durable quota reservations + usage pools.
+        Additive only (new tables); all v5 runs/ledger/approvals data is preserved
+        untouched, and historical quota windows are never reset by later config."""
+        self._conn.executescript(_QUOTA_SCHEMA)
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -1030,6 +1193,200 @@ class CheckpointStore:
                 ),
             )
             return cur.rowcount
+
+    # ---- Phase 4 C3: durable quota reservations (shared across runs/processes) ----
+
+    def reserve_quota_batch(
+        self,
+        dispatch_id: str,
+        *,
+        pool: str,
+        items: list[dict[str, Any]],
+        anchor_iso: str,
+        limits: dict[tuple[str, str], int],
+        now_iso: str | None = None,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Atomically reserve a batch of quota items for ONE unique dispatch_id,
+        BEFORE dispatch. Everything happens in ONE BEGIN IMMEDIATE transaction, so
+        concurrent processes/connections serialize the check-then-write and can
+        never over-reserve:
+
+        - items/limits are strictly validated (strict ints, no negatives, deduped
+          by (kind, period); conflicting duplicates rejected);
+        - a duplicate dispatch_id is IDEMPOTENT (True) only when pool, anchor,
+          items, run and lease binding are identical — otherwise CheckpointError;
+        - when run_id + lease_owner are given, the existing lease fencing
+          (_verify_lease_locked: RUNNING + unexpired lease + owner + generation)
+          must pass, else False (stale workers cannot reserve);
+        - EVERY item is checked (used + amount <= limit) BEFORE any write; any
+          exhaustion raises QuotaExhaustedError and the whole transaction rolls
+          back (all-or-nothing, no partial accounting);
+        - on success the reservation row (status=reserved) and the usage increments
+          commit together. Usage is never decremented: there is no refund path, so
+          a crash after reservation conservatively retains the consumed quota.
+
+        SQLite write-lock contention (OperationalError busy/locked) is retried a
+        bounded number of times on top of busy_timeout; persistent failure raises
+        CheckpointError."""
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            raise CheckpointError("dispatch_id must be a non-empty unique string")
+        if not isinstance(pool, str) or not pool:
+            raise CheckpointError("pool must be a non-empty string")
+        norm_items = _normalize_quota_items(items)
+        norm_limits = _normalize_quota_limits(limits, norm_items)
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._reserve_quota_batch_tx(
+                    dispatch_id, pool=pool, items=norm_items, anchor_iso=anchor_iso,
+                    limits=norm_limits, now_iso=now_iso, run_id=run_id,
+                    lease_owner=lease_owner, lease_generation=lease_generation,
+                )
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"quota reservation transaction failed (SQLite contention): {exc}"
+                ) from exc
+        raise CheckpointError("quota reservation failed after bounded retries")
+
+    def _reserve_quota_batch_tx(
+        self, dispatch_id: str, *, pool: str, items: list[dict[str, Any]],
+        anchor_iso: str, limits: dict[tuple[str, str], int], now_iso: str | None,
+        run_id: str | None, lease_owner: str | None, lease_generation: int | None,
+    ) -> bool:
+        now = now_iso or self.now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")  # serialize check+write across processes
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM quota_reservations WHERE dispatch_id=?", (dispatch_id,)
+                ).fetchone()
+                if row is not None:
+                    same = (
+                        row["pool"] == pool
+                        and row["anchor_iso"] == anchor_iso
+                        and _quota_items_equal(json.loads(row["items_json"]), items)
+                        and row["run_id"] == run_id
+                        and row["lease_owner"] == lease_owner
+                        and (row["lease_generation"] is None) == (lease_generation is None)
+                        and (lease_generation is None
+                             or int(row["lease_generation"]) == int(lease_generation))
+                    )
+                    if same:
+                        self._conn.commit()
+                        return True  # idempotent reconciliation of the same dispatch
+                    raise CheckpointError(
+                        f"conflicting duplicate reservation for dispatch_id "
+                        f"{dispatch_id!r} — rejecting instead of double-counting"
+                    )
+                if (run_id is not None and lease_owner is not None
+                        and not self._verify_lease_locked(run_id, lease_owner,
+                                                          lease_generation)):
+                    self._conn.rollback()
+                    return False  # stale worker / lost lease: no reservation
+                checks: list[tuple[dict[str, Any], str]] = []
+                for it in items:
+                    window = quota_window_for(anchor_iso, it["period"], now)
+                    limit = limits[(it["kind"], it["period"])]
+                    urow = self._conn.execute(
+                        "SELECT used FROM quota_usage WHERE pool=? AND kind=? "
+                        "AND period=? AND window_start=?",
+                        (pool, it["kind"], it["period"], window),
+                    ).fetchone()
+                    used = int(urow["used"]) if urow is not None else 0
+                    if used + it["amount"] > limit:
+                        raise QuotaExhaustedError(
+                            f"quota exhausted for pool {pool!r} "
+                            f"{it['kind']}/{it['period']} window {window}: "
+                            f"used {used} + {it['amount']} > limit {limit}"
+                        )
+                    checks.append((it, window))
+                self._conn.execute(
+                    "INSERT INTO quota_reservations (dispatch_id, pool, anchor_iso, "
+                    "items_json, run_id, lease_owner, lease_generation, status, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        dispatch_id, pool, anchor_iso, json.dumps(items), run_id,
+                        lease_owner, lease_generation, ReservationStatus.RESERVED.value,
+                        now,
+                    ),
+                )
+                for it, window in checks:
+                    self._conn.execute(
+                        "INSERT INTO quota_usage (pool, kind, period, window_start, used) "
+                        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(pool, kind, period, "
+                        "window_start) DO UPDATE SET used = used + excluded.used",
+                        (pool, it["kind"], it["period"], window, it["amount"]),
+                    )
+                self._conn.commit()
+                return True
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def get_reservation(self, dispatch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM quota_reservations WHERE dispatch_id=?", (dispatch_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        d = {k: row[k] for k in row.keys()}
+        d["items"] = json.loads(d.pop("items_json"))
+        return d
+
+    def mark_dispatched(
+        self,
+        dispatch_id: str,
+        *,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Transition a reservation reserved -> dispatched (the physical request is
+        about to be sent / was sent). Idempotent for the same binding; fenced by the
+        reservation's lease owner+generation AND (when given) the run lease, so a
+        stale worker cannot mark another worker's dispatch. Never touches usage."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM quota_reservations WHERE dispatch_id=?", (dispatch_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if lease_owner is not None:
+                if row["lease_owner"] != lease_owner:
+                    return False
+                if (lease_generation is not None
+                        and int(row["lease_generation"] or -1) != int(lease_generation)):
+                    return False
+                if run_id is not None:
+                    if row["run_id"] != run_id:
+                        return False
+                    if not self._verify_lease_locked(run_id, lease_owner, lease_generation):
+                        return False
+            if row["status"] == ReservationStatus.DISPATCHED.value:
+                return True  # idempotent
+            cur = self._conn.execute(
+                "UPDATE quota_reservations SET status=? WHERE dispatch_id=? AND status=?",
+                (ReservationStatus.DISPATCHED.value, dispatch_id,
+                 ReservationStatus.RESERVED.value),
+            )
+            return cur.rowcount == 1
+
+    def quota_status(self, pool: str) -> list[dict[str, Any]]:
+        """All usage rows of a pool (every historical window retained, never reset)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT pool, kind, period, window_start, used FROM quota_usage "
+                "WHERE pool=? ORDER BY window_start, kind, period",
+                (pool,),
+            ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
 
     def close(self) -> None:
         with self._lock:

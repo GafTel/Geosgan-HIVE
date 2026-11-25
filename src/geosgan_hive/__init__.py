@@ -100,6 +100,10 @@ from .providers import (
     parse_model,
     resolve_credentials,
 )
+from .quota_engine import (
+    QuotaEngine,
+    QuotaReservation,
+)
 from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
 from .run_context import (
@@ -137,7 +141,9 @@ __all__ = [
     "CloudProviderAdapter",
     "CostUnknownError",
     "FakeCloudAdapter",
+    "QuotaEngine",
     "QuotaPeriod",
+    "QuotaReservation",
     "QuotaSpec",
     "TokenEstimate",
     "bounded_token_estimate",

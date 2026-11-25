@@ -530,9 +530,9 @@ def test_mutating_timeout_marks_ledger_unknown(tmp_path):
     store.close()
 
 
-# ---- schema migration v4 -> v5 ----
+# ---- schema migration v4 -> v5 -> v6 ----
 
-def test_schema_v4_migrates_to_v5_with_ledger_tables(tmp_path):
+def test_schema_v4_migrates_to_v6_with_ledger_and_quota_tables(tmp_path):
     db = str(tmp_path / "m.db")
     store = CheckpointStore(db, persist_mode=PersistMode.RESUMABLE, lease_ttl_seconds=60.0)
     store.close()
@@ -550,7 +550,8 @@ def test_schema_v4_migrates_to_v5_with_ledger_tables(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         v = store2._conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert v == "5" and {"tool_executions", "approvals"} <= tables
+    assert v == "6" and {"tool_executions", "approvals", "quota_reservations",
+                         "quota_usage"} <= tables
     store2.close()
 
 
