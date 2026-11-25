@@ -26,6 +26,17 @@ from .checkpoints import (
     PersistMode,
     RunCheckpoint,
 )
+from .cloud_profiles import (
+    BillingModel,
+    CloudProfile,
+    CloudProfileRegistry,
+    CloudProviderAdapter,
+    FakeCloudAdapter,
+    QuotaPeriod,
+    QuotaSpec,
+    TokenEstimate,
+    bounded_token_estimate,
+)
 from .collaboration import (
     CollaborationEngine,
     DelegationProposal,
@@ -40,8 +51,11 @@ from .errors import (
     BudgetExceededError,
     CapabilityMismatchError,
     CheckpointError,
+    CloudConfigError,
+    CloudOfflineError,
     ConfigError,
     ContextWindowExceededError,
+    CostUnknownError,
     DelegationError,
     DelegationRejectedError,
     ErrorClass,
@@ -109,6 +123,18 @@ from .usage import UsageRecord, UsageSummary, UsageTracker
 __version__ = "0.5.0"
 
 __all__ = [
+    "BillingModel",
+    "CloudConfigError",
+    "CloudOfflineError",
+    "CloudProfile",
+    "CloudProfileRegistry",
+    "CloudProviderAdapter",
+    "CostUnknownError",
+    "FakeCloudAdapter",
+    "QuotaPeriod",
+    "QuotaSpec",
+    "TokenEstimate",
+    "bounded_token_estimate",
     "Agent",
     "AgentResult",
     "AgentSpec",

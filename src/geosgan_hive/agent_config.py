@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .checkpoints import PersistMode
+from .cloud_profiles import CloudProfile
 from .errors import ConfigError, HiveError
 from .fallback import FallbackMode, FallbackPolicy
 from .providers import parse_model
@@ -140,6 +141,32 @@ class ToolsConfig(BaseModel):
         return [e.lower() for e in value]
 
 
+class CloudConfig(BaseModel):
+    """Phase 4 cloud profile configuration (optional; absent = legacy behavior).
+
+    zero_cost=true is FAIL-CLOSED: only models with a free_tier_verified profile
+    and current operator attestation may receive live dispatches, and
+    max_spend_usd must be strictly 0. Profiles never contain credentials
+    (extra='forbid') or raw account ids (label + sha256 fingerprint only).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    zero_cost: bool = False
+    max_spend_usd: float | None = Field(default=None, ge=0)  # None = no cap
+    profiles: list[CloudProfile] = Field(default_factory=list)
+    allowed_providers: list[str] | None = None  # None = all registered providers
+
+    @model_validator(mode="after")
+    def _zero_cost_spend_rule(self) -> CloudConfig:
+        if self.zero_cost and self.max_spend_usd not in (None, 0.0):
+            raise ValueError(
+                "zero-cost mode requires max_spend_usd to be strictly 0 "
+                "(no paid spending allowed)"
+            )
+        return self
+
+
 class HiveConfig(BaseModel):
     """Whole team configuration: one supervisor plus the specialist agents."""
 
@@ -149,6 +176,7 @@ class HiveConfig(BaseModel):
     fallback: FallbackPolicy = Field(default_factory=FallbackPolicy)  # global default: OFF
     checkpoint: CheckpointConfig | None = None  # required for WAIT/HYBRID modes
     tools: ToolsConfig | None = None  # None = legacy built-in tools only; block = explicit
+    cloud: CloudConfig | None = None  # Phase 4: None = legacy cost_tier semantics
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:
@@ -259,6 +287,17 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
                 tools.setdefault("budgets", {})["max_tool_calls_per_run"] = environ[
                     "HIVE_TOOLS_BUDGETS_MAX_TOOL_CALLS_PER_RUN"
                 ]
+    # Phase 4: HIVE_CLOUD_* overrides create an explicit cloud block (absent vars
+    # leave the block absent -> legacy behavior preserved)
+    if any(k.startswith("HIVE_CLOUD_") for k in environ):
+        cloud = data.setdefault("cloud", {})
+        if isinstance(cloud, dict):
+            if "HIVE_CLOUD_ZERO_COST" in environ:
+                cloud["zero_cost"] = environ["HIVE_CLOUD_ZERO_COST"].lower() in (
+                    "1", "true", "yes", "on"
+                )
+            if "HIVE_CLOUD_MAX_SPEND_USD" in environ:
+                cloud["max_spend_usd"] = environ["HIVE_CLOUD_MAX_SPEND_USD"]
     for prefix, fields, section in sections:
         for key in fields:
             env_var = f"{prefix}_{key.upper()}"
