@@ -159,10 +159,11 @@ class CloudConfig(BaseModel):
 
     @model_validator(mode="after")
     def _zero_cost_spend_rule(self) -> CloudConfig:
-        if self.zero_cost and self.max_spend_usd not in (None, 0.0):
+        if self.zero_cost and self.max_spend_usd != 0.0:
+            # None means "unlimited" — never allowed in zero-cost mode
             raise ValueError(
-                "zero-cost mode requires max_spend_usd to be strictly 0 "
-                "(no paid spending allowed)"
+                "zero-cost mode requires max_spend_usd to be exactly 0.0 "
+                "(None/unlimited is not allowed; no paid spending)"
             )
         return self
 
@@ -293,9 +294,17 @@ def apply_env_overrides(data: dict[str, Any], environ: Mapping[str, str]) -> dic
         cloud = data.setdefault("cloud", {})
         if isinstance(cloud, dict):
             if "HIVE_CLOUD_ZERO_COST" in environ:
-                cloud["zero_cost"] = environ["HIVE_CLOUD_ZERO_COST"].lower() in (
-                    "1", "true", "yes", "on"
-                )
+                raw = environ["HIVE_CLOUD_ZERO_COST"].strip().lower()
+                if raw in ("1", "true", "yes", "on"):
+                    cloud["zero_cost"] = True
+                elif raw in ("0", "false", "no", "off"):
+                    cloud["zero_cost"] = False
+                else:
+                    raise ConfigError(
+                        f"HIVE_CLOUD_ZERO_COST={environ['HIVE_CLOUD_ZERO_COST']!r} is not a "
+                        "valid boolean; valid: 1/true/yes/on, 0/false/no/off — refusing "
+                        "to silently disable zero-cost protection"
+                    )
             if "HIVE_CLOUD_MAX_SPEND_USD" in environ:
                 cloud["max_spend_usd"] = environ["HIVE_CLOUD_MAX_SPEND_USD"]
     for prefix, fields, section in sections:

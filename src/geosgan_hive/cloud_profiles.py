@@ -1,25 +1,30 @@
-"""Phase 4 C2: cloud provider profiles, billing eligibility, offline adapters.
+"""Phase 4 C2 (hardened): cloud provider profiles, billing eligibility, offline adapters.
 
-Design rules (approved):
+Design rules (approved + C2 audit):
 - `providers.cost_tier()` keeps its legacy semantics OUTSIDE zero-cost mode; this
   module adds ACCOUNT-SCOPED cloud eligibility on top, never replacing it.
 - In zero-cost mode, live dispatch requires a profile with
-  billing=free_tier_verified AND current operator attestation
-  (verified_free + overage_billing_disabled + verified_at within TTL).
+  billing=free_tier_verified AND independent billing verification
+  (billing_verified=True) AND current operator attestation
+  (verified_free + overage_billing_disabled + verified_at within
+  [verified_at, verified_at+ttl], never in the future, never naive).
   Operator attestation alone is NOT a billing guarantee: unknown billing or
-  unknown overage conditions block live dispatch (fail closed).
-- Profiles never contain credentials or raw account identifiers: extra fields are
-  forbidden; the account is referenced only by an opaque label + sha256
-  fingerprint, and quota pools are identified as '<provider>:acct:<fingerprint>'
-  so one account pool is SHARED across all models of that account.
-- Fake adapters are strictly offline: allow_network=False and any dispatch
-  attempt raises; no socket is ever touched.
+  missing independent verification blocks live dispatch (fail closed).
+- Profiles are immutable and never contain credentials or raw account
+  identifiers: extra fields are forbidden; the account is referenced only by an
+  opaque label + sha256 fingerprint, and quota pools are BOUND to the actual
+  fingerprint: '<provider>:acct:<fingerprint>', shared across all models of
+  that account. Duplicate models, conflicting profiles and conflicting shared
+  pool definitions are rejected — no silent overwrites.
+- Fake adapters are strictly offline and test-only: their char/4 estimates must
+  never be used for live quota enforcement (bounded_token_estimate(live=True)
+  refuses test-only adapters).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -47,31 +52,59 @@ class QuotaPeriod(StrEnum):
 class QuotaSpec(BaseModel):
     """One quota limit attached to a SHARED pool identifier. All models of the
     same account/profile share the pool, so provider/account quotas are tracked
-    across models, not only per run."""
+    across models, not only per run. A quota without any limit is rejected."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     pool: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
     max_requests: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
     period: QuotaPeriod = QuotaPeriod.DAY
 
+    @model_validator(mode="after")
+    def _has_limit(self) -> QuotaSpec:
+        if self.max_requests is None and self.max_tokens is None:
+            raise ValueError(
+                "quota without any limit is meaningless — set max_requests "
+                "and/or max_tokens"
+            )
+        return self
+
+    def key(self) -> tuple[str, str]:
+        """Conflict key: same pool AND same period (multiple periods/limit kinds on
+        one pool are allowed)."""
+        return (self.pool, self.period.value)
+
+    def conflicts(self, other: QuotaSpec) -> bool:
+        """True if both specs constrain the SAME limit kind on the same pool+period
+        with different values (e.g. two different max_requests for one day)."""
+        if self.key() != other.key():
+            return False
+        if (self.max_requests is not None and other.max_requests is not None
+                and self.max_requests != other.max_requests):
+            return True
+        if (self.max_tokens is not None and other.max_tokens is not None
+                and self.max_tokens != other.max_tokens):
+            return True
+        return False
+
 
 class CloudProfile(BaseModel):
-    """Operator-verified profile for one provider account and its models.
+    """Operator-verified profile for one provider account and its models (immutable).
 
-    `billing=free_tier_verified` requires the full attestation set; the
-    attestation is a config claim by the operator, NOT a billing guarantee —
-    anything not explicitly verified stays UNKNOWN and blocks live dispatch in
-    zero-cost mode."""
+    `billing=free_tier_verified` requires the full attestation set AND independent
+    billing verification (billing_verified). Attestation is an operator claim,
+    not a billing guarantee — anything not verified stays UNKNOWN and blocks
+    live dispatch in zero-cost mode."""
 
-    model_config = ConfigDict(extra="forbid")  # rejects api_key/secret-like fields
+    model_config = ConfigDict(extra="forbid", frozen=True)  # rejects api_key-like fields
 
     provider: str
     models: list[str] = Field(min_length=1)
     billing: BillingModel = BillingModel.UNKNOWN
-    verified_free: bool = False
-    overage_billing_disabled: bool = False
+    verified_free: bool = False            # operator attestation: free tier exists
+    overage_billing_disabled: bool = False  # operator attestation: no overage billing
+    billing_verified: bool = False         # INDEPENDENT billing verification (not attestation)
     verified_at: datetime | None = None
     verification_ttl_days: int = Field(default=30, ge=1, le=3650)
     account_label: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -105,37 +138,66 @@ class CloudProfile(BaseModel):
 
     @field_validator("verified_at")
     @classmethod
-    def _tz_aware(cls, v: datetime | None) -> datetime | None:
+    def _aware(cls, v: datetime | None) -> datetime | None:
         if v is not None and v.tzinfo is None:
-            return v.replace(tzinfo=UTC)
+            raise ValueError(
+                "verified_at must carry a timezone offset (ambiguous naive "
+                "timestamps are rejected)"
+            )
         return v
 
     @model_validator(mode="after")
-    def _attestation_and_pools(self) -> CloudProfile:
-        if self.billing == BillingModel.FREE_TIER_VERIFIED and not (
-            self.verified_free
-            and self.overage_billing_disabled
-            and self.verified_at is not None
-        ):
-            raise ValueError(
-                "billing=free_tier_verified requires verified_free=True, "
-                "overage_billing_disabled=True and verified_at set (operator "
-                "attestation — a claim, not a billing guarantee)"
-            )
-        prefix = f"{self.provider}:"
-        for q in self.quotas:
-            if not q.pool.startswith(prefix):
+    def _hardened_rules(self) -> CloudProfile:
+        if self.billing == BillingModel.FREE_TIER_VERIFIED:
+            if not (
+                self.verified_free
+                and self.overage_billing_disabled
+                and self.verified_at is not None
+            ):
                 raise ValueError(
-                    f"quota pool {q.pool!r} must start with {prefix!r} "
-                    "(account-scoped pool identifier)"
+                    "billing=free_tier_verified requires verified_free=True, "
+                    "overage_billing_disabled=True and verified_at (tz-aware); "
+                    "billing_verified (independent verification) is additionally "
+                    "required for live dispatch eligibility — attestation alone is "
+                    "not a billing guarantee"
                 )
+            if self.account_fingerprint is None:
+                raise ValueError(
+                    "free_tier_verified requires account_fingerprint (sha256 of the "
+                    "account id; the raw id is never stored)"
+                )
+            if not self.quotas:
+                raise ValueError(
+                    "free_tier_verified requires at least one bounded quota spec"
+                )
+            expected_pool = f"{self.provider}:acct:{self.account_fingerprint}"
+            for q in self.quotas:
+                if q.pool != expected_pool:
+                    raise ValueError(
+                        f"quota pool {q.pool!r} must be bound to the actual account "
+                        f"fingerprint: expected {expected_pool!r}"
+                    )
+            for i, a in enumerate(self.quotas):
+                for b in self.quotas[i + 1:]:
+                    if a.conflicts(b):
+                        raise ValueError(
+                            f"conflicting definitions for shared pool {a.pool!r} "
+                            f"period {a.period.value} in one profile"
+                        )
         return self
 
     def verification_current(self, now: datetime) -> bool:
+        """True iff verified_at <= now <= verified_at + ttl. Future or naive
+        timestamps are never 'current'."""
+        if now.tzinfo is None:
+            raise CloudConfigError(
+                "verification_current() requires a timezone-aware 'now' "
+                "(ambiguous naive timestamps are rejected)"
+            )
         if self.verified_at is None:
             return False
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=UTC)
+        if self.verified_at > now:
+            return False  # future verification timestamp
         return now <= self.verified_at + timedelta(days=self.verification_ttl_days)
 
     def pool_ids(self) -> list[str]:
@@ -143,7 +205,9 @@ class CloudProfile(BaseModel):
 
 
 class CloudProfileRegistry:
-    """Resolved view of the cloud profiles: eligibility + shared quota pools."""
+    """Resolved, validated, IMMUTABLE view of the cloud profiles: eligibility +
+    shared quota pools. All invariants are enforced in __init__, so direct
+    construction cannot bypass them; attributes are read-only afterwards."""
 
     def __init__(
         self,
@@ -153,6 +217,7 @@ class CloudProfileRegistry:
         allowed_providers: list[str] | None = None,
         max_spend_usd: float | None = None,
     ) -> None:
+        object.__setattr__(self, "_frozen", False)
         if allowed_providers is not None:
             for p in allowed_providers:
                 try:
@@ -166,12 +231,55 @@ class CloudProfileRegistry:
                         f"profile provider {prof.provider!r} is not in "
                         f"allowed_providers {sorted(allowed)} — unauthorized provider"
                     )
-        self.zero_cost = bool(zero_cost)
-        self.max_spend_usd = max_spend_usd
-        self.profiles = list(profiles)
-        self._by_model: dict[str, CloudProfile] = {
-            m: p for p in self.profiles for m in p.models
-        }
+        profiles = [
+            p if isinstance(p, CloudProfile) else CloudProfile.model_validate(p)
+            for p in profiles
+        ]
+        # duplicate model registrations: no silent overwrites
+        by_model: dict[str, CloudProfile] = {}
+        for p in profiles:
+            for m in p.models:
+                if m in by_model:
+                    raise CloudConfigError(
+                        f"duplicate model registration {m!r} in profiles "
+                        f"{by_model[m].account_label!r} and {p.account_label!r}"
+                    )
+                by_model[m] = p
+        # conflicting profiles for the same provider account
+        seen_accounts: dict[tuple[str, str], CloudProfile] = {}
+        for p in profiles:
+            key = (p.provider, p.account_label)
+            if key in seen_accounts:
+                other = seen_accounts[key]
+                if (other.account_fingerprint != p.account_fingerprint
+                        or other.billing != p.billing):
+                    raise CloudConfigError(
+                        f"conflicting profiles for {key}: different fingerprint or billing"
+                    )
+            else:
+                seen_accounts[key] = p
+        # conflicting shared pool definitions across profiles (same pool+period+
+        # same limit kind with different values); multiple periods are allowed
+        all_quotas = [q for p in profiles for q in p.quotas]
+        for i, a in enumerate(all_quotas):
+            for b in all_quotas[i + 1:]:
+                if a.conflicts(b):
+                    raise CloudConfigError(
+                        f"conflicting quota definition for shared pool {a.pool!r} "
+                        f"period {a.period.value}"
+                    )
+        object.__setattr__(self, "zero_cost", bool(zero_cost))
+        object.__setattr__(self, "max_spend_usd", max_spend_usd)
+        object.__setattr__(self, "profiles", tuple(profiles))
+        object.__setattr__(self, "_by_model", by_model)
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"CloudProfileRegistry is immutable after construction ({name!r})"
+            )
+        object.__setattr__(self, name, value)
 
     @classmethod
     def from_config(cls, cloud: CloudConfig | None) -> CloudProfileRegistry:
@@ -187,8 +295,13 @@ class CloudProfileRegistry:
     def profile_for(self, model: str) -> CloudProfile | None:
         return self._by_model.get(model)
 
+    def quotas_for(self, model: str) -> list[QuotaSpec]:
+        """ALL quota constraints applicable to the model (multiple periods/limits)."""
+        p = self._by_model.get(model)
+        return list(p.quotas) if p is not None else []
+
     def quota_pool(self, model: str) -> str | None:
-        """Shared quota pool id for the model's account (None = no quota configured)."""
+        """Shared quota pool id for the model's account (first pool; None if none)."""
         p = self._by_model.get(model)
         return p.pool_ids()[0] if p is not None and p.quotas else None
 
@@ -198,8 +311,9 @@ class CloudProfileRegistry:
         Outside zero-cost mode: legacy semantics are preserved (any known provider
         prefix is allowed; cost_tier()/usage tracking behave as before).
         In zero-cost mode: fail closed — the model must have an enabled profile
-        with billing=free_tier_verified and a CURRENT attestation; unknown billing
-        or expired verification blocks the dispatch before any request is sent."""
+        with billing=free_tier_verified, independent billing verification, a
+        CURRENT attestation and bounded quotas; unknown billing, paid, disabled,
+        unverified or expired profiles block the dispatch before any request."""
         if not self.zero_cost:
             try:
                 parse_model(model)
@@ -219,13 +333,20 @@ class CloudProfileRegistry:
                 f"billing={p.billing.value} for {model!r} — only free_tier_verified "
                 "is allowed in zero-cost mode"
             )
+        if not p.billing_verified:
+            return False, (
+                f"billing for {model!r} is operator-attested but NOT independently "
+                "verified — attestation is not a billing guarantee; live dispatch "
+                "stays disabled"
+            )
         if not p.verification_current(now):
+            if p.verified_at is not None and p.verified_at > now:
+                return False, f"verification timestamp for {model!r} is in the future"
             return False, (
                 f"operator verification for {model!r} expired "
-                f"(ttl {p.verification_ttl_days}d from {p.verified_at}); attestation "
-                "alone is not a billing guarantee — re-verify"
+                f"(ttl {p.verification_ttl_days}d from {p.verified_at}); re-verify"
             )
-        return True, "free_tier_verified, attestation current, quota pool checked at dispatch"
+        return True, "free_tier_verified + independently verified + attestation current"
 
 
 @dataclass(frozen=True)
@@ -238,10 +359,11 @@ class TokenEstimate:
 
 class CloudProviderAdapter(Protocol):
     """Contract for provider adapters (live or fake). Live adapters must never be
-    reachable from the fake path; fakes are strictly offline."""
+    reachable from the fake path; fakes are strictly offline and test-only."""
 
     name: str
     allow_network: bool
+    is_test_only: bool
 
     def estimate_cost(self, model: str, *, prompt_tokens: int,
                       max_output_tokens: int) -> float | None: ...
@@ -252,10 +374,12 @@ class CloudProviderAdapter(Protocol):
 
 
 class FakeCloudAdapter:
-    """Strictly offline fake provider for tests/demos: no network ever."""
+    """Strictly offline, test-only fake provider: no network ever; its char/4
+    token heuristic must never be used for live quota enforcement."""
 
     name = "fake"
     allow_network = False
+    is_test_only = True
 
     def estimate_cost(self, model: str, *, prompt_tokens: int,
                       max_output_tokens: int) -> float | None:
@@ -279,22 +403,50 @@ class FakeCloudAdapter:
         )
 
 
+def _strict_int(value: Any, name: str) -> int:
+    if type(value) is not int:  # bool is not accepted as an int here
+        raise CostUnknownError(f"{name} must be a strict int, got {type(value).__name__}")
+    return value
+
+
 def bounded_token_estimate(
-    adapter: CloudProviderAdapter, model: str, *, prompt_chars: int, max_output_tokens: int
+    adapter: CloudProviderAdapter, model: str, *, prompt_chars: int,
+    max_output_tokens: int, live: bool = False,
 ) -> TokenEstimate:
     """Reserve a BOUNDED token estimate before dispatch, including max output
-    tokens. Unknown or unbounded usage fails closed (CostUnknownError)."""
-    if max_output_tokens < 1:
+    tokens. Strict validation: integer types only (no bools), nonnegative prompt
+    count, positive output bound, and no under-reservation relative to the
+    requested output cap. Unknown/unbounded usage fails closed (CostUnknownError).
+    Test-only (fake) adapters are refused for live enforcement."""
+    if live and getattr(adapter, "is_test_only", False):
+        raise CostUnknownError(
+            f"adapter {adapter.name!r} is test-only; its heuristic estimates must "
+            "never be used for live quota enforcement"
+        )
+    pc = _strict_int(prompt_chars, "prompt_chars")
+    mo = _strict_int(max_output_tokens, "max_output_tokens")
+    if pc < 0:
+        raise CostUnknownError("prompt_chars must be nonnegative")
+    if mo < 1:
         raise CostUnknownError(
             f"unbounded max_output_tokens for {model!r} — refusing to dispatch "
             "without a bounded estimate (fail closed)"
         )
     est = adapter.estimate_tokens(
-        model=model, prompt_chars=prompt_chars, max_output_tokens=max_output_tokens
+        model=model, prompt_chars=pc, max_output_tokens=mo
     )
     if est is None:
         raise CostUnknownError(
             f"no bounded token estimate for {model!r} — unknown/unbounded usage "
             "fails closed"
         )
-    return est
+    pt, eo = _strict_int(est.prompt_tokens, "estimate.prompt_tokens"), _strict_int(
+        est.max_output_tokens, "estimate.max_output_tokens")
+    if pt < 0:
+        raise CostUnknownError("estimate.prompt_tokens must be nonnegative")
+    if eo < mo:
+        raise CostUnknownError(
+            f"under-reservation: estimate.max_output_tokens={eo} < requested cap "
+            f"{mo} for {model!r} — fail closed"
+        )
+    return TokenEstimate(prompt_tokens=pt, max_output_tokens=eo)
