@@ -1056,6 +1056,35 @@ class CheckpointStore:
             )
             return cur.rowcount == 1
 
+    def claim_lease_gen(self, run_id: str, owner: str) -> int | None:
+        """Atomically claim a suspended run for `owner` and RETURN the new lease
+        generation to the claiming worker (worker-owned identity; it is never
+        re-read from SQLite by other parties). Returns None when the lease is
+        held by a live worker."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1, updated_at=? "
+                "WHERE run_id=? AND state IN (?, ?) "
+                "AND (lease_owner IS NULL OR lease_expires_at <= ?)",
+                (
+                    owner,
+                    self._lease_expiry(),
+                    now,
+                    run_id,
+                    ExecutionState.WAITING_FOR_PROVIDER.value,
+                    ExecutionState.READY_TO_RESUME.value,
+                    now,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = self._conn.execute(
+                "SELECT lease_generation FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            return int(row["lease_generation"])
+
     def renew_lease(self, run_id: str, owner: str) -> bool:
         """Extend the lease; fenced by ownership (a stale worker cannot renew)."""
         now = self.now_iso()

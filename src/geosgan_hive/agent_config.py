@@ -203,6 +203,21 @@ class HiveConfig(BaseModel):
                     "requires a checkpoint store: set a 'checkpoint:' block in the config "
                     "(durable resume additionally requires checkpoint.persist_mode=resumable)"
                 )
+        # Phase 4: cloud.zero_cost=true is fail-closed at config level — it must never
+        # silently run in legacy mode, so a durable (non-:memory:) checkpoint store is
+        # mandatory for the shared quota engine
+        if self.cloud is not None and self.cloud.zero_cost:
+            if self.checkpoint is None:
+                raise ValueError(
+                    "cloud.zero_cost=true requires a 'checkpoint:' block: the durable "
+                    "shared quota store is mandatory in zero-cost mode (refusing to run "
+                    "in legacy mode)"
+                )
+            if self.checkpoint.path == ":memory:":
+                raise ValueError(
+                    "cloud.zero_cost=true requires a persistent checkpoint.path "
+                    "(':memory:' is not durable and is rejected in zero-cost mode)"
+                )
         return self
 
     def agent(self, name: str) -> AgentSpec:

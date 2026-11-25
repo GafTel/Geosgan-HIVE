@@ -5,7 +5,10 @@ from typing import Any
 from .agent_config import AgentSpec, HiveConfig, SupervisorSpec
 from .agents import Agent
 from .checkpoints import CheckpointStore
+from .cloud_gate import ZeroCostGate
+from .cloud_profiles import CloudProfileRegistry
 from .collaboration import CollaborationEngine
+from .errors import ConfigError
 from .fallback import FallbackPolicy, effective_policy
 from .gateway import ModelGateway
 from .orchestrator import Supervisor
@@ -91,6 +94,8 @@ def build_team(
     tracker: UsageTracker | None = None,
     *,
     checkpoint_store: CheckpointStore | None = None,
+    cloud_adapter: Any = None,
+    cloud_default_max_output_tokens: int | None = None,
 ) -> tuple[Supervisor, dict[str, Agent]]:
     """Build the whole team from a validated config, wiring the engine.
 
@@ -128,6 +133,23 @@ def build_team(
         # every physical dispatch reservation is durably committed to SQLite
         # BEFORE the provider request is sent
         gateway.set_durable_store(store)
+    # Phase 4 C4: wire the cloud registry + zero-cost gate through the factory so a
+    # YAML zero_cost=true can never silently run in legacy mode
+    if config.cloud is not None and hasattr(gateway, "set_cloud_registry"):
+        reg = CloudProfileRegistry.from_config(config.cloud)
+        gateway.set_cloud_registry(reg)
+        if reg.zero_cost:
+            if store is None or getattr(store, "path", None) == ":memory:":
+                raise ConfigError(
+                    "cloud.zero_cost=true requires a durable shared quota store "
+                    "(config.checkpoint.path, not ':memory:') — refusing to run in "
+                    "legacy mode"
+                )
+            gate = ZeroCostGate(
+                reg, store, adapter=cloud_adapter,
+                default_max_output_tokens=cloud_default_max_output_tokens,
+            )
+            gateway.set_cloud_gate(gate)
     tools = default_registry()
     # Phase 3: the ToolGateway is ALWAYS wired in production; every tool call goes
     # through it (policy + budgets + validation). Legacy registry path remains only

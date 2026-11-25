@@ -414,12 +414,17 @@ class Supervisor:
         ctx, root_task_id = self._open_run(task, run_id)
         try:
             if self.checkpoint_store is not None and owner is not None:
-                self.checkpoint_store.create_run(
+                cp = self.checkpoint_store.create_run(
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                # worker-owned lease identity recorded in the execution context
+                # (from THIS worker's own create call — never adopted from SQLite)
+                if ctx is not None:
+                    ctx.lease_owner = owner
+                    ctx.lease_generation = cp.lease_generation
                 self._start_lease_keeper(run_id, owner)
             result = self._run_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
@@ -469,11 +474,15 @@ class Supervisor:
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
-        if not store.claim_lease(run_id, owner):
+        gen = store.claim_lease_gen(run_id, owner)
+        if gen is None:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
         self._start_lease_keeper(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
+        # worker-owned identity from THIS worker's own claim (returned generation)
+        ctx.lease_owner = owner
+        ctx.lease_generation = gen
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",
@@ -668,12 +677,15 @@ class Supervisor:
         ctx, root_task_id = self._open_run(task, run_id)
         try:
             if self.checkpoint_store is not None and owner is not None:
-                self.checkpoint_store.create_run(
+                cp = self.checkpoint_store.create_run(
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                if ctx is not None:
+                    ctx.lease_owner = owner
+                    ctx.lease_generation = cp.lease_generation
                 self._start_lease_keeper_async(run_id, owner)
             result = await self._arun_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
@@ -726,11 +738,14 @@ class Supervisor:
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
-        if not store.claim_lease(run_id, owner):
+        gen = store.claim_lease_gen(run_id, owner)
+        if gen is None:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
         store.mark_running(run_id, owner=owner)
         self._start_lease_keeper_async(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
+        ctx.lease_owner = owner
+        ctx.lease_generation = gen
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",

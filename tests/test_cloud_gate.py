@@ -130,7 +130,7 @@ def fake_response(content="ok", model=M1):
     )
 
 
-def make_gateway(store, gate, *, max_attempts=1, sleeps=None):
+def make_gateway(store, gate, *, max_attempts=1, sleeps=None, ctx_lookup=None):
     gw = ModelGateway(
         tracker=UsageTracker(),
         retry_policy=RetryPolicy(max_attempts=max_attempts, base_delay_seconds=0,
@@ -139,6 +139,8 @@ def make_gateway(store, gate, *, max_attempts=1, sleeps=None):
         sleep=(sleeps.append if sleeps is not None else lambda s: None),
     )
     gw.set_durable_store(store)
+    if ctx_lookup is not None:
+        gw.set_context_lookup(ctx_lookup)
     gw.set_cloud_gate(gate)
     return gw
 
@@ -176,7 +178,7 @@ def no_network(monkeypatch):
 
 def test_zero_cost_requires_durable_store(tmp_path):
     reg = registry([free_profile()])
-    with pytest.raises(CloudConfigError, match="durable shared quota storage"):
+    with pytest.raises(CloudConfigError, match="durable shared quota store"):
         ZeroCostGate(reg, None, adapter=LiveStubAdapter())
 
 
@@ -229,9 +231,9 @@ def test_gate_authorizes_and_records_durable_dispatch(tmp_path, litellm_spy, no_
     rows = store.quota_status(POOL_A)
     kinds = {(r["kind"]): r["used"] for r in rows}
     assert kinds["requests"] == 1
-    prompt_chars = (len(json.dumps(litellm_spy[0]["messages"], default=str))
-                    + len(json.dumps(litellm_spy[0].get("tools") or []))
-                    + len(M1) + 512)
+    base = (len(json.dumps(litellm_spy[0]["messages"], default=str))
+            + len(json.dumps(litellm_spy[0].get("tools") or [])) + len(M1))
+    prompt_chars = base + max(256, base // 10)  # conservative protocol overhead
     assert kinds["tokens"] == prompt_chars + 64  # complete prompt + max output
     # credentials are never part of the prompt accounting
     assert "sk-test" not in json.dumps(litellm_spy[0].get("messages"))
@@ -356,11 +358,16 @@ def test_no_automatic_paid_fallback(tmp_path, litellm_spy, no_network):
 # ---- lease fencing on run-bound (resumed) dispatches ----
 
 def test_run_bound_dispatch_fenced_when_lease_lost(tmp_path, litellm_spy, no_network):
+    from geosgan_hive.run_context import CollaborationPolicy, RunContext
+
     db = str(tmp_path / "lease.db")
     gate, store, _ = make_gate(tmp_path, [free_profile()], name="lease.db")
-    gw = make_gateway(store, gate)
     store.create_run(run_id="r", owner="w1", task="t", agent="s", model=M1,
                      root_task_id="root")
+    ctx = RunContext("r", CollaborationPolicy())
+    ctx.lease_owner = "w1"  # worker-owned identity from the execution context
+    ctx.lease_generation = 0
+    gw = make_gateway(store, gate, ctx_lookup=lambda rid: ctx if rid == "r" else None)
     gw.complete([Message("user", "x")], model=M1, run_id="r", max_tokens=16)
     assert len(litellm_spy) == 1
     with store._lock:

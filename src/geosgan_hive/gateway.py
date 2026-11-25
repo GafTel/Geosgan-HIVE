@@ -19,6 +19,7 @@ from .errors import (
 from .errors import (
     BudgetExceededError,
     CheckpointError,
+    ConfigError,
     ErrorClass,
     FallbackExhaustedError,
     GatewayConnectionError,
@@ -163,11 +164,40 @@ class ModelGateway:
     def set_durable_store(self, store: Any) -> None:
         """Wire a CheckpointStore so each physical dispatch is durably reserved
         (monotonic, atomic, before the request) for runs that have one."""
+        if (store is None and self._cloud_registry is not None
+                and self._cloud_registry.zero_cost):
+            # zero-cost enforcement can never be silently disabled by dropping
+            # the durable store
+            raise ConfigError(
+                "zero-cost mode requires the durable store; set_durable_store(None) "
+                "is rejected while a zero-cost cloud registry is wired"
+            )
         self._durable_store = store
         self._cloud_gate = None  # rebuild lazily with the new store
 
+    def set_cloud_registry(self, registry: CloudProfileRegistry) -> None:
+        """Wire the cloud profile registry (factory path). While a zero-cost
+        registry is active it can never be replaced by an inactive one."""
+        if (self._cloud_registry is not None and self._cloud_registry.zero_cost
+                and not registry.zero_cost):
+            raise ConfigError(
+                "cannot weaken a wired zero-cost registry to non-zero-cost — "
+                "zero-cost enforcement cannot be silently disabled"
+            )
+        self._cloud_registry = registry
+        self._cloud_gate = None
+
     def set_cloud_gate(self, gate: ZeroCostGate) -> None:
-        """Wire an explicit ZeroCostGate (tests / custom wiring)."""
+        """Wire an explicit ZeroCostGate (tests / custom wiring). An inactive gate
+        can never replace an active zero-cost gate."""
+        if (self._cloud_registry is not None and self._cloud_registry.zero_cost
+                and not gate.enabled()):
+            raise ConfigError(
+                "refusing to replace an active zero-cost gate with an inactive one — "
+                "zero-cost enforcement cannot be silently disabled"
+            )
+        if self._cloud_registry is None:
+            self._cloud_registry = gate.registry
         self._cloud_gate = gate
 
     def _get_cloud_gate(self) -> ZeroCostGate | None:
@@ -232,24 +262,53 @@ class ModelGateway:
                     "dispatch blocked"
                 )
 
+    def _gate_binding(self, run_id: str | None) -> tuple[str | None, int | None]:
+        """Worker-owned lease identity for run-bound dispatches, taken from the
+        EXECUTION CONTEXT (never adopted by reading SQLite). Missing run/context/
+        binding fails closed when the zero-cost gate is active."""
+        if run_id is None:
+            return None, None
+        ctx = self._run_context(run_id)
+        owner = getattr(ctx, "lease_owner", None) if ctx is not None else None
+        gen = getattr(ctx, "lease_generation", None) if ctx is not None else None
+        if owner is None or gen is None:
+            raise CheckpointError(
+                f"zero-cost run-bound dispatch of run {run_id!r} requires the "
+                "worker-owned lease binding in the execution context (missing -> "
+                "fail closed)"
+            )
+        return owner, gen
+
     def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
-        """One physical dispatch: the zero-cost gate (when active) authorizes the
-        dispatch FIRST (durable quota reservation + single-use authorization),
-        then the physical attempt is reserved atomically (durably when wired), the
-        request slot is held ONLY around the in-flight request (never during
-        backoff, cooldown, checkpointing or delegation waits), then LiteLLM."""
+        """One physical dispatch. Zero-cost gate (when active): phase 1 reserves the
+        durable quota BEFORE the slot; the request slot is acquired next and held
+        ONLY around the in-flight request (never during backoff/cooldown/checkpoint
+        waits); phase 2 revalidates lease+evidence+window+policy and grants the
+        single-use authorization IMMEDIATELY BEFORE the LiteLLM invocation."""
         gate = self._get_cloud_gate()
+        dispatch_id = ""
+        owner = gen = None
         if gate is not None and gate.enabled():
-            gate.authorize_physical_dispatch(model, kwargs, run_id=run_id)
+            owner, gen = self._gate_binding(run_id)
+            dispatch_id = gate.prepare_dispatch(
+                model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
 
         if ctx is None:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
             return litellm.completion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.sync_semaphore()
         sem.acquire()
         try:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
             return litellm.completion(**kwargs)
         finally:
             sem.release()
@@ -258,17 +317,29 @@ class ModelGateway:
         self, kwargs: dict[str, Any], *, model: str, run_id: str | None
     ) -> Any:
         gate = self._get_cloud_gate()
+        dispatch_id = ""
+        owner = gen = None
         if gate is not None and gate.enabled():
-            gate.authorize_physical_dispatch(model, kwargs, run_id=run_id)
+            owner, gen = self._gate_binding(run_id)
+            dispatch_id = gate.prepare_dispatch(
+                model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
 
         if ctx is None:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
             return await litellm.acompletion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.semaphore()
         await sem.acquire()
         try:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
             return await litellm.acompletion(**kwargs)
         finally:
             sem.release()

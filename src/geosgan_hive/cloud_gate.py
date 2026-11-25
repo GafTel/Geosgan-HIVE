@@ -1,31 +1,30 @@
-"""Phase 4 C4: central zero-cost gate enforced before EVERY physical provider
-dispatch (sync, async, retry, fallback candidate and resumed runs all funnel
-through ModelGateway._dispatch_sync / _dispatch_async).
+"""Phase 4 C4 (hardened): central zero-cost gate in front of EVERY physical
+provider dispatch. ModelGateway._dispatch_sync / _dispatch_async are the single
+choke points, so sync, async, retry, fallback-candidate and resumed-run paths are
+all covered.
 
-Fail-closed rules (approved C4 spec):
-- In zero-cost mode a durable shared quota store is REQUIRED.
-- Every dispatch needs a live-eligible profile: free_tier_verified billing,
-  current attestation AND current VerificationEvidence bound to the account
-  fingerprint with the trusted credential/account binding implemented. Operator
-  attestation alone never enables live dispatch (production stays blocked until
-  trusted billing verification exists — C2 gate).
-- Conservative token/request bounds are reserved BEFORE dispatch via the durable
-  QuotaEngine, under a unique dispatch_id; dispatch authorization
-  (mark_dispatched) is single-use — a replay can never authorize another request.
-- max_tokens is always bounded and is set on the actual provider request kwargs;
-  unbounded output fails closed (CostUnknownError).
-- Prompt accounting covers the COMPLETE serialized prompt (messages + tool
-  schemas + model + protocol overhead); the api_key is never serialized.
-- LIVE token estimation requires an explicit live-capable adapter
-  (bounded_token_estimate(live=True)); test-only/mock adapters (e.g.
-  FakeCloudAdapter) are rejected for live enforcement — mock estimates are never
-  used for live requests.
-- QuotaExhaustedError (local durable quota) is distinguished from transient
-  RateLimitError (HTTP 429, retryable, Retry-After honored, never invented).
-- No automatic paid fallback: fallback candidates must pass the zero-cost
-  candidate check (free_tier_verified profile) or they are rejected.
-- Lease fencing: run-bound dispatches are bound to the run's lease
-  owner+generation; stale workers are blocked by the store.
+Two-phase protocol per physical dispatch:
+1. prepare_dispatch — BEFORE the concurrency slot is taken: live-eligibility
+   (billing evidence + trusted credential/account binding; production stays
+   blocked until trusted verification exists), endpoint binding, bounded
+   max_tokens enforced on the request kwargs, estimate_cost enforcement, complete
+   payload accounting with a conservative protocol overhead, demonstrably
+   conservative live token bounds, and the DURABLE quota reservation under a
+   unique dispatch_id (lease-fenced by the worker-owned identity).
+2. finalize_dispatch — AFTER the request slot is acquired, IMMEDIATELY BEFORE the
+   provider invocation: re-validates eligibility/evidence and atomically
+   revalidates lease + quota window + current policy (mark_dispatched, single-use
+   dispatch authorization). Any denial means the request is never sent.
+
+Fail-closed rules:
+- Zero-cost mode requires a durable, non-:memory: shared quota store.
+- Run-bound dispatches require the worker-owned lease identity from the execution
+  context (never adopted by reading SQLite); missing run/context/binding fails
+  closed.
+- Unknown/nonfinite/negative costs and costs above max_spend_usd (0 in zero-cost)
+  are rejected; heuristic token estimates are not accepted for live requests.
+- The gate has no disable switch and cannot be replaced by an inactive gate while
+  a zero-cost registry is wired.
 
 Local quota tracking cannot observe usage outside HIVE and cannot guarantee
 provider billing or quotas.
@@ -34,6 +33,7 @@ provider billing or quotas.
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -45,12 +45,19 @@ from .cloud_profiles import (
     TokenEstimate,
     bounded_token_estimate,
 )
-from .errors import CheckpointError, CloudConfigError, CostUnknownError
+from .errors import (
+    BudgetExceededError,
+    CheckpointError,
+    CloudConfigError,
+    CostUnknownError,
+)
 from .quota_engine import QuotaEngine
 
 
 class ZeroCostGate:
-    """The single zero-cost enforcement point in front of every physical dispatch."""
+    """The single zero-cost enforcement point in front of every physical dispatch.
+    Immutable after construction (enabled() derives from the registry and cannot
+    be switched off)."""
 
     def __init__(
         self,
@@ -60,29 +67,57 @@ class ZeroCostGate:
         adapter: Any,
         utcnow: Any = lambda: datetime.now(UTC),
         default_max_output_tokens: int | None = None,
-        protocol_overhead_chars: int = 512,
     ) -> None:
-        if registry.zero_cost and store is None:
+        if registry.zero_cost and (
+            store is None or getattr(store, "path", None) == ":memory:"
+        ):
             raise CloudConfigError(
-                "zero-cost mode requires durable shared quota storage "
-                "(a CheckpointStore) — live dispatch fails closed without it"
+                "zero-cost mode requires a durable shared quota store (a "
+                "CheckpointStore with a persistent path; :memory: is rejected) — "
+                "live dispatch fails closed without it"
             )
-        self.registry = registry
+        self._registry = registry
         self.store = store
         self.engine = QuotaEngine(store, registry, utcnow=utcnow) if store is not None else None
         self.adapter = adapter
         self._utcnow = utcnow
         self.default_max_output_tokens = default_max_output_tokens
-        self.protocol_overhead_chars = protocol_overhead_chars
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(f"ZeroCostGate is immutable ({name!r}) — no disable switch")
+        object.__setattr__(self, name, value)
+
+    @property
+    def registry(self) -> CloudProfileRegistry:
+        return self._registry
 
     def enabled(self) -> bool:
-        return bool(self.registry.zero_cost)
+        return bool(self._registry.zero_cost)
 
     def _now(self) -> datetime:
         n = self._utcnow()
         if not isinstance(n, datetime) or n.tzinfo is None:
             raise CloudConfigError("zero-cost gate requires a tz-aware clock")
         return n
+
+    def _check_evidence_binding(self, model: str, kwargs: dict[str, Any], n: datetime) -> None:
+        """Live eligibility incl. evidence; plus endpoint binding when the
+        evidence declares one (must match the request's api_base)."""
+        ok, reason = self._registry.live_dispatch_eligible(model, now=n)
+        if not ok:
+            raise CloudConfigError(f"zero-cost gate blocked dispatch of {model!r}: {reason}")
+        p = self._registry.profile_for(model)
+        ev = p.verification_evidence if p is not None else None
+        if ev is not None and ev.endpoint is not None:
+            api_base = kwargs.get("api_base")
+            if api_base is not None and str(api_base).rstrip("/") != ev.endpoint.rstrip("/"):
+                raise CloudConfigError(
+                    f"zero-cost gate blocked dispatch of {model!r}: endpoint "
+                    f"{api_base!r} does not match the verification evidence endpoint "
+                    f"{ev.endpoint!r}"
+                )
 
     def candidate_billing_ok(self, model: str) -> tuple[bool, str]:
         """Candidate-level check for fallback chains: the model needs an enabled
@@ -92,7 +127,7 @@ class ZeroCostGate:
         if not self.enabled():
             return True, "zero-cost gate not active"
         n = self._now()
-        p = self.registry.profile_for(model)
+        p = self._registry.profile_for(model)
         if p is None:
             return False, f"no cloud profile for {model!r} (unknown billing fails closed)"
         if not p.enabled:
@@ -103,20 +138,37 @@ class ZeroCostGate:
             return False, f"operator verification for {model!r} expired"
         return True, "ok"
 
-    def authorize_physical_dispatch(
-        self, model: str, kwargs: dict[str, Any], *, run_id: str | None = None,
+    def _payload_chars(self, kwargs: dict[str, Any]) -> int:
+        """Complete serialized provider payload (messages + tool schemas + model),
+        plus a conservative protocol overhead: max(256 chars, 10% of payload).
+        The api_key is deliberately never serialized."""
+        messages = kwargs.get("messages") or []
+        tools = kwargs.get("tools") or []
+        payload = (
+            len(json.dumps(messages, default=str))
+            + len(json.dumps(tools, default=str))
+            + len(str(kwargs.get("model") or ""))
+        )
+        return payload + max(256, payload // 10)
+
+    def prepare_dispatch(
+        self, model: str, kwargs: dict[str, Any], *,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
     ) -> str:
-        """Enforce the zero-cost policy for ONE physical dispatch and return the
-        dispatch_id ONLY when authorized. Raises (and the request is never sent)
-        on: ineligible billing/evidence/credential binding, unknown cost, unbounded
-        output, quota exhaustion, fencing failure or double authorization."""
+        """Phase 1 (before the concurrency slot): validate + durably RESERVE the
+        dispatch. Returns the unique dispatch_id; the physical request is NOT yet
+        authorized (see finalize_dispatch)."""
         if not self.enabled():
             return ""
         n = self._now()
-        ok, reason = self.registry.live_dispatch_eligible(model, now=n)
-        if not ok:
-            raise CloudConfigError(
-                f"zero-cost gate blocked dispatch of {model!r}: {reason}"
+        self._check_evidence_binding(model, kwargs, n)
+        if run_id is not None and (lease_owner is None or lease_generation is None):
+            raise CheckpointError(
+                f"zero-cost run-bound dispatch of {model!r} requires the worker-owned "
+                "lease binding (lease_owner + lease_generation from the execution "
+                "context) — missing binding fails closed"
             )
         mo = kwargs.get("max_tokens")
         if mo is None:
@@ -127,37 +179,74 @@ class ZeroCostGate:
                 f"(got {mo!r}) — unknown/unbounded usage fails closed"
             )
         kwargs["max_tokens"] = mo  # enforced on the actual provider request
-        # complete serialized prompt accounting: messages + tool schemas + model +
-        # protocol overhead; the api_key is deliberately never serialized
-        messages = kwargs.get("messages") or []
-        tools = kwargs.get("tools") or []
-        prompt_chars = (
-            len(json.dumps(messages, default=str))
-            + len(json.dumps(tools, default=str))
-            + len(str(kwargs.get("model") or ""))
-            + self.protocol_overhead_chars
-        )
+        prompt_chars = self._payload_chars(kwargs)
         est: TokenEstimate = bounded_token_estimate(
             self.adapter, model, prompt_chars=prompt_chars,
             max_output_tokens=mo, live=True,
         )
+        # cost enforcement: unknown/nonfinite/negative rejected; anything above the
+        # configured spend cap (strictly 0 in zero-cost mode) is blocked
+        cost = self.adapter.estimate_cost(
+            model, prompt_tokens=est.prompt_tokens, max_output_tokens=mo)
+        if cost is None:
+            raise CostUnknownError(
+                f"unknown estimated cost for {model!r} — unknown is not zero; blocked")
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)) \
+                or not math.isfinite(cost) or cost < 0:
+            raise CostUnknownError(
+                f"invalid estimated cost for {model!r}: {cost!r} (nonfinite/negative/"
+                "non-numeric rejected)")
+        cap = self._registry.max_spend_usd if self._registry.zero_cost else None
+        if cap is not None and cost > cap:
+            raise BudgetExceededError(
+                f"estimated cost {cost} for {model!r} exceeds the spend cap "
+                f"{cap} — potentially billable request blocked in zero-cost mode"
+            )
         dispatch_id = uuid4().hex
-        bound_run, owner, gen = None, None, None
-        if run_id is not None and self.store is not None:
-            row = self.store.get(run_id)
-            if row is not None:
-                bound_run, owner, gen = run_id, row.lease_owner, row.lease_generation
         assert self.engine is not None
         self.engine.reserve_for_model(
-            model, dispatch_id, est, run_id=bound_run, lease_owner=owner,
-            lease_generation=gen, now=n,
+            model, dispatch_id, est, run_id=run_id, lease_owner=lease_owner,
+            lease_generation=lease_generation, now=n,
         )
+        return dispatch_id
+
+    def finalize_dispatch(
+        self, model: str, dispatch_id: str, *,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Phase 2 (after the request slot is held, immediately before the provider
+        invocation): revalidate evidence/eligibility (incl. endpoint binding),
+        then atomically revalidate lease + quota window + current policy via the
+        single-use mark_dispatched. Raises — and the request is never sent — on
+        any denial."""
+        if not self.enabled():
+            return
+        n = self._now()
+        self._check_evidence_binding(model, kwargs or {}, n)
+        assert self.engine is not None
         if not self.engine.mark_dispatched(
-            dispatch_id, run_id=bound_run, lease_owner=owner,
-            lease_generation=gen, now=n,
+            dispatch_id, run_id=run_id, lease_owner=lease_owner,
+            lease_generation=lease_generation, now=n,
         ):
             raise CheckpointError(
                 f"zero-cost gate: dispatch authorization denied for {dispatch_id} "
-                "(already used / quota window rolled / lease fenced) — not dispatched"
+                "(already used / quota window rolled / policy changed / lease fenced) "
+                "— not dispatched"
             )
+
+    def authorize_physical_dispatch(
+        self, model: str, kwargs: dict[str, Any], *, run_id: str | None = None,
+        lease_owner: str | None = None, lease_generation: int | None = None,
+    ) -> str:
+        """Convenience one-shot (prepare + finalize) for non-gateway callers."""
+        dispatch_id = self.prepare_dispatch(
+            model, kwargs, run_id=run_id, lease_owner=lease_owner,
+            lease_generation=lease_generation)
+        if dispatch_id:
+            self.finalize_dispatch(
+                model, dispatch_id, run_id=run_id, lease_owner=lease_owner,
+                lease_generation=lease_generation)
         return dispatch_id

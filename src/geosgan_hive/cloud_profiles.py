@@ -91,6 +91,11 @@ class VerificationEvidence(BaseModel):
     collected_by: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
     credential_bound: bool
     account_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    #: optional explicit bindings: the provider the evidence was collected for and
+    #: the endpoint (api_base host) it applies to. When set, they must match the
+    #: profile's provider / the request's endpoint at dispatch time.
+    provider: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
+    endpoint: str | None = Field(default=None, pattern=r"^https://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
 
     @field_validator("collected_at")
     @classmethod
@@ -246,6 +251,12 @@ class CloudProfile(BaseModel):
             raise ValueError(
                 "verification_evidence is bound to a different account fingerprint "
                 "than this profile"
+            )
+        ev = self.verification_evidence
+        if ev is not None and ev.provider is not None and ev.provider != self.provider:
+            raise ValueError(
+                f"verification_evidence is bound to provider {ev.provider!r}, but this "
+                f"profile is for provider {self.provider!r}"
             )
         return self
 
@@ -586,5 +597,14 @@ def bounded_token_estimate(
         raise CostUnknownError(
             f"under-reservation: estimate.max_output_tokens={eo} < requested cap "
             f"{mo} for {model!r} — fail closed"
+        )
+    if live and caps.token_estimation != TokenEstimationMode.EXACT and pt < pc:
+        # heuristic estimates (e.g. chars/4) are NOT demonstrably conservative for
+        # the complete provider payload: the universal lower bound is >= 1 token per
+        # character. Only EXACT estimation may report fewer prompt tokens.
+        raise CostUnknownError(
+            f"non-conservative prompt token bound for {model!r}: estimate "
+            f"prompt_tokens={pt} < payload chars={pc} (heuristic estimates are not "
+            "proof of conservative coverage — fail closed)"
         )
     return TokenEstimate(prompt_tokens=pt, max_output_tokens=eo)

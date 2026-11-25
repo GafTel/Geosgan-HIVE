@@ -244,8 +244,10 @@ def test_hive_config_accepts_optional_cloud_block():
                           model="ollama/a")],
     )
     assert HiveConfig(**base).cloud is None  # absent -> legacy, unchanged
-    cfg = HiveConfig(**base, cloud={"zero_cost": True, "max_spend_usd": 0.0,
-                                    "profiles": [free_profile()]})
+    # zero_cost=true now REQUIRES a durable checkpoint store (never silently legacy)
+    cfg = HiveConfig(**base, checkpoint={},
+                     cloud={"zero_cost": True, "max_spend_usd": 0.0,
+                            "profiles": [free_profile()]})
     assert cfg.cloud is not None and cfg.cloud.zero_cost is True
     assert cfg.cloud.profiles[0].billing == BillingModel.FREE_TIER_VERIFIED
 
@@ -647,9 +649,20 @@ def test_live_estimation_requires_explicit_capability_flags():
         bounded_token_estimate(FakeCloudAdapter(), "fake/mini", prompt_chars=10,
                                max_output_tokens=64, live=True)  # live_supported=False
     stub = LiveStubAdapter()
-    est = bounded_token_estimate(stub, "fake/mini", prompt_chars=100,
+    # heuristic char/4 is NOT demonstrably conservative for live enforcement
+    with pytest.raises(CostUnknownError, match="conservative"):
+        bounded_token_estimate(stub, "fake/mini", prompt_chars=100,
+                               max_output_tokens=64, live=True)
+
+    class ConservativeStub(LiveStubAdapter):
+        def estimate_tokens(self, model, *, prompt_chars, max_output_tokens):
+            # >= 1 token per char: demonstrably conservative universal bound
+            return TokenEstimate(prompt_tokens=prompt_chars,
+                                 max_output_tokens=max_output_tokens)
+
+    est = bounded_token_estimate(ConservativeStub(), "fake/mini", prompt_chars=100,
                                  max_output_tokens=64, live=True)
-    assert est.max_output_tokens == 64 and est.prompt_tokens >= 25  # conservative ceil
+    assert est.max_output_tokens == 64 and est.prompt_tokens == 100
 
 
 def test_verification_evidence_model_valid():
