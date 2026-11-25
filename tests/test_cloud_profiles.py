@@ -55,6 +55,7 @@ def free_profile(**overrides) -> dict:
         verified_at=(NOW - timedelta(days=1)).isoformat(),
         account_label="main",
         account_fingerprint="a" * 64,
+        quota_window_start=(NOW - timedelta(days=1)).isoformat(),
         verification_evidence={
             "source": "provider_billing_console_export",
             "evidence_ref": "ev-2026-01-14",
@@ -70,8 +71,9 @@ def free_profile(**overrides) -> dict:
     return base
 
 
-def registry(profiles, *, zero_cost=True, **kw) -> CloudProfileRegistry:
+def registry(profiles, *, zero_cost=True, trusted=False, **kw) -> CloudProfileRegistry:
     kw.setdefault("max_spend_usd", 0.0 if zero_cost else None)
+    kw.setdefault("trusted_evidence_binding", trusted)
     return CloudProfileRegistry(
         profiles=[CloudProfile.model_validate(p) for p in profiles],
         zero_cost=zero_cost,
@@ -124,9 +126,13 @@ def test_free_tier_verified_requires_both_attestations_and_timestamp():
 # ---- billing eligibility in zero-cost mode ----
 
 def test_verified_free_profile_is_eligible_when_verification_current():
-    reg = registry([free_profile()], zero_cost=True)
+    reg = registry([free_profile()], zero_cost=True, trusted=True)
     ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is True, reason
+    # production default (trusted binding not implemented): blocked
+    reg0 = registry([free_profile()], zero_cost=True)
+    ok, reason = reg0.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "blocked" in reason.lower()
 
 
 def test_unknown_billing_blocks_zero_cost_live_dispatch():
@@ -485,7 +491,7 @@ def test_operator_attestation_alone_does_not_enable_live_dispatch():
     ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is False and "evidence" in reason.lower()
     # evidence contract satisfied as well -> allowed
-    reg2 = registry([free_profile(billing_verified=True)], zero_cost=True)
+    reg2 = registry([free_profile(billing_verified=True)], zero_cost=True, trusted=True)
     ok, _ = reg2.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is True
     # billing_verified=True WITHOUT evidence is still just an assertion -> blocked
@@ -546,13 +552,13 @@ def test_account_wide_quota_aggregation_across_models():
                               {"pool": f"gemini:acct:{fp}", "max_requests": 1500,
                                "period": "day"}])  # duplicate of p1's constraint
     reg = registry([p1, p2], zero_cost=True)
-    agg = reg.account_quotas(fp)
+    agg = reg.account_quotas("gemini", fp)
     # deduplicated union of ALL account constraints (day requests + day tokens)
     assert len(agg) == 2
     # every model of the account sees the account-wide limits (no bypass)
     for m in ("gemini/gemini-2.0-flash", "gemini/gemini-2.0-flash-lite"):
         assert {q.key() for q in reg.quotas_for(m)} == {q.key() for q in agg}
-    assert reg.account_fingerprint_for("gemini/gemini-2.0-flash-lite") == fp
+    assert reg.account_key_for("gemini/gemini-2.0-flash-lite") == ("gemini", fp)
 
 
 # --- issue 4: canonical identity conflicts by fingerprint ---
@@ -606,10 +612,14 @@ def test_evidence_contract_required_and_bound_to_account():
     reg3 = registry([old], zero_cost=True)
     ok, _ = reg3.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is False
-    # proper evidence -> allowed
-    reg4 = registry([base], zero_cost=True)
+    # proper evidence + trusted binding hook -> allowed
+    reg4 = registry([base], zero_cost=True, trusted=True)
     ok, _ = reg4.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
     assert ok is True
+    # proper evidence but NO trusted binding (production C2 state) -> still blocked
+    reg5 = registry([base], zero_cost=True)
+    ok, reason = reg5.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "blocked" in reason.lower()
 
 
 # --- issue 6: live token estimation capability flags ---
@@ -652,3 +662,61 @@ def test_verification_evidence_model_valid():
         "account_fingerprint": "a" * 64,
     })
     assert ev.credential_bound is True
+
+
+# ================= C2 residual fixes (failing-first) =================
+
+def test_account_quotas_keyed_by_provider_and_fingerprint():
+    from types import MappingProxyType
+
+    fp = "a" * 64
+    registry([free_profile()], zero_cost=True)
+    # same fingerprint under a DIFFERENT provider must not collide
+    m = free_profile(provider="mistral", models=["mistral/mistral-small-latest"])
+    m["quotas"] = [{"pool": f"mistral:acct:{fp}", "max_requests": 7, "period": "day"}]
+    m["verification_evidence"] = dict(m["verification_evidence"], account_fingerprint=fp)
+    both = registry([free_profile(), m], zero_cost=True)
+    assert isinstance(both._account_quotas, MappingProxyType)
+    assert len(both.account_quotas("gemini", fp)) == 1
+    assert len(both.account_quotas("mistral", fp)) == 1
+    assert both.account_quotas("gemini", fp) != both.account_quotas("mistral", fp)
+    with pytest.raises(TypeError):
+        both._account_quotas[("gemini", fp)] = ()
+
+
+def test_defensive_revalidation_of_existing_instances():
+    p = CloudProfile.model_validate(free_profile())
+    reg = CloudProfileRegistry(profiles=[p], zero_cost=True, max_spend_usd=0.0)
+    # instance passed in was re-validated from its dump (still a CloudProfile, tuple fields)
+    assert isinstance(reg.profiles[0], CloudProfile)
+    assert isinstance(reg.profiles[0].quotas, tuple)
+
+
+def test_live_dispatch_blocked_until_trusted_binding_implemented():
+    reg = registry([free_profile()], zero_cost=True, trusted=False)
+    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "not proof of authenticity" in reason
+    reg_t = registry([free_profile()], zero_cost=True, trusted=True)
+    ok, _ = reg_t.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is True
+
+
+def test_adapter_capabilities_strictly_typed():
+    with pytest.raises(ValidationError):
+        AdapterCapabilities(live_supported="yes", token_estimation="exact")
+    with pytest.raises(ValidationError):
+        AdapterCapabilities(live_supported=True, token_estimation="maybe")
+    with pytest.raises(ValidationError):
+        AdapterCapabilities(live_supported=True, token_estimation="exact", extra=1)
+    caps = AdapterCapabilities(live_supported=True, token_estimation=TokenEstimationMode.EXACT)
+    assert caps.live_supported is True
+
+
+def test_free_tier_requires_quota_window_start():
+    p = free_profile()
+    del p["quota_window_start"]
+    with pytest.raises(ValidationError):
+        CloudProfile.model_validate(p)
+    p2 = free_profile(quota_window_start="2026-01-14T00:00:00")  # naive
+    with pytest.raises(ValidationError):
+        CloudProfile.model_validate(p2)

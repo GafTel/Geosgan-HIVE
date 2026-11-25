@@ -58,12 +58,13 @@ class TokenEstimationMode(StrEnum):
     NONE = "none"
 
 
-@dataclass(frozen=True)
-class AdapterCapabilities:
-    """Explicit adapter capability flags. Missing/ambiguous flags fail closed for
-    live estimation."""
+class AdapterCapabilities(BaseModel):
+    """Explicit, strictly typed adapter capability flags (frozen; extra fields
+    forbidden). Missing/ambiguous flags fail closed for live estimation."""
 
-    live_supported: bool
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    live_supported: bool = Field(strict=True)  # no string coercion
     token_estimation: TokenEstimationMode
 
 
@@ -153,6 +154,9 @@ class CloudProfile(BaseModel):
     verification_evidence: VerificationEvidence | None = None
     account_label: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
     account_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    #: explicit UTC anchor for quota period windows; REQUIRED for live zero-cost
+    #: profiles — unknown reset semantics fail closed (never invented)
+    quota_window_start: datetime | None = None
     quotas: tuple[QuotaSpec, ...] = Field(default_factory=tuple)
     enabled: bool = True
 
@@ -180,11 +184,11 @@ class CloudProfile(BaseModel):
             out.append(m)
         return tuple(out)
 
-    @field_validator("verified_at")
+    @field_validator("verified_at", "quota_window_start")
     @classmethod
     def _aware(cls, v: datetime | None) -> datetime | None:
         if v is not None and v.tzinfo is None:
-            raise ValueError("verified_at must be timezone-aware (naive timestamps rejected)")
+            raise ValueError("timestamps must be timezone-aware (naive timestamps rejected)")
         return v
 
     @model_validator(mode="after")
@@ -205,6 +209,11 @@ class CloudProfile(BaseModel):
                 )
             if not self.quotas:
                 raise ValueError("free_tier_verified requires at least one bounded quota spec")
+            if self.quota_window_start is None:
+                raise ValueError(
+                    "free_tier_verified requires quota_window_start (explicit UTC anchor "
+                    "for period resets) — unknown reset semantics fail closed"
+                )
             expected_pool = f"{self.provider}:acct:{self.account_fingerprint}"
             for q in self.quotas:
                 if q.pool != expected_pool:
@@ -256,6 +265,7 @@ class CloudProfileRegistry:
         zero_cost: bool = False,
         allowed_providers: list[str] | None = None,
         max_spend_usd: float | None = None,
+        trusted_evidence_binding: bool = False,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         if zero_cost and max_spend_usd != 0.0:
@@ -264,8 +274,12 @@ class CloudProfileRegistry:
                 "zero-cost mode requires max_spend_usd == 0.0 exactly "
                 "(None/unlimited rejected)"
             )
+        # defensive revalidation: even existing Pydantic instances are re-validated
+        # from their dump, so a mutated/bypassed instance cannot slip through
         profiles = tuple(
-            p if isinstance(p, CloudProfile) else CloudProfile.model_validate(p)
+            CloudProfile.model_validate(
+                p.model_dump() if isinstance(p, CloudProfile) else p
+            )
             for p in profiles
         )
         if allowed_providers is not None:
@@ -321,24 +335,29 @@ class CloudProfileRegistry:
                         f"conflicting quota definition for shared pool {a.pool!r} "
                         f"period {a.period.value}"
                     )
-        # account-wide aggregated quotas, deduplicated, keyed by canonical fingerprint
-        acct: dict[str, dict[tuple, QuotaSpec]] = {}
-        fp_of_model: dict[str, str] = {}
+        # account-wide aggregated quotas, deduplicated, keyed by CANONICAL
+        # (provider, fingerprint) — never fingerprint alone
+        acct: dict[tuple[str, str], dict[tuple, QuotaSpec]] = {}
+        fp_of_model: dict[str, tuple[str, str]] = {}
         for p in profiles:
             if p.account_fingerprint is None:
                 continue
-            fp = p.account_fingerprint
-            bucket = acct.setdefault(fp, {})
+            key = (p.provider, p.account_fingerprint)
+            bucket = acct.setdefault(key, {})
             for q in p.quotas:
                 bucket[q.dedup_key()] = q
             for m in p.models:
-                fp_of_model[m] = fp
+                fp_of_model[m] = key
         object.__setattr__(self, "zero_cost", bool(zero_cost))
         object.__setattr__(self, "max_spend_usd", max_spend_usd)
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "_by_model", MappingProxyType(by_model))
-        object.__setattr__(self, "_account_quotas", {k: tuple(v.values()) for k, v in acct.items()})
+        object.__setattr__(
+            self, "_account_quotas",
+            MappingProxyType({k: tuple(v.values()) for k, v in acct.items()}),
+        )
         object.__setattr__(self, "_fp_of_model", MappingProxyType(fp_of_model))
+        object.__setattr__(self, "trusted_evidence_binding", bool(trusted_evidence_binding))
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -362,17 +381,19 @@ class CloudProfileRegistry:
     def profile_for(self, model: str) -> CloudProfile | None:
         return self._by_model.get(model)
 
-    def account_fingerprint_for(self, model: str) -> str | None:
+    def account_key_for(self, model: str) -> tuple[str, str] | None:
+        """Canonical (provider, fingerprint) account key for a model."""
         return self._fp_of_model.get(model)
 
-    def account_quotas(self, fingerprint: str) -> tuple[QuotaSpec, ...]:
-        """ALL quota constraints of one account (canonical fingerprint), deduplicated."""
-        return self._account_quotas.get(fingerprint, ())
+    def account_quotas(self, provider: str, fingerprint: str) -> tuple[QuotaSpec, ...]:
+        """ALL quota constraints of one account, keyed by (provider, fingerprint),
+        deduplicated."""
+        return self._account_quotas.get((provider.lower(), fingerprint), ())
 
     def quotas_for(self, model: str) -> tuple[QuotaSpec, ...]:
         """Account-wide constraints applying to this model (no model bypass)."""
-        fp = self._fp_of_model.get(model)
-        return self.account_quotas(fp) if fp else ()
+        key = self._fp_of_model.get(model)
+        return self.account_quotas(*key) if key else ()
 
     def quota_pool(self, model: str) -> str | None:
         p = self._by_model.get(model)
@@ -429,6 +450,12 @@ class CloudProfileRegistry:
             return False, (
                 f"verification evidence for {model!r} is stale (collected "
                 f"{ev.collected_at}); re-collect evidence"
+            )
+        if not self.trusted_evidence_binding:
+            return False, (
+                "trusted evidence/credential-account binding is not implemented yet "
+                "(VerificationEvidence is a data contract, not proof of authenticity) "
+                "— production live dispatch stays blocked"
             )
         return True, "free_tier_verified + evidence bound to account + attestation current"
 
