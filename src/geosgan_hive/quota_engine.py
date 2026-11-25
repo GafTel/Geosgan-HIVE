@@ -160,14 +160,19 @@ class QuotaEngine:
         total_tokens = pt + mo
         items: list[dict[str, Any]] = []
         limits: dict[tuple[str, str], int] = {}
+        constraints: list[dict[str, Any]] = []
         for q in quotas:
             if q.max_requests is not None:
                 items.append({"kind": "requests", "period": q.period.value, "amount": 1})
                 limits[("requests", q.period.value)] = q.max_requests
+                constraints.append({"kind": "requests", "period": q.period.value,
+                                    "limit": q.max_requests})
             if q.max_tokens is not None:
                 items.append({"kind": "tokens", "period": q.period.value,
                               "amount": total_tokens})
                 limits[("tokens", q.period.value)] = q.max_tokens
+                constraints.append({"kind": "tokens", "period": q.period.value,
+                                    "limit": q.max_tokens})
         outcome = self._store.reserve_quota_batch(
             dispatch_id,
             pool=pool,
@@ -178,6 +183,8 @@ class QuotaEngine:
             run_id=run_id,
             lease_owner=lease_owner,
             lease_generation=lease_generation,
+            constraints=constraints,
+            reset_semantics=_profile.quota_reset_semantics.value,
         )
         if outcome == QuotaReservationOutcome.REPLAYED:
             raise CheckpointError(
@@ -197,26 +204,39 @@ class QuotaEngine:
         run_id: str | None = None,
         lease_owner: str | None = None,
         lease_generation: int | None = None,
+        now: datetime | None = None,
     ) -> bool:
         """Grant dispatch authorization for a reservation — True for exactly ONE
-        caller (atomic BEGIN IMMEDIATE); replays and stale workers get False and
-        must not send another physical request. Never refunds usage."""
+        caller (atomic BEGIN IMMEDIATE, with window + policy revalidation);
+        replays, stale workers, unbound callers on run-bound reservations and
+        window-rolled reservations get False and must not send another physical
+        request. Never refunds usage."""
+        n = self._now(now) if now is not None else None
         return self._store.mark_dispatched(
             dispatch_id, run_id=run_id, lease_owner=lease_owner,
             lease_generation=lease_generation,
+            now_iso=n.isoformat(timespec="milliseconds") if n is not None else None,
         )
 
     def migrate_quota_policy(
         self, model: str, *, anchor: datetime, operator: str,
         now: datetime | None = None,
     ) -> bool:
-        """Explicit operator migration of the model's account quota window policy.
-        Usage rows are never touched (historical windows retained)."""
+        """Explicit, transactional, audited migration of the model's account quota
+        policy; effective active usage is carried forward, never silently reset."""
         n = self._now(now)
-        _profile, pool, _anchor, quotas = self._resolve(model, n)
+        profile, pool, _anchor, quotas = self._resolve(model, n)
         periods = sorted({q.period.value for q in quotas})
+        constraints = [
+            {"kind": kind, "period": q.period.value, "limit": limit}
+            for q in quotas
+            for kind, limit in (("requests", q.max_requests), ("tokens", q.max_tokens))
+            if limit is not None
+        ]
         return self._store.migrate_quota_policy(
             pool, anchor_iso=anchor.isoformat(), periods=periods, operator=operator,
+            constraints=constraints,
+            reset_semantics=profile.quota_reset_semantics.value,
         )
 
     def quota_policy(self, model: str, *, now: datetime | None = None

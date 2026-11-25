@@ -27,6 +27,7 @@ from .checkpoints import (
     QuotaReservationOutcome,
     RunCheckpoint,
 )
+from .cloud_gate import ZeroCostGate
 from .cloud_profiles import (
     AdapterCapabilities,
     BillingModel,
@@ -136,6 +137,7 @@ __all__ = [
     "BillingModel",
     "TokenEstimationMode",
     "VerificationEvidence",
+    "ZeroCostGate",
     "CloudConfigError",
     "CloudOfflineError",
     "CloudProfile",

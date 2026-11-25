@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .cloud_gate import ZeroCostGate
+from .cloud_profiles import CloudProfileRegistry
 from .errors import (
     AuthenticationError as HiveAuthenticationError,
 )
@@ -124,6 +126,9 @@ class ModelGateway:
         health: HealthRegistry | None = None,
         fallback_engine: FallbackEngine | None = None,
         default_fallback: FallbackPolicy | None = None,
+        cloud_registry: CloudProfileRegistry | None = None,
+        cloud_adapter: Any = None,
+        default_max_output_tokens: int | None = None,
     ) -> None:
         self.tracker = tracker if tracker is not None else UsageTracker()
         self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -149,11 +154,36 @@ class ModelGateway:
         # optional durable store: every physical dispatch reservation is committed
         # to SQLite BEFORE the provider request is sent (Phase 2.5 gate requirement)
         self._durable_store: Any = None
+        # Phase 4 C4: central zero-cost gate in front of EVERY physical dispatch
+        self._cloud_registry = cloud_registry
+        self._cloud_adapter = cloud_adapter
+        self._default_max_output_tokens = default_max_output_tokens
+        self._cloud_gate: ZeroCostGate | None = None
 
     def set_durable_store(self, store: Any) -> None:
         """Wire a CheckpointStore so each physical dispatch is durably reserved
         (monotonic, atomic, before the request) for runs that have one."""
         self._durable_store = store
+        self._cloud_gate = None  # rebuild lazily with the new store
+
+    def set_cloud_gate(self, gate: ZeroCostGate) -> None:
+        """Wire an explicit ZeroCostGate (tests / custom wiring)."""
+        self._cloud_gate = gate
+
+    def _get_cloud_gate(self) -> ZeroCostGate | None:
+        """Lazily build the zero-cost gate from the registry + durable store.
+        In zero-cost mode a missing durable store fails closed at dispatch time."""
+        if self._cloud_gate is not None:
+            return self._cloud_gate
+        if self._cloud_registry is None:
+            return None
+        self._cloud_gate = ZeroCostGate(
+            self._cloud_registry,
+            self._durable_store,
+            adapter=self._cloud_adapter,
+            default_max_output_tokens=self._default_max_output_tokens,
+        )
+        return self._cloud_gate
 
     def retry_after_hint(self, provider: Provider | str) -> float:
         """Largest Retry-After hint (seconds) observed for this provider, 0 if none."""
@@ -203,10 +233,14 @@ class ModelGateway:
                 )
 
     def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
-        """One physical dispatch: reserve the physical attempt atomically (durably
-        when wired), acquire the request slot ONLY around the in-flight request
-        (never during backoff, cooldown, checkpointing or delegation waits), then
-        call LiteLLM."""
+        """One physical dispatch: the zero-cost gate (when active) authorizes the
+        dispatch FIRST (durable quota reservation + single-use authorization),
+        then the physical attempt is reserved atomically (durably when wired), the
+        request slot is held ONLY around the in-flight request (never during
+        backoff, cooldown, checkpointing or delegation waits), then LiteLLM."""
+        gate = self._get_cloud_gate()
+        if gate is not None and gate.enabled():
+            gate.authorize_physical_dispatch(model, kwargs, run_id=run_id)
         ctx = self._run_context(run_id)
         import litellm
 
@@ -223,6 +257,9 @@ class ModelGateway:
     async def _dispatch_async(
         self, kwargs: dict[str, Any], *, model: str, run_id: str | None
     ) -> Any:
+        gate = self._get_cloud_gate()
+        if gate is not None and gate.enabled():
+            gate.authorize_physical_dispatch(model, kwargs, run_id=run_id)
         ctx = self._run_context(run_id)
         import litellm
 
@@ -384,6 +421,7 @@ class ModelGateway:
         fallback_attempts = 0
         last_error: BaseException | None = None
         tried: list[str] = []
+        gate = self._get_cloud_gate()
         for candidate in chain:
             if candidate != primary and fallback_attempts >= policy.max_fallback_attempts:
                 break
@@ -395,6 +433,14 @@ class ModelGateway:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                            metadata={"model": candidate, "reason": decision.reason})
                 continue
+            if gate is not None and gate.enabled():
+                billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
+                if not billing_ok:
+                    # no automatic paid/unknown-cost fallback in zero-cost mode
+                    self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
+                               metadata={"model": candidate,
+                                         "reason": f"zero-cost gate: {billing_reason}"})
+                    continue
             probes = self._claim_probes(candidate, ctx, agent)
             if probes is None:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
@@ -657,6 +703,7 @@ class ModelGateway:
         fallback_attempts = 0
         last_error: BaseException | None = None
         tried: list[str] = []
+        gate = self._get_cloud_gate()
         for candidate in chain:
             if candidate != primary and fallback_attempts >= policy.max_fallback_attempts:
                 break
@@ -668,6 +715,14 @@ class ModelGateway:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                            metadata={"model": candidate, "reason": decision.reason})
                 continue
+            if gate is not None and gate.enabled():
+                billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
+                if not billing_ok:
+                    # no automatic paid/unknown-cost fallback in zero-cost mode
+                    self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
+                               metadata={"model": candidate,
+                                         "reason": f"zero-cost gate: {billing_reason}"})
+                    continue
             probes = self._claim_probes(candidate, ctx, agent)
             if probes is None:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,

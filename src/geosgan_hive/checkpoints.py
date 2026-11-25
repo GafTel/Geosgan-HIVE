@@ -16,7 +16,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -64,9 +64,12 @@ CREATE TABLE IF NOT EXISTS approvals (
 """
 
 #: Phase 4 C3: durable, cross-process quota reservations + usage pools.
-#: - quota_policies: canonical quota window policy per account pool (anchor +
-#:   periods + policy hash). Anchor/period changes are rejected at reservation
-#:   time unless migrate_quota_policy is called explicitly; usage is never reset.
+#: - quota_policies (v7): canonical quota policy per account pool — anchor,
+#:   periods, COMPLETE canonical constraints (limit kinds + values) and reset
+#:   semantics, all covered by policy_hash. Incompatible configurations are
+#:   rejected across processes. Anchor/period/constraint changes are rejected at
+#:   reservation time unless migrate_quota_policy is called explicitly; active
+#:   usage is carried forward, never silently reset.
 #: - quota_reservations: one row per unique dispatch_id, bound to its actual
 #:   windows (items_json), limits (limits_json), policy (policy_hash) and lease
 #:   binding. Idempotent reconciliation replays must match ALL of these.
@@ -74,11 +77,15 @@ CREATE TABLE IF NOT EXISTS approvals (
 #:   windows are retained forever. Usage is only ever INCREMENTED at reservation
 #:   time; there is deliberately no refund path (a crash after reservation
 #:   conservatively retains the usage).
+#: - quota_policy_audit: one row per explicit policy migration (operator, old/new
+#:   hash, carried-usage summary), written in the SAME transaction as the change.
 _QUOTA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS quota_policies (
     pool TEXT PRIMARY KEY,
     anchor_iso TEXT NOT NULL,
     periods_json TEXT NOT NULL,
+    constraints_json TEXT NOT NULL DEFAULT '[]',
+    reset_semantics TEXT NOT NULL DEFAULT 'unknown',
     policy_hash TEXT NOT NULL,
     operator TEXT,
     created_at TEXT NOT NULL,
@@ -104,6 +111,15 @@ CREATE TABLE IF NOT EXISTS quota_usage (
     window_start TEXT NOT NULL,
     used INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (pool, kind, period, window_start)
+);
+CREATE TABLE IF NOT EXISTS quota_policy_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool TEXT NOT NULL,
+    old_policy_hash TEXT,
+    new_policy_hash TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    carried_json TEXT NOT NULL DEFAULT '[]',
+    at TEXT NOT NULL
 );
 """
 
@@ -361,10 +377,47 @@ def _canonical_anchor(anchor_iso: str) -> str:
     return anchor.astimezone(UTC).isoformat(timespec="milliseconds")
 
 
-def _quota_policy_hash(anchor_canon: str, periods: list[str]) -> str:
-    payload = json.dumps({"anchor": anchor_canon, "periods": sorted(periods)},
-                         sort_keys=True, separators=(",", ":"))
+def _quota_policy_hash(anchor_canon: str, periods: list[str],
+                       constraints: list[dict[str, Any]], reset_semantics: str) -> str:
+    """Canonical identity of a quota policy: window anchor + periods + COMPLETE
+    constraints (limit kinds and values) + reset-semantics evidence level."""
+    payload = json.dumps(
+        {
+            "anchor": anchor_canon,
+            "periods": sorted(periods),
+            "constraints": sorted(
+                (c["kind"], c["period"], c["limit"]) for c in constraints
+            ),
+            "reset_semantics": reset_semantics,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_constraints(constraints: Any) -> list[dict[str, Any]]:
+    if not isinstance(constraints, (list, tuple)):
+        raise CheckpointError("constraints must be a list of {kind, period, limit}")
+    out = []
+    for c in constraints:
+        if not isinstance(c, dict):
+            raise CheckpointError("constraints must be dicts")
+        kind, period, limit = c.get("kind"), c.get("period"), c.get("limit")
+        if kind not in _QUOTA_KINDS or period not in _QUOTA_PERIODS:
+            raise CheckpointError(f"invalid constraint kind/period in {c!r}")
+        if type(limit) is not int or limit < 1 or limit > SQLITE_INT_MAX:
+            raise CheckpointError("constraint limit must be a strict int in [1, 2^63-1]")
+        out.append({"kind": kind, "period": period, "limit": limit})
+    out.sort(key=lambda c: (c["kind"], c["period"]))
+    return out
+
+
+def _validate_reset_semantics(reset_semantics: Any) -> str:
+    if not isinstance(reset_semantics, str) or not reset_semantics.replace("_", "").isalpha() \
+            or not 1 <= len(reset_semantics) <= 32:
+        raise CheckpointError("reset_semantics must be a short lowercase identifier")
+    return reset_semantics
 
 
 def _limits_json(limits: dict[tuple[str, str], int]) -> str:
@@ -468,6 +521,8 @@ class CheckpointStore:
                         self._migrate_4_to_5()
                     elif v == 5:
                         self._migrate_5_to_6()
+                    elif v == 6:
+                        self._migrate_6_to_7()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -508,6 +563,50 @@ class CheckpointStore:
         and historical quota windows are never reset by later config. Runs inside
         the caller's open transaction (statement-wise, no implicit commit)."""
         _exec_schema(self._conn, _QUOTA_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_6_to_7(self) -> None:
+        """dev-v6 -> v7 (Phase 4 C3 hardening). Earlier DEVELOPMENT schema-v6
+        databases (branch commits before the audit) are handled explicitly here;
+        the official v5 -> v6 path above is preserved unchanged.
+
+        Adds the complete canonical policy columns (constraints_json,
+        reset_semantics) and the quota_policy_audit table, then recomputes
+        policy hashes of existing rows with the v7 canonical formula so stored
+        reservations stay consistent with their pool policy. All inside the
+        caller's open transaction (statement-wise, no implicit commit)."""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(quota_policies)").fetchall()}
+        if "constraints_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE quota_policies ADD COLUMN constraints_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "reset_semantics" not in cols:
+            self._conn.execute(
+                "ALTER TABLE quota_policies ADD COLUMN reset_semantics "
+                "TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        _exec_schema(self._conn, _QUOTA_SCHEMA)  # creates audit table if missing
+        for row in self._conn.execute(
+            "SELECT pool, anchor_iso, periods_json, constraints_json, reset_semantics "
+            "FROM quota_policies"
+        ).fetchall():
+            constraints = _normalize_constraints(json.loads(row["constraints_json"]))
+            new_hash = _quota_policy_hash(
+                row["anchor_iso"], json.loads(row["periods_json"]), constraints,
+                row["reset_semantics"],
+            )
+            self._conn.execute(
+                "UPDATE quota_policies SET policy_hash=? WHERE pool=?",
+                (new_hash, row["pool"]),
+            )
+            self._conn.execute(
+                "UPDATE quota_reservations SET policy_hash=? WHERE pool=? AND anchor_iso=?",
+                (new_hash, row["pool"], row["anchor_iso"]),
+            )
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -993,7 +1092,9 @@ class CheckpointStore:
             return False
         if row["state"] != ExecutionState.RUNNING.value:
             return False
-        if row["lease_expires_at"] is not None and row["lease_expires_at"] <= self.now_iso():
+        # a run-bound dispatch requires a PRESENT, unexpired lease (missing expiry
+        # is rejected — fail closed)
+        if row["lease_expires_at"] is None or row["lease_expires_at"] <= self.now_iso():
             return False
         if lease_owner is not None and row["lease_owner"] != lease_owner:
             return False
@@ -1311,6 +1412,8 @@ class CheckpointStore:
         run_id: str | None = None,
         lease_owner: str | None = None,
         lease_generation: int | None = None,
+        constraints: list[dict[str, Any]] | None = None,
+        reset_semantics: str = "unknown",
     ) -> QuotaReservationOutcome:
         """Atomically reserve a batch of quota items for ONE unique dispatch_id,
         BEFORE dispatch. Everything happens in ONE BEGIN IMMEDIATE transaction, so
@@ -1354,6 +1457,12 @@ class CheckpointStore:
         _validate_quota_binding(run_id, lease_owner, lease_generation)
         anchor_canon = _canonical_anchor(anchor_iso)
         limits_str = _limits_json(norm_limits)
+        # constraints are account-config, NOT derived from the per-call limits
+        # (the engine passes the complete canonical set); store-level default []
+        norm_constraints = _normalize_constraints(
+            constraints if constraints is not None else []
+        )
+        semantics = _validate_reset_semantics(reset_semantics)
         for attempt in range(_QUOTA_TX_ATTEMPTS):
             try:
                 return self._reserve_quota_batch_tx(
@@ -1361,6 +1470,7 @@ class CheckpointStore:
                     limits=norm_limits, limits_str=limits_str, now_iso=now_iso,
                     run_id=run_id, lease_owner=lease_owner,
                     lease_generation=lease_generation,
+                    constraints=norm_constraints, reset_semantics=semantics,
                 )
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
@@ -1376,7 +1486,8 @@ class CheckpointStore:
         self, dispatch_id: str, *, pool: str, items: list[dict[str, Any]],
         anchor_canon: str, limits: dict[tuple[str, str], int], limits_str: str,
         now_iso: str | None, run_id: str | None, lease_owner: str | None,
-        lease_generation: int | None,
+        lease_generation: int | None, constraints: list[dict[str, Any]],
+        reset_semantics: str,
     ) -> QuotaReservationOutcome:
         now = now_iso or self.now_iso()
         with self._lock:
@@ -1391,7 +1502,8 @@ class CheckpointStore:
                         "(stale worker / lost lease)"
                     )
                 periods = sorted({it["period"] for it in items})
-                policy_hash = _quota_policy_hash(anchor_canon, periods)
+                policy_hash = _quota_policy_hash(anchor_canon, periods, constraints,
+                                                 reset_semantics)
                 row = self._conn.execute(
                     "SELECT * FROM quota_reservations WHERE dispatch_id=?", (dispatch_id,)
                 ).fetchone()
@@ -1428,9 +1540,10 @@ class CheckpointStore:
                 if prow is None:
                     self._conn.execute(
                         "INSERT INTO quota_policies (pool, anchor_iso, periods_json, "
-                        "policy_hash, operator, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, NULL, ?, ?)",
-                        (pool, anchor_canon, json.dumps(periods), policy_hash, now, now),
+                        "constraints_json, reset_semantics, policy_hash, operator, "
+                        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                        (pool, anchor_canon, json.dumps(periods),
+                         json.dumps(constraints), reset_semantics, policy_hash, now, now),
                     )
                 elif prow["policy_hash"] != policy_hash:
                     raise CheckpointError(
@@ -1500,22 +1613,26 @@ class CheckpointStore:
         run_id: str | None = None,
         lease_owner: str | None = None,
         lease_generation: int | None = None,
+        now_iso: str | None = None,
     ) -> bool:
         """Atomically grant DISPATCH AUTHORIZATION for a reservation — exactly once.
-        One BEGIN IMMEDIATE transaction covers lease verification and the
-        reserved->dispatched transition, so concurrent callers serialize and only
-        the single winner (UPDATE rowcount == 1) receives True. Replays of an
-        already-dispatched reservation return False: they must NOT send another
-        physical request. The lease binding is all-or-none; when bound to a run,
-        both the reservation's recorded binding and the live run lease
-        (owner+generation) must match, so stale workers get False. Never touches
-        quota_usage (no refund, ever)."""
+        One BEGIN IMMEDIATE transaction covers: (a) lease-binding match — the
+        supplied binding (all-or-none, INCLUDING all-None) must equal the
+        reservation's stored binding, so a run-bound reservation can never be
+        authorized by an unbound caller and vice versa; (b) the live run lease
+        (owner + generation + present, unexpired expiry) when run-bound; (c) the
+        reserved->dispatched transition; and (d) ATOMIC revalidation that the
+        reservation still belongs to its original quota window and to the pool's
+        CURRENT persisted policy — a reservation rolled into a new window, or one
+        whose policy changed, must NOT authorize a request now. Only the single
+        winner (UPDATE rowcount == 1) receives True. Never touches quota_usage
+        (no refund, ever)."""
         _validate_quota_binding(run_id, lease_owner, lease_generation)
         for attempt in range(_QUOTA_TX_ATTEMPTS):
             try:
                 return self._mark_dispatched_tx(
                     dispatch_id, run_id=run_id, lease_owner=lease_owner,
-                    lease_generation=lease_generation,
+                    lease_generation=lease_generation, now_iso=now_iso,
                 )
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
@@ -1529,8 +1646,9 @@ class CheckpointStore:
 
     def _mark_dispatched_tx(
         self, dispatch_id: str, *, run_id: str | None, lease_owner: str | None,
-        lease_generation: int | None,
+        lease_generation: int | None, now_iso: str | None,
     ) -> bool:
+        now = now_iso or self.now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1541,16 +1659,37 @@ class CheckpointStore:
                 if row is None:
                     self._conn.commit()
                     return False
-                if run_id is not None:
-                    if (row["run_id"] != run_id or row["lease_owner"] != lease_owner
-                            or row["lease_generation"] is None
-                            or int(row["lease_generation"]) != int(lease_generation)):
-                        self._conn.commit()
-                        return False
-                    if not self._verify_lease_locked(run_id, lease_owner,
-                                                     lease_generation):
-                        self._conn.rollback()
-                        return False
+                # (a) supplied binding must EXACTLY match the stored binding,
+                # including the all-None case (unbound caller vs run-bound row)
+                if (row["run_id"] != run_id or row["lease_owner"] != lease_owner
+                        or (row["lease_generation"] is None) != (lease_generation is None)
+                        or (lease_generation is not None
+                            and int(row["lease_generation"]) != int(lease_generation))):
+                    self._conn.commit()
+                    return False
+                # (b) live run lease must be valid (present expiry + owner + gen)
+                if run_id is not None and not self._verify_lease_locked(
+                        run_id, lease_owner, lease_generation):
+                    self._conn.commit()
+                    return False
+                # (d) atomic window + current-policy revalidation at authorization
+                prow = self._conn.execute(
+                    "SELECT policy_hash FROM quota_policies WHERE pool=?",
+                    (row["pool"],),
+                ).fetchone()
+                if prow is None or prow["policy_hash"] != row["policy_hash"]:
+                    self._conn.commit()
+                    return False  # policy changed since the reservation
+                try:
+                    for it in json.loads(row["items_json"]):
+                        if quota_window_for(row["anchor_iso"], it["period"], now) \
+                                != it["window_start"]:
+                            self._conn.commit()
+                            return False  # rolled into a new window: no authorization
+                except CheckpointError:
+                    self._conn.commit()
+                    return False  # clock/anchor inconsistency: fail closed
+                # (c) single-winner state transition
                 cur = self._conn.execute(
                     "UPDATE quota_reservations SET status=? "
                     "WHERE dispatch_id=? AND status=?",
@@ -1564,8 +1703,8 @@ class CheckpointStore:
                 raise
 
     def quota_policy(self, pool: str) -> dict[str, Any] | None:
-        """The persisted canonical quota window policy of a pool (anchor, periods,
-        policy hash, operator), or None when no reservation was ever made."""
+        """The persisted canonical quota policy of a pool: anchor, periods,
+        complete constraints, reset semantics, policy hash, operator."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM quota_policies WHERE pool=?", (pool,)
@@ -1574,19 +1713,44 @@ class CheckpointStore:
             return None
         d = {k: row[k] for k in row.keys()}
         d["periods"] = json.loads(d.pop("periods_json"))
+        d["constraints"] = json.loads(d.pop("constraints_json"))
         return d
+
+    def policy_audit(self, pool: str) -> list[dict[str, Any]]:
+        """Audit trail of explicit policy migrations for a pool (transactional
+        with the change itself)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, pool, old_policy_hash, new_policy_hash, operator, "
+                "carried_json, at FROM quota_policy_audit WHERE pool=? ORDER BY id",
+                (pool,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            d["carried"] = json.loads(d.pop("carried_json"))
+            out.append(d)
+        return out
 
     def migrate_quota_policy(
         self, pool: str, *, anchor_iso: str, periods: list[str], operator: str,
-        now_iso: str | None = None,
+        constraints: list[dict[str, Any]] | None = None,
+        reset_semantics: str | None = None, now_iso: str | None = None,
     ) -> bool:
-        """EXPLICIT operator migration of a pool's canonical quota window policy.
-        Replaces the persisted anchor/periods (recording the operator id) and
-        returns True when the policy actually changed, False for a no-op.
-        quota_usage rows are NEVER touched: historical usage is retained and new
-        windows simply start empty. Without this explicit call, anchor/period
-        changes are rejected at reservation time (no silent reset of active usage).
-        Unknown reset semantics still fail closed upstream in the QuotaEngine."""
+        """EXPLICIT, TRANSACTIONAL, AUDITED migration of a pool's canonical quota
+        policy. One BEGIN IMMEDIATE transaction:
+        - validates the new anchor/periods/constraints/reset semantics;
+        - rejects UNSAFE migrations: a future anchor, or one that would move any
+          active window BACKWARD (new window < old window), is refused;
+        - PRESERVES EFFECTIVE ACTIVE USAGE: for every (kind, period), the usage of
+          the currently active old window is carried forward (added) into the new
+          active window. Usage is increment-only — historical rows are retained
+          and never decreased, and no usage is ever silently dropped;
+        - upserts the policy row (constraints + reset semantics + hash + operator)
+          and appends a quota_policy_audit row with the carried-usage summary.
+        Returns True when the policy changed, False for a no-op. Without this
+        explicit call, incompatible configurations are rejected at reservation
+        time across processes."""
         if not isinstance(pool, str) or not pool:
             raise CheckpointError("pool must be a non-empty string")
         if not isinstance(operator, str) or not operator:
@@ -1596,25 +1760,121 @@ class CheckpointStore:
         for p in norm_periods:
             if p not in _QUOTA_PERIODS:
                 raise CheckpointError(f"unknown quota period {p!r} — fail closed")
-        policy_hash = _quota_policy_hash(anchor_canon, norm_periods)
+        # constraints/semantics not given -> PRESERVE the persisted ones (a window
+        # migration must not silently change limit kinds/values or evidence level);
+        # pass them explicitly to change them (which then requires this migration).
         now = now_iso or self.now_iso()
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT policy_hash FROM quota_policies WHERE pool=?", (pool,)
-            ).fetchone()
-            if row is not None and row["policy_hash"] == policy_hash:
-                return False  # no-op
-            self._conn.execute(
-                "INSERT INTO quota_policies (pool, anchor_iso, periods_json, "
-                "policy_hash, operator, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(pool) DO UPDATE SET "
-                "anchor_iso=excluded.anchor_iso, periods_json=excluded.periods_json, "
-                "policy_hash=excluded.policy_hash, operator=excluded.operator, "
-                "updated_at=excluded.updated_at",
-                (pool, anchor_canon, json.dumps(norm_periods), policy_hash, operator,
-                 now, now),
-            )
-            return True
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._migrate_quota_policy_tx(
+                    pool, anchor_canon=anchor_canon, norm_periods=norm_periods,
+                    constraints=constraints, reset_semantics=reset_semantics,
+                    operator=operator, now=now,
+                )
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"policy migration transaction failed (SQLite contention): {exc}"
+                ) from exc
+        raise CheckpointError("policy migration failed after bounded retries")
+
+    def _migrate_quota_policy_tx(
+        self, pool: str, *, anchor_canon: str, norm_periods: list[str],
+        constraints: list[dict[str, Any]] | None, reset_semantics: str | None,
+        operator: str, now: str,
+    ) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM quota_policies WHERE pool=?", (pool,)
+                ).fetchone()
+                if row is not None:
+                    old_hash = row["policy_hash"]
+                    old_anchor = row["anchor_iso"]
+                    if constraints is None:
+                        norm_constraints = _normalize_constraints(
+                            json.loads(row["constraints_json"]))
+                    else:
+                        norm_constraints = _normalize_constraints(constraints)
+                    semantics = (_validate_reset_semantics(reset_semantics)
+                                 if reset_semantics is not None
+                                 else row["reset_semantics"])
+                else:
+                    old_hash = None
+                    old_anchor = None
+                    norm_constraints = _normalize_constraints(
+                        constraints if constraints is not None else [])
+                    semantics = _validate_reset_semantics(
+                        reset_semantics if reset_semantics is not None else "unknown")
+                new_hash = _quota_policy_hash(anchor_canon, norm_periods,
+                                              norm_constraints, semantics)
+                if row is not None:
+                    if old_hash == new_hash:
+                        self._conn.commit()
+                        return False  # no-op
+                    # carry the EFFECTIVE ACTIVE usage of old windows forward
+                    carried: list[dict[str, Any]] = []
+                    for period in norm_periods:
+                        old_window = quota_window_for(old_anchor, period, now)
+                        new_window = quota_window_for(anchor_canon, period, now)
+                        if new_window < old_window:
+                            raise CheckpointError(
+                                f"unsafe policy migration for pool {pool!r}: period "
+                                f"{period!r} would move the active window backward "
+                                f"({old_window} -> {new_window}) — rejected"
+                            )
+                        if new_window == old_window:
+                            continue  # same window: nothing to carry (no double count)
+                        for kind in _QUOTA_KINDS:
+                            urow = self._conn.execute(
+                                "SELECT used FROM quota_usage WHERE pool=? AND kind=? "
+                                "AND period=? AND window_start=?",
+                                (pool, kind, period, old_window),
+                            ).fetchone()
+                            used = int(urow["used"]) if urow is not None else 0
+                            if used > 0:
+                                self._conn.execute(
+                                    "INSERT INTO quota_usage (pool, kind, period, "
+                                    "window_start, used) VALUES (?, ?, ?, ?, ?) "
+                                    "ON CONFLICT(pool, kind, period, window_start) "
+                                    "DO UPDATE SET used = used + excluded.used",
+                                    (pool, kind, period, new_window, used),
+                                )
+                                carried.append({"kind": kind, "period": period,
+                                                "from": old_window, "to": new_window,
+                                                "used": used})
+                else:
+                    old_hash = None
+                    carried = []
+                self._conn.execute(
+                    "INSERT INTO quota_policies (pool, anchor_iso, periods_json, "
+                    "constraints_json, reset_semantics, policy_hash, operator, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(pool) DO UPDATE SET "
+                    "anchor_iso=excluded.anchor_iso, periods_json=excluded.periods_json, "
+                    "constraints_json=excluded.constraints_json, "
+                    "reset_semantics=excluded.reset_semantics, "
+                    "policy_hash=excluded.policy_hash, operator=excluded.operator, "
+                    "updated_at=excluded.updated_at",
+                    (pool, anchor_canon, json.dumps(norm_periods),
+                     json.dumps(norm_constraints), semantics, new_hash, operator,
+                     now, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO quota_policy_audit (pool, old_policy_hash, "
+                    "new_policy_hash, operator, carried_json, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pool, old_hash, new_hash, operator, json.dumps(carried), now),
+                )
+                self._conn.commit()
+                return True
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def quota_status(self, pool: str) -> list[dict[str, Any]]:
         """All usage rows of a pool (every historical window retained, never reset)."""

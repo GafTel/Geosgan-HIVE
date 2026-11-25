@@ -164,13 +164,14 @@ def _make_v5_db(path):
     conn.close()
 
 
-def test_schema_version_is_6_and_fresh_store_has_quota_tables(tmp_path):
-    assert SCHEMA_VERSION == 6
+def test_schema_version_is_7_and_fresh_store_has_quota_tables(tmp_path):
+    assert SCHEMA_VERSION == 7
     store = CheckpointStore(str(tmp_path / "fresh.db"))
     with store._lock:
         names = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert {"quota_reservations", "quota_usage"} <= names
+    assert {"quota_reservations", "quota_usage", "quota_policies",
+            "quota_policy_audit"} <= names
     store.close()
 
 
@@ -183,8 +184,9 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         names = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "6"
-    assert {"quota_reservations", "quota_usage"} <= names
+    assert v == "7"
+    assert {"quota_reservations", "quota_usage", "quota_policies",
+            "quota_policy_audit"} <= names
     cp = store.get("r5")
     assert cp is not None and cp.task == "task-text" and cp.physical_reserved == 3
     assert cp.state.value == "running"  # live lease preserved, NOT marked FAILED
@@ -198,11 +200,11 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
     store.close()
 
 
-def test_schema_above_v6_rejected(tmp_path):
+def test_schema_above_v7_rejected(tmp_path):
     path = str(tmp_path / "bad.db")
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '7')")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '8')")
     conn.commit()
     conn.close()
     with pytest.raises(CheckpointError, match="schema_version"):
@@ -554,7 +556,7 @@ def test_shared_account_pool_across_models(tmp_path):
 
 # ---- config changes never reset consumed quotas ----
 
-def test_config_limit_change_does_not_reset_used(tmp_path):
+def test_config_limit_change_requires_explicit_migration_and_keeps_used(tmp_path):
     db = str(tmp_path / "cfg.db")
     store = CheckpointStore(db, utcnow=lambda: NOW)
     reg1 = registry([free_profile(quotas=[{"pool": POOL_A, "max_requests": 5,
@@ -562,13 +564,17 @@ def test_config_limit_change_does_not_reset_used(tmp_path):
     eng1 = QuotaEngine(store, reg1, utcnow=lambda: NOW)
     for i in range(3):
         eng1.reserve_for_model(MODEL, f"d{i}", TokenEstimate(1, 1), now=NOW)
-    # operator edits config: same account fingerprint/pool, higher limit
+    # operator edits config: same account, higher limit -> incompatible policy,
+    # rejected across configurations until migrated explicitly
     reg2 = registry([free_profile(quotas=[{"pool": POOL_A, "max_requests": 100,
                                            "max_tokens": 10**9, "period": "day"}])])
     eng2 = QuotaEngine(store, reg2, utcnow=lambda: NOW)
+    with pytest.raises(CheckpointError, match="policy"):
+        eng2.reserve_for_model(MODEL, "d3", TokenEstimate(1, 1), now=NOW)
+    assert eng2.migrate_quota_policy(MODEL, anchor=ANCHOR, operator="op") is True
     st = eng2.quota_status(MODEL, now=NOW)
     assert st[("requests", "day")]["used"] == 3 and st[("requests", "day")]["limit"] == 100
-    eng2.reserve_for_model(MODEL, "d3", TokenEstimate(1, 1), now=NOW)  # allowed by new limit
+    eng2.reserve_for_model(MODEL, "d3", TokenEstimate(1, 1), now=NOW)  # allowed now
     assert eng2.quota_status(MODEL, now=NOW)[("requests", "day")]["used"] == 4
     store.close()
 
@@ -695,8 +701,11 @@ def test_crash_after_reservation_retains_it_without_refund(tmp_path):
     rows = {(r["kind"]): r["used"] for r in s2.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 150}  # no double count, no auto-refund
     # lifecycle can still complete exactly once; usage never decreases
-    assert s2.mark_dispatched("d-crash") is True
-    assert s2.mark_dispatched("d-crash") is False  # second caller gets NO authorization
+    assert s2.mark_dispatched("d-crash", run_id="crash", lease_owner="w",
+                              lease_generation=0, now_iso=now) is True
+    assert s2.mark_dispatched("d-crash", run_id="crash", lease_owner="w",
+                              lease_generation=0, now_iso=now) is False  # no re-authz
+    assert s2.mark_dispatched("d-crash", now_iso=now) is False  # unbound caller rejected
     rows = {(r["kind"]): r["used"] for r in s2.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 150}
     # a new dispatch still works against the retained usage
@@ -809,7 +818,7 @@ def test_concurrent_dispatch_authorization_single_winner(tmp_path):
     def worker(i):
         store = s1 if i % 2 == 0 else s2
         barrier.wait()
-        r = store.mark_dispatched("d1")
+        r = store.mark_dispatched("d1", now_iso=now)
         with lock:
             results.append(r)
 
@@ -829,26 +838,29 @@ def test_concurrent_dispatch_authorization_single_winner(tmp_path):
 def test_anchor_change_rejected_until_explicit_migration(tmp_path):
     store = CheckpointStore(str(tmp_path / "p.db"))
     now = NOW.isoformat(timespec="milliseconds")
-    anchor2 = (ANCHOR + timedelta(hours=1)).isoformat()  # past anchor, new window
+    now2 = (NOW + timedelta(hours=6)).isoformat(timespec="milliseconds")
+    anchor2 = (ANCHOR + timedelta(hours=1)).isoformat()  # forward-moving window
     kw = dict(pool=POOL_A, items=day_items(1), limits={("requests", "day"): 10},
               now_iso=now)
     assert store.reserve_quota_batch("d1", anchor_iso=ANCHOR.isoformat(),
                                      **kw) == QuotaReservationOutcome.CREATED
     pol = store.quota_policy(POOL_A)
-    assert pol is not None and pol["anchor_iso"].startswith("2026-01-14")
+    assert pol is not None and pol["anchor_iso"].startswith("2026-01-14T12")
     # changing the anchor without explicit migration is rejected (no silent reset)
     with pytest.raises(CheckpointError, match="policy"):
-        store.reserve_quota_batch("d2", anchor_iso=anchor2, **kw)
+        store.reserve_quota_batch("d2", anchor_iso=anchor2, **{**kw, "now_iso": now2})
     assert store.get_reservation("d2") is None
-    # explicit operator migration: allowed, usage rows are NEVER touched
+    # explicit operator migration: allowed, ACTIVE usage carried forward
     assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
-                                      operator="op-1") is True
+                                      operator="op-1", now_iso=now2) is True
     assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
-                                      operator="op-1") is False  # no-op
+                                      operator="op-1", now_iso=now2) is False  # no-op
+    rows = {r["window_start"]: r["used"] for r in store.quota_status(POOL_A)}
+    assert rows["2026-01-15T13:00:00.000+00:00"] == 1  # carried into the new window
+    assert rows["2026-01-15T12:00:00.000+00:00"] == 1  # history retained, never reset
     assert store.reserve_quota_batch("d2", anchor_iso=anchor2,
-                                     **kw) == QuotaReservationOutcome.CREATED
-    rows = store.quota_status(POOL_A)
-    assert len(rows) == 2  # old-window usage retained, new window separate
+                                     **{**kw, "now_iso": now2}
+                                     ) == QuotaReservationOutcome.CREATED
     assert store.quota_policy(POOL_A)["anchor_iso"].startswith("2026-01-14T13")
     assert store.quota_policy(POOL_A)["operator"] == "op-1"
     store.close()
@@ -960,7 +972,8 @@ def test_interrupted_migration_rolls_back_and_recovers(tmp_path, monkeypatch):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "6" and {"quota_reservations", "quota_usage", "quota_policies"} <= tables
+    assert v == "7" and {"quota_reservations", "quota_usage", "quota_policies",
+                         "quota_policy_audit"} <= tables
     assert store.get("r5") is not None
     store.close()
 
@@ -974,8 +987,248 @@ def test_usage_is_increment_only_across_operations(tmp_path):
               limits={("requests", "day"): 100}, now_iso=now)
     for i in range(5):
         assert store.reserve_quota_batch(f"d{i}", **kw) == QuotaReservationOutcome.CREATED
-    store.mark_dispatched("d0")
-    store.mark_dispatched("d0")  # rejected replay: no effect
+    store.mark_dispatched("d0", now_iso=now)
+    store.mark_dispatched("d0", now_iso=now)  # rejected replay: no effect
     used = [r["used"] for r in store.quota_status(POOL_A)]
     assert used == [5]  # monotonic, never decremented, no refund path
+    store.close()
+
+
+# ---- C3 residual: binding match incl. all-None (audit point 1) ----
+
+def test_run_bound_reservation_never_authorized_by_unbound_caller(tmp_path):
+    eng, store, _ = make_engine(tmp_path, [free_profile()])
+    store.create_run(run_id="r", owner="w1", task="t", agent="s", model=MODEL,
+                     root_task_id="root")
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW,
+                          run_id="r", lease_owner="w1", lease_generation=0)
+    assert store.mark_dispatched("d1", now_iso=NOW.isoformat(timespec="milliseconds")) is False
+    assert store.mark_dispatched("d1", run_id="r", lease_owner="w2", lease_generation=1,
+                                 now_iso=NOW.isoformat(timespec="milliseconds")) is False
+    assert store.mark_dispatched("d1", run_id="r", lease_owner="w1", lease_generation=0,
+                                 now_iso=NOW.isoformat(timespec="milliseconds")) is True
+    store.close()
+
+
+def test_unbound_reservation_rejects_bound_caller(tmp_path):
+    store = CheckpointStore(str(tmp_path / "u.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10}, now_iso=now)
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    assert store.mark_dispatched("d1", run_id="r", lease_owner="w", lease_generation=0,
+                                 now_iso=now) is False  # bound caller on unbound row
+    assert store.mark_dispatched("d1", now_iso=now) is True  # matching all-None binding
+    store.close()
+
+
+# ---- C3 residual: window + policy revalidation at authorization (point 2) ----
+
+def test_mark_dispatched_rejects_rolled_over_window(tmp_path):
+    store = CheckpointStore(str(tmp_path / "w.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    now_next = (NOW + timedelta(days=1)).isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10}, now_iso=now)
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    assert store.reserve_quota_batch("d2", **kw) == QuotaReservationOutcome.CREATED
+    # d1 in the same window -> authorized; d2 "dispatched" a day later -> NOT
+    assert store.mark_dispatched("d1", now_iso=now) is True
+    assert store.mark_dispatched("d2", now_iso=now_next) is False
+    assert store.get_reservation("d2")["status"] == "reserved"  # untouched
+    store.close()
+
+
+def test_mark_dispatched_rejects_after_policy_change(tmp_path):
+    eng, store, _ = make_engine(tmp_path, [free_profile()])
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    pol = store.quota_policy(POOL_A)
+    # explicit policy change (extra period, same constraints) -> audited migration
+    assert store.migrate_quota_policy(
+        POOL_A, anchor_iso=ANCHOR.isoformat(), periods=["day", "week"],
+        operator="op", constraints=pol["constraints"],
+        reset_semantics=pol["reset_semantics"]) is True
+    assert eng.mark_dispatched("d1", now=NOW) is False  # policy no longer current
+    store.close()
+
+
+# ---- C3 residual: safe, audited, usage-carrying migration (points 3, 5) ----
+
+def test_migration_preserves_effective_usage_for_enforcement(tmp_path):
+    store = CheckpointStore(str(tmp_path / "carry.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    now2 = (NOW + timedelta(hours=6)).isoformat(timespec="milliseconds")
+    anchor2 = (ANCHOR + timedelta(hours=1)).isoformat()
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 5}, now_iso=now)
+    for i in range(3):
+        assert store.reserve_quota_batch(f"d{i}", **kw) == QuotaReservationOutcome.CREATED
+    assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
+                                      operator="op", now_iso=now2) is True
+    kw2 = {**kw, "anchor_iso": anchor2, "now_iso": now2}
+    # carried usage still counts against the limit in the new window: 2 more OK, 3rd not
+    assert store.reserve_quota_batch("d3", **kw2) == QuotaReservationOutcome.CREATED
+    assert store.reserve_quota_batch("d4", **kw2) == QuotaReservationOutcome.CREATED
+    with pytest.raises(QuotaExhaustedError):
+        store.reserve_quota_batch("d5", **kw2)
+    rows = {r["window_start"]: r["used"] for r in store.quota_status(POOL_A)}
+    assert rows["2026-01-15T13:00:00.000+00:00"] == 5  # 3 carried + 2 new
+    assert rows["2026-01-15T12:00:00.000+00:00"] == 3  # history retained
+    store.close()
+
+
+def test_unsafe_migrations_rejected(tmp_path):
+    store = CheckpointStore(str(tmp_path / "unsafe.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    now2 = (NOW + timedelta(hours=6)).isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10}, now_iso=now)
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    # future anchor -> fail closed
+    with pytest.raises(CheckpointError):
+        store.migrate_quota_policy(POOL_A, anchor_iso=(NOW + timedelta(days=2)).isoformat(),
+                                   periods=["day"], operator="op", now_iso=now2)
+    # backward-moving active window -> unsafe, rejected
+    with pytest.raises(CheckpointError, match="unsafe"):
+        store.migrate_quota_policy(POOL_A, anchor_iso=(ANCHOR + timedelta(hours=1)).isoformat(),
+                                   periods=["day"], operator="op", now_iso=now)
+    assert store.quota_policy(POOL_A)["anchor_iso"].startswith("2026-01-14T12")
+    store.close()
+
+
+def test_migration_is_transactional_and_audited(tmp_path):
+    store = CheckpointStore(str(tmp_path / "audit.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    now2 = (NOW + timedelta(hours=6)).isoformat(timespec="milliseconds")
+    anchor2 = (ANCHOR + timedelta(hours=1)).isoformat()
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10}, now_iso=now)
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    old_hash = store.quota_policy(POOL_A)["policy_hash"]
+    assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
+                                      operator="op-9", now_iso=now2) is True
+    audit = store.policy_audit(POOL_A)
+    assert len(audit) == 1
+    assert audit[0]["operator"] == "op-9"
+    assert audit[0]["old_policy_hash"] == old_hash
+    assert audit[0]["new_policy_hash"] == store.quota_policy(POOL_A)["policy_hash"]
+    assert audit[0]["carried"] == [{"kind": "requests", "period": "day",
+                                    "from": "2026-01-15T12:00:00.000+00:00",
+                                    "to": "2026-01-15T13:00:00.000+00:00", "used": 1}]
+    store.close()
+
+
+# ---- C3 residual: complete canonical constraints persisted (point 4) ----
+
+def test_policy_persists_constraints_and_reset_semantics(tmp_path):
+    eng, store, _ = make_engine(tmp_path, [free_profile()])
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    pol = store.quota_policy(POOL_A)
+    assert pol["constraints"] == [
+        {"kind": "requests", "period": "day", "limit": 1500},
+        {"kind": "tokens", "period": "day", "limit": 1_000_000},
+    ]
+    assert pol["reset_semantics"] == "provider_documented"
+    store.close()
+
+
+def test_incompatible_config_rejected_across_connections(tmp_path):
+    db = str(tmp_path / "xproc.db")
+    s1 = CheckpointStore(db)
+    s2 = CheckpointStore(db)  # independent connection = "another process"
+    now = NOW.isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              now_iso=now)
+    assert s1.reserve_quota_batch(
+        "d1", limits={("requests", "day"): 10}, **kw) == QuotaReservationOutcome.CREATED
+    # a different canonical constraint set from another process is incompatible
+    with pytest.raises(CheckpointError, match="policy"):
+        s2.reserve_quota_batch(
+            "d2", limits={("requests", "day"): 20},
+            constraints=[{"kind": "requests", "period": "day", "limit": 20}], **kw)
+    assert s2.get_reservation("d2") is None
+    s1.close()
+    s2.close()
+
+
+# ---- C3 residual: dev-v6 databases handled explicitly (point 6) ----
+
+def test_dev_v6_database_migrates_to_v7_explicitly(tmp_path):
+    db = str(tmp_path / "dev6.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '6')")
+    # dev-v6 quota_policies WITHOUT constraints_json / reset_semantics columns
+    conn.execute(
+        "CREATE TABLE quota_policies (pool TEXT PRIMARY KEY, anchor_iso TEXT NOT NULL, "
+        "periods_json TEXT NOT NULL, policy_hash TEXT NOT NULL, operator TEXT, "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE quota_reservations (dispatch_id TEXT PRIMARY KEY, pool TEXT NOT NULL, "
+        "anchor_iso TEXT NOT NULL, items_json TEXT NOT NULL, limits_json TEXT NOT NULL, "
+        "policy_hash TEXT NOT NULL, run_id TEXT, lease_owner TEXT, lease_generation INTEGER, "
+        "status TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE quota_usage (pool TEXT NOT NULL, kind TEXT NOT NULL, "
+        "period TEXT NOT NULL, window_start TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (pool, kind, period, window_start))")
+    anchor_canon = "2026-01-14T12:00:00.000+00:00"
+    window = quota_window_for(anchor_canon, "day", NOW.isoformat(timespec="milliseconds"))
+    conn.execute("INSERT INTO quota_policies VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                 (POOL_A, anchor_canon, '["day"]', "deadbeef" * 8,
+                  NOW.isoformat(), NOW.isoformat()))
+    conn.execute("INSERT INTO quota_reservations VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                 ("d-old", POOL_A, anchor_canon,
+                  json.dumps([{"kind": "requests", "period": "day", "amount": 1,
+                               "window_start": window}]),
+                  json.dumps([{"kind": "requests", "period": "day", "limit": 10}]),
+                  "deadbeef" * 8, "reserved", NOW.isoformat()))
+    conn.execute("INSERT INTO quota_usage VALUES (?, 'requests', 'day', ?, 1)",
+                 (POOL_A, window))
+    conn.commit()
+    conn.close()
+    store = CheckpointStore(db, utcnow=lambda: NOW)  # triggers v6 -> v7
+    with store._lock:
+        v = store._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        cols = {r["name"] for r in store._conn.execute(
+            "PRAGMA table_info(quota_policies)").fetchall()}
+        tables = {r[0] for r in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert v == "7"
+    assert {"constraints_json", "reset_semantics"} <= cols
+    assert "quota_policy_audit" in tables
+    # stored rows preserved and hashes recomputed consistently
+    res = store.get_reservation("d-old")
+    pol = store.quota_policy(POOL_A)
+    assert res["policy_hash"] == pol["policy_hash"] != "deadbeef" * 8
+    assert store.quota_status(POOL_A)[0]["used"] == 1
+    # the old reservation can still be authorized in its own window
+    assert store.mark_dispatched("d-old", now_iso=NOW.isoformat(timespec="milliseconds")) is True
+    # and new reservations work on the migrated schema
+    now = NOW.isoformat(timespec="milliseconds")
+    assert store.reserve_quota_batch(
+        "d-new", pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+        limits={("requests", "day"): 10}, now_iso=now) == QuotaReservationOutcome.CREATED
+    store.close()
+
+
+# ---- C3 residual: missing lease expiry rejected (point 7) ----
+
+def test_missing_lease_expiry_rejects_run_bound_dispatch(tmp_path):
+    db = str(tmp_path / "nl.db")
+    eng, store, _ = make_engine(tmp_path, [free_profile()], name="nl.db")
+    store.create_run(run_id="r", owner="w1", task="t", agent="s", model=MODEL,
+                     root_task_id="root")
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW,
+                          run_id="r", lease_owner="w1", lease_generation=0)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE runs SET lease_expires_at=NULL WHERE run_id='r'")
+    conn.commit()
+    conn.close()
+    with pytest.raises(CheckpointError, match="fencing"):
+        eng.reserve_for_model(MODEL, "d2", TokenEstimate(1, 1), now=NOW,
+                              run_id="r", lease_owner="w1", lease_generation=0)
+    assert eng.mark_dispatched("d1", run_id="r", lease_owner="w1",
+                               lease_generation=0, now=NOW) is False
     store.close()
