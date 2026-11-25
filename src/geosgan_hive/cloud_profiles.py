@@ -52,6 +52,16 @@ class QuotaPeriod(StrEnum):
     MONTH = "month"
 
 
+class QuotaResetSemantics(StrEnum):
+    """Evidence level for provider quota-RESET behavior. UNKNOWN fails closed in
+    the QuotaEngine: an arbitrary window anchor alone is NOT evidence that the
+    provider resets quotas on that schedule — reset times are never invented."""
+
+    PROVIDER_DOCUMENTED = "provider_documented"
+    OPERATOR_ATTESTED = "operator_attested"
+    UNKNOWN = "unknown"
+
+
 class TokenEstimationMode(StrEnum):
     EXACT = "exact"
     BOUNDED_HEURISTIC = "bounded_heuristic"
@@ -157,6 +167,9 @@ class CloudProfile(BaseModel):
     #: explicit UTC anchor for quota period windows; REQUIRED for live zero-cost
     #: profiles — unknown reset semantics fail closed (never invented)
     quota_window_start: datetime | None = None
+    #: evidence level for the reset schedule itself; UNKNOWN (the default) makes
+    #: the QuotaEngine fail closed even when an anchor is configured
+    quota_reset_semantics: QuotaResetSemantics = QuotaResetSemantics.UNKNOWN
     quotas: tuple[QuotaSpec, ...] = Field(default_factory=tuple)
     enabled: bool = True
 

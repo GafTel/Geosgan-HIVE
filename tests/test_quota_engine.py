@@ -25,6 +25,7 @@ from geosgan_hive.checkpoints import (
     SCHEMA_VERSION,
     CheckpointStore,
     PersistMode,
+    QuotaReservationOutcome,
     quota_window_for,
 )
 from geosgan_hive.cloud_profiles import (
@@ -61,6 +62,7 @@ def free_profile(**overrides) -> dict:
         account_label="main",
         account_fingerprint=FP_A,
         quota_window_start=ANCHOR.isoformat(),
+        quota_reset_semantics="provider_documented",
         verification_evidence={
             "source": "provider_billing_console_export",
             "evidence_ref": "ev-2026-01-14",
@@ -192,7 +194,7 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
     ok = store.reserve_quota_batch(
         "d-mig", pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
         limits={("requests", "day"): 10}, now_iso=NOW.isoformat(timespec="milliseconds"))
-    assert ok is True
+    assert ok == QuotaReservationOutcome.CREATED
     store.close()
 
 
@@ -220,7 +222,8 @@ def test_reservation_persists_across_connections(tmp_path):
     s2 = CheckpointStore(db)
     res = s2.get_reservation("d1")
     assert res is not None and res["status"] == "reserved"
-    assert res["items"] == [{"kind": "requests", "period": "day", "amount": 1}]
+    assert res["items"][0]["kind"] == "requests" and res["items"][0]["amount"] == 1
+    assert "window_start" in res["items"][0] and res["policy_hash"]
     rows = s2.quota_status(POOL_A)
     assert len(rows) == 1 and rows[0]["used"] == 1 and rows[0]["kind"] == "requests"
     s2.close()
@@ -286,8 +289,9 @@ def test_duplicate_dispatch_id_idempotent_not_double_counted(tmp_path):
     store = CheckpointStore(str(tmp_path / "d.db"))
     kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
               limits={("requests", "day"): 10}, now_iso=NOW.isoformat(timespec="milliseconds"))
-    assert store.reserve_quota_batch("d1", **kw) is True
-    assert store.reserve_quota_batch("d1", **kw) is True  # idempotent replay
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    # idempotent replay: reconciles WITHOUT granting new dispatch authorization
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.REPLAYED
     rows = store.quota_status(POOL_A)
     assert rows[0]["used"] == 1  # never double-counted
     store.close()
@@ -298,7 +302,8 @@ def test_conflicting_duplicate_dispatch_id_rejected(tmp_path):
     now = NOW.isoformat(timespec="milliseconds")
     assert store.reserve_quota_batch(
         "d1", pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
-        limits={("requests", "day"): 10}, now_iso=now) is True
+        limits={("requests", "day"): 10},
+        now_iso=now) == QuotaReservationOutcome.CREATED
     with pytest.raises(CheckpointError, match="conflicting duplicate"):
         store.reserve_quota_batch(
             "d1", pool=POOL_A, items=day_items(5), anchor_iso=ANCHOR.isoformat(),
@@ -360,7 +365,7 @@ def test_duplicate_items_same_amount_deduped(tmp_path):
         "d1", pool=POOL_A, items=day_items(1) + day_items(1),
         anchor_iso=ANCHOR.isoformat(), limits={("requests", "day"): 10},
         now_iso=NOW.isoformat(timespec="milliseconds"))
-    assert ok is True
+    assert ok == QuotaReservationOutcome.CREATED
     assert store.quota_status(POOL_A)[0]["used"] == 1  # deduped, not 2
     store.close()
 
@@ -475,8 +480,8 @@ def test_mark_dispatched_lifecycle_idempotent_no_refund(tmp_path):
     eng, store, _ = make_engine(tmp_path, [free_profile()])
     eng.reserve_for_model(MODEL, "d1", TokenEstimate(10, 20), now=NOW)
     assert eng.mark_dispatched("nope") is False
-    assert eng.mark_dispatched("d1") is True
-    assert eng.mark_dispatched("d1") is True  # idempotent
+    assert eng.mark_dispatched("d1") is True  # exactly one caller gets authorization
+    assert eng.mark_dispatched("d1") is False  # replay NEVER re-authorizes a dispatch
     assert store.get_reservation("d1")["status"] == "dispatched"
     rows = {(r["kind"]): r["used"] for r in store.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 30}  # never refunded/decremented
@@ -585,9 +590,9 @@ def test_concurrent_reservations_exact_under_contention(tmp_path):
         store = s1 if i % 2 == 0 else s2
         barrier.wait()
         try:
-            ok = store.reserve_quota_batch(f"d{i}", pool=POOL_A, items=day_items(1),
-                                           anchor_iso=anchor, limits=limits, now_iso=now)
-            outcome = "ok" if ok else "fenced"
+            res = store.reserve_quota_batch(f"d{i}", pool=POOL_A, items=day_items(1),
+                                            anchor_iso=anchor, limits=limits, now_iso=now)
+            outcome = res.value
         except QuotaExhaustedError:
             outcome = "exhausted"
         with lock:
@@ -598,7 +603,7 @@ def test_concurrent_reservations_exact_under_contention(tmp_path):
         t.start()
     for t in threads:
         t.join()
-    assert outcomes.count("ok") == 20
+    assert outcomes.count("created") == 20
     assert outcomes.count("exhausted") == 10
     assert s1.quota_status(POOL_A)[0]["used"] == 20  # exact, never over-counted
     assert len([r for r in s1.list_runs()]) == 0
@@ -622,9 +627,9 @@ def test_concurrent_token_reservations_exact(tmp_path):
         store = s1 if i % 2 == 0 else s2
         barrier.wait()
         try:
-            store.reserve_quota_batch(f"t{i}", pool=POOL_A, items=items,
-                                      anchor_iso=anchor, limits=limits, now_iso=now)
-            outcome = "ok"
+            res = store.reserve_quota_batch(f"t{i}", pool=POOL_A, items=items,
+                                            anchor_iso=anchor, limits=limits, now_iso=now)
+            outcome = res.value
         except QuotaExhaustedError:
             outcome = "exhausted"
         with lock:
@@ -635,7 +640,7 @@ def test_concurrent_token_reservations_exact(tmp_path):
         t.start()
     for t in threads:
         t.join()
-    assert outcomes.count("ok") == 6  # 6*150=900 <= 1000, 7th would exceed
+    assert outcomes.count("created") == 6  # 6*150=900 <= 1000, 7th would exceed
     assert s1.quota_status(POOL_A)[0]["used"] == 900
     s1.close()
     s2.close()
@@ -652,13 +657,13 @@ db, anchor, now = sys.argv[1], sys.argv[2], sys.argv[3]
 store = CheckpointStore(db, persist_mode=PersistMode.RESUMABLE, lease_ttl_seconds=60.0)
 store.create_run(run_id="crash", owner="w", task="t", agent="s", model="m",
                  root_task_id="r")
-ok = store.reserve_quota_batch(
+res = store.reserve_quota_batch(
     "d-crash", pool="gemini:acct:" + "a" * 64,
     items=[{"kind": "requests", "period": "day", "amount": 1},
            {"kind": "tokens", "period": "day", "amount": 150}],
     anchor_iso=anchor, limits={("requests", "day"): 10, ("tokens", "day"): 1000},
     now_iso=now, run_id="crash", lease_owner="w", lease_generation=0)
-assert ok, "reservation must succeed before the crash"
+assert res.value == "created", "reservation must succeed before the crash"
 os._exit(9)  # hard crash AFTER the durable reservation, BEFORE any dispatch
 """
 
@@ -678,23 +683,26 @@ def test_crash_after_reservation_retains_it_without_refund(tmp_path):
     assert res["run_id"] == "crash" and res["lease_owner"] == "w"
     rows = {(r["kind"]): r["used"] for r in s2.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 150}  # conservatively retained
-    # reconciliation: same dispatch_id is idempotent, never double-counted
+    # reconciliation: same dispatch_id replays idempotently (no new authorization),
+    # never double-counted
     assert s2.reserve_quota_batch(
         "d-crash", pool=POOL_A,
         items=[{"kind": "requests", "period": "day", "amount": 1},
                {"kind": "tokens", "period": "day", "amount": 150}],
         anchor_iso=anchor, limits={("requests", "day"): 10, ("tokens", "day"): 1000},
-        now_iso=now, run_id="crash", lease_owner="w", lease_generation=0) is True
+        now_iso=now, run_id="crash", lease_owner="w", lease_generation=0
+    ) == QuotaReservationOutcome.REPLAYED
     rows = {(r["kind"]): r["used"] for r in s2.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 150}  # no double count, no auto-refund
-    # lifecycle can still complete; usage never decreases
+    # lifecycle can still complete exactly once; usage never decreases
     assert s2.mark_dispatched("d-crash") is True
+    assert s2.mark_dispatched("d-crash") is False  # second caller gets NO authorization
     rows = {(r["kind"]): r["used"] for r in s2.quota_status(POOL_A)}
     assert rows == {"requests": 1, "tokens": 150}
     # a new dispatch still works against the retained usage
     assert s2.reserve_quota_batch(
         "d-next", pool=POOL_A, items=day_items(1), anchor_iso=anchor,
-        limits={("requests", "day"): 10}, now_iso=now) is True
+        limits={("requests", "day"): 10}, now_iso=now) == QuotaReservationOutcome.CREATED
     assert [r for r in s2.quota_status(POOL_A) if r["kind"] == "requests"][0]["used"] == 2
     s2.close()
 
@@ -709,5 +717,265 @@ def test_reservation_json_is_stored_safely(tmp_path):
         raw = store._conn.execute(
             "SELECT items_json FROM quota_reservations WHERE dispatch_id='d1'"
         ).fetchone()[0]
-    assert json.loads(raw) == [{"kind": "requests", "period": "day", "amount": 2}]
+    stored = json.loads(raw)
+    assert stored[0]["kind"] == "requests" and stored[0]["amount"] == 2
+    assert "window_start" in stored[0]  # reservations are bound to actual windows
+    store.close()
+
+
+# ---- C3 hardening: complete lease binding (audit point 1) ----
+
+@pytest.mark.parametrize("kw", [
+    dict(run_id="r"),                                             # run without owner
+    dict(run_id="r", lease_owner="w"),                            # missing generation
+    dict(run_id="r", lease_generation=0),                         # missing owner
+    dict(lease_owner="w"),                                        # owner without run
+    dict(lease_owner="w", lease_generation=0),                    # owner without run
+    dict(lease_generation=0),                                     # generation alone
+    dict(run_id="r", lease_owner="w", lease_generation=-1),       # negative generation
+    dict(run_id="r", lease_owner="w", lease_generation=True),     # bool generation
+    dict(run_id="", lease_owner="w", lease_generation=0),         # empty run id
+])
+def test_partial_or_malformed_lease_binding_rejected(tmp_path, kw):
+    store = CheckpointStore(str(tmp_path / "b.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    with pytest.raises(CheckpointError, match="binding|generation|run_id"):
+        store.reserve_quota_batch("d1", pool=POOL_A, items=day_items(1),
+                                  anchor_iso=ANCHOR.isoformat(),
+                                  limits={("requests", "day"): 10}, now_iso=now, **kw)
+    with pytest.raises(CheckpointError):
+        store.mark_dispatched("d1", **kw)
+    assert store.quota_status(POOL_A) == []
+    store.close()
+
+
+def test_stale_worker_rejected_on_identical_replay(tmp_path):
+    """Audit point 4: lease ownership is validated on DUPLICATE paths too."""
+    db = str(tmp_path / "s.db")
+    eng, store, _ = make_engine(tmp_path, [free_profile()], name="s.db")
+    store.create_run(run_id="r", owner="w1", task="t", agent="s", model=MODEL,
+                     root_task_id="root")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10},
+              now_iso=NOW.isoformat(timespec="milliseconds"),
+              run_id="r", lease_owner="w1", lease_generation=0)
+    assert store.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    # lease takeover by w2
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE runs SET lease_owner='w2', lease_generation=1, "
+                 "lease_expires_at='2999-01-01T00:00:00.000+00:00' WHERE run_id='r'")
+    conn.commit()
+    conn.close()
+    # identical replay by the STALE worker must be rejected, not silently accepted
+    with pytest.raises(CheckpointError, match="fencing"):
+        store.reserve_quota_batch("d1", **kw)
+    # a replay with a DIFFERENT binding is a conflicting duplicate, not a reconciliation
+    kw2 = {**kw, "lease_owner": "w2", "lease_generation": 1}
+    with pytest.raises(CheckpointError, match="conflicting duplicate"):
+        store.reserve_quota_batch("d1", **kw2)
+    assert store.quota_status(POOL_A)[0]["used"] == 1
+    assert store.get_reservation("d1")["status"] == "reserved"  # readable, unchanged
+    store.close()
+
+
+# ---- C3 hardening: replay never authorizes a new dispatch (audit point 2) ----
+
+def test_engine_replay_of_used_dispatch_id_never_authorizes(tmp_path):
+    eng, store, _ = make_engine(tmp_path, [free_profile()])
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    with pytest.raises(CheckpointError, match="never authorizes"):
+        eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    eng.mark_dispatched("d1")
+    # even after dispatch, a replay of the same id is rejected by the engine
+    with pytest.raises(CheckpointError, match="never authorizes"):
+        eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    assert store.quota_status(POOL_A)[0]["used"] == 1  # still no double count
+    store.close()
+
+
+def test_concurrent_dispatch_authorization_single_winner(tmp_path):
+    """Audit point 3: exactly one caller may obtain dispatch authorization."""
+    db = str(tmp_path / "mw.db")
+    s1 = CheckpointStore(db)
+    s2 = CheckpointStore(db)
+    now = NOW.isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 10}, now_iso=now)
+    assert s1.reserve_quota_batch("d1", **kw) == QuotaReservationOutcome.CREATED
+    results = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker(i):
+        store = s1 if i % 2 == 0 else s2
+        barrier.wait()
+        r = store.mark_dispatched("d1")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(True) == 1  # single winner only
+    assert s1.get_reservation("d1")["status"] == "dispatched"
+    s1.close()
+    s2.close()
+
+
+# ---- C3 hardening: persisted policy identity + safe migration (points 5, 6) ----
+
+def test_anchor_change_rejected_until_explicit_migration(tmp_path):
+    store = CheckpointStore(str(tmp_path / "p.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    anchor2 = (ANCHOR + timedelta(hours=1)).isoformat()  # past anchor, new window
+    kw = dict(pool=POOL_A, items=day_items(1), limits={("requests", "day"): 10},
+              now_iso=now)
+    assert store.reserve_quota_batch("d1", anchor_iso=ANCHOR.isoformat(),
+                                     **kw) == QuotaReservationOutcome.CREATED
+    pol = store.quota_policy(POOL_A)
+    assert pol is not None and pol["anchor_iso"].startswith("2026-01-14")
+    # changing the anchor without explicit migration is rejected (no silent reset)
+    with pytest.raises(CheckpointError, match="policy"):
+        store.reserve_quota_batch("d2", anchor_iso=anchor2, **kw)
+    assert store.get_reservation("d2") is None
+    # explicit operator migration: allowed, usage rows are NEVER touched
+    assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
+                                      operator="op-1") is True
+    assert store.migrate_quota_policy(POOL_A, anchor_iso=anchor2, periods=["day"],
+                                      operator="op-1") is False  # no-op
+    assert store.reserve_quota_batch("d2", anchor_iso=anchor2,
+                                     **kw) == QuotaReservationOutcome.CREATED
+    rows = store.quota_status(POOL_A)
+    assert len(rows) == 2  # old-window usage retained, new window separate
+    assert store.quota_policy(POOL_A)["anchor_iso"].startswith("2026-01-14T13")
+    assert store.quota_policy(POOL_A)["operator"] == "op-1"
+    store.close()
+
+
+def test_replay_conflicting_across_window_limit_or_policy_rejected(tmp_path):
+    store = CheckpointStore(str(tmp_path / "c.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    now_next_day = (NOW + timedelta(days=1)).isoformat(timespec="milliseconds")
+    base = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+                now_iso=now)
+    assert store.reserve_quota_batch("d1", limits={("requests", "day"): 10},
+                                     **base) == QuotaReservationOutcome.CREATED
+    # same id, later window -> conflicting replay across windows
+    with pytest.raises(CheckpointError, match="conflicting duplicate"):
+        store.reserve_quota_batch("d1", limits={("requests", "day"): 10},
+                                  **{**base, "now_iso": now_next_day})
+    # same id, different limits -> conflicting replay across limits
+    with pytest.raises(CheckpointError, match="conflicting duplicate"):
+        store.reserve_quota_batch("d1", limits={("requests", "day"): 99}, **base)
+    # same id, different anchor (policy) -> conflicting replay across policies
+    with pytest.raises(CheckpointError):
+        store.reserve_quota_batch(
+            "d1", limits={("requests", "day"): 10},
+            **{**base, "anchor_iso": (ANCHOR + timedelta(days=3)).isoformat()})
+    assert store.quota_status(POOL_A)[0]["used"] == 1
+    store.close()
+
+
+def test_reservation_carries_policy_hash_and_windows(tmp_path):
+    eng, store, _ = make_engine(tmp_path, [free_profile()])
+    eng.reserve_for_model(MODEL, "d1", TokenEstimate(5, 5), now=NOW)
+    res = store.get_reservation("d1")
+    assert res["policy_hash"] and len(res["policy_hash"]) == 64
+    assert res["items"][0]["window_start"] == quota_window_for(
+        ANCHOR.isoformat(), "day", NOW.isoformat(timespec="milliseconds"))
+    store.close()
+
+
+# ---- C3 hardening: unknown reset semantics fail closed (point 7) ----
+
+def test_engine_fail_closed_on_unknown_reset_semantics(tmp_path):
+    prof = free_profile(quota_reset_semantics="unknown")  # anchor alone is not evidence
+    eng, store, _ = make_engine(tmp_path, [prof])
+    with pytest.raises(CloudConfigError, match="reset semantics"):
+        eng.reserve_for_model(MODEL, "d1", TokenEstimate(1, 1), now=NOW)
+    assert store.quota_status(POOL_A) == []
+    store.close()
+
+
+# ---- C3 hardening: SQLite integer bounds, zero requests (point 8) ----
+
+@pytest.mark.parametrize("bad_amount", [2**63, 2**63 - 1 + 1, -(2**63)])
+def test_overflow_amounts_rejected(tmp_path, bad_amount):
+    store = CheckpointStore(str(tmp_path / "o.db"))
+    with pytest.raises(CheckpointError, match="rejected|int64|overflow|bounds"):
+        store.reserve_quota_batch(
+            "d1", pool=POOL_A,
+            items=[{"kind": "tokens", "period": "day", "amount": bad_amount}],
+            anchor_iso=ANCHOR.isoformat(), limits={("tokens", "day"): 2**63 - 1},
+            now_iso=NOW.isoformat(timespec="milliseconds"))
+    store.close()
+
+
+def test_zero_request_reservation_and_overflow_limit_rejected(tmp_path):
+    store = CheckpointStore(str(tmp_path / "z.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    with pytest.raises(CheckpointError, match="zero|at least 1"):
+        store.reserve_quota_batch(
+            "d1", pool=POOL_A,
+            items=[{"kind": "requests", "period": "day", "amount": 0}],
+            anchor_iso=ANCHOR.isoformat(), limits={("requests", "day"): 10}, now_iso=now)
+    with pytest.raises(CheckpointError, match="int64|overflow|bounds"):
+        store.reserve_quota_batch(
+            "d1", pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+            limits={("requests", "day"): 2**63}, now_iso=now)
+    assert store.quota_status(POOL_A) == []
+    store.close()
+
+
+# ---- C3 hardening: atomic, recoverable migrations (point 9) ----
+
+def test_interrupted_migration_rolls_back_and_recovers(tmp_path, monkeypatch):
+    from geosgan_hive.checkpoints import _QUOTA_SCHEMA, _exec_schema
+
+    db = str(tmp_path / "int.db")
+    _make_v5_db(db)
+    orig = CheckpointStore._migrate_5_to_6
+
+    def boom(self):
+        _exec_schema(self._conn, _QUOTA_SCHEMA)  # partial work, then "crash"
+        raise RuntimeError("interrupted mid-migration")
+
+    monkeypatch.setattr(CheckpointStore, "_migrate_5_to_6", boom)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        CheckpointStore(db)
+    # the whole migration transaction rolled back: still v5, no quota tables
+    conn = sqlite3.connect(db)
+    v = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    conn.close()
+    assert v == "5" and "quota_reservations" not in tables and "quota_usage" not in tables
+    # reopening without the fault migrates cleanly (recoverable)
+    monkeypatch.setattr(CheckpointStore, "_migrate_5_to_6", orig)
+    store = CheckpointStore(db)
+    with store._lock:
+        v = store._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        tables = {r[0] for r in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert v == "6" and {"quota_reservations", "quota_usage", "quota_policies"} <= tables
+    assert store.get("r5") is not None
+    store.close()
+
+
+# ---- C3 hardening: increment-only accounting (point 10) ----
+
+def test_usage_is_increment_only_across_operations(tmp_path):
+    store = CheckpointStore(str(tmp_path / "mono.db"))
+    now = NOW.isoformat(timespec="milliseconds")
+    kw = dict(pool=POOL_A, items=day_items(1), anchor_iso=ANCHOR.isoformat(),
+              limits={("requests", "day"): 100}, now_iso=now)
+    for i in range(5):
+        assert store.reserve_quota_batch(f"d{i}", **kw) == QuotaReservationOutcome.CREATED
+    store.mark_dispatched("d0")
+    store.mark_dispatched("d0")  # rejected replay: no effect
+    used = [r["used"] for r in store.quota_status(POOL_A)]
+    assert used == [5]  # monotonic, never decremented, no refund path
     store.close()

@@ -24,6 +24,7 @@ from .checkpoints import (
     CheckpointStore,
     ExecutionState,
     PersistMode,
+    QuotaReservationOutcome,
     RunCheckpoint,
 )
 from .cloud_profiles import (
@@ -34,6 +35,7 @@ from .cloud_profiles import (
     CloudProviderAdapter,
     FakeCloudAdapter,
     QuotaPeriod,
+    QuotaResetSemantics,
     QuotaSpec,
     TokenEstimate,
     TokenEstimationMode,
@@ -144,6 +146,8 @@ __all__ = [
     "QuotaEngine",
     "QuotaPeriod",
     "QuotaReservation",
+    "QuotaReservationOutcome",
+    "QuotaResetSemantics",
     "QuotaSpec",
     "TokenEstimate",
     "bounded_token_estimate",

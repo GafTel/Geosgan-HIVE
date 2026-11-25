@@ -33,8 +33,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .checkpoints import CheckpointStore, quota_window_for
-from .cloud_profiles import CloudProfileRegistry, TokenEstimate
+from .checkpoints import (
+    CheckpointStore,
+    QuotaReservationOutcome,
+    quota_window_for,
+)
+from .cloud_profiles import (
+    CloudProfileRegistry,
+    QuotaResetSemantics,
+    TokenEstimate,
+)
 from .errors import CheckpointError, CloudConfigError, CostUnknownError
 
 
@@ -104,6 +112,12 @@ class QuotaEngine:
                 f"quota_window_start {anchor.isoformat()} is in the future relative "
                 f"to now {now.isoformat()} — fail closed"
             )
+        if profile.quota_reset_semantics == QuotaResetSemantics.UNKNOWN:
+            raise CloudConfigError(
+                f"unknown quota reset semantics for {model!r} — an arbitrary anchor "
+                "alone is not evidence of provider reset behavior; fail closed "
+                "(reset times are never invented)"
+            )
         return profile, next(iter(pools)), anchor, quotas
 
     def reserve_for_model(
@@ -154,7 +168,7 @@ class QuotaEngine:
                 items.append({"kind": "tokens", "period": q.period.value,
                               "amount": total_tokens})
                 limits[("tokens", q.period.value)] = q.max_tokens
-        ok = self._store.reserve_quota_batch(
+        outcome = self._store.reserve_quota_batch(
             dispatch_id,
             pool=pool,
             items=items,
@@ -165,10 +179,11 @@ class QuotaEngine:
             lease_owner=lease_owner,
             lease_generation=lease_generation,
         )
-        if not ok:
+        if outcome == QuotaReservationOutcome.REPLAYED:
             raise CheckpointError(
-                f"lease fencing rejected quota reservation {dispatch_id!r} "
-                "(stale worker / lost lease)"
+                f"dispatch_id {dispatch_id!r} is already reserved — a replay never "
+                "authorizes a new physical dispatch; inspect reservation() and use "
+                "mark_dispatched (granted at most once)"
             )
         return QuotaReservation(
             dispatch_id=dispatch_id, pool=pool, items=tuple(items),
@@ -183,12 +198,32 @@ class QuotaEngine:
         lease_owner: str | None = None,
         lease_generation: int | None = None,
     ) -> bool:
-        """Mark a reserved dispatch as dispatched (fenced; idempotent; never
-        refunds usage)."""
+        """Grant dispatch authorization for a reservation — True for exactly ONE
+        caller (atomic BEGIN IMMEDIATE); replays and stale workers get False and
+        must not send another physical request. Never refunds usage."""
         return self._store.mark_dispatched(
             dispatch_id, run_id=run_id, lease_owner=lease_owner,
             lease_generation=lease_generation,
         )
+
+    def migrate_quota_policy(
+        self, model: str, *, anchor: datetime, operator: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Explicit operator migration of the model's account quota window policy.
+        Usage rows are never touched (historical windows retained)."""
+        n = self._now(now)
+        _profile, pool, _anchor, quotas = self._resolve(model, n)
+        periods = sorted({q.period.value for q in quotas})
+        return self._store.migrate_quota_policy(
+            pool, anchor_iso=anchor.isoformat(), periods=periods, operator=operator,
+        )
+
+    def quota_policy(self, model: str, *, now: datetime | None = None
+                     ) -> dict[str, Any] | None:
+        n = self._now(now)
+        _profile, pool, _anchor, _quotas = self._resolve(model, n)
+        return self._store.quota_policy(pool)
 
     def reservation(self, dispatch_id: str) -> dict[str, Any] | None:
         return self._store.get_reservation(dispatch_id)
