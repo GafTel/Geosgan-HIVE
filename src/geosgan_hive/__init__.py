@@ -29,6 +29,7 @@ from .agents import (
     parse_delegation_call,
     parse_tool_call,
 )
+from .api_adapters import register_api_tools
 from .catalog import (
     BillingClassification,
     CatalogModel,
@@ -187,6 +188,7 @@ __all__ = [
     "catalog_from_dict",
     "load_catalog",
     "ApiSession",
+    "register_api_tools",
     "EndpointRule",
     "HttpLimits",
     "HttpResult",
