@@ -40,8 +40,8 @@ from geosgan_hive.usage import UsageTracker
 NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 ANCHOR = datetime(2026, 1, 14, 12, 0, 0, tzinfo=UTC)
 FP_A = "a" * 64
-POOL_A = "gemini:acct:" + FP_A
-M1 = "gemini/gemini-2.0-flash"
+POOL_A = "ollama:acct:" + FP_A
+M1 = "ollama/llama3.2"
 
 
 class ExactAdapter:
@@ -66,20 +66,20 @@ class ExactAdapter:
         raise RuntimeError("offline")
 
 
-def evidence(fp=FP_A, enforcement="provider_hard_limit", **kw):
+def evidence(fp=FP_A, enforcement="local_inference", **kw):
     base = dict(source="provider_billing_console_export", evidence_ref="ev-1",
                 collected_at=(NOW - timedelta(days=1)).isoformat(),
                 collected_by="operator-1", credential_bound=True, account_fingerprint=fp,
-                billing_enforcement=enforcement)
+                billing_enforcement=enforcement, endpoint="http://localhost:11434")
     base.update(kw)
     return base
 
 
 def free_profile(model=M1, fp=FP_A, enforcement="provider_hard_limit", max_requests=100,
                  **overrides):
-    pool = "gemini:acct:" + fp
+    pool = "ollama:acct:" + fp
     base = dict(
-        provider="gemini", models=[model], billing="free_tier_verified",
+        provider="ollama", models=[model], billing="free_tier_verified",
         verified_free=True, overage_billing_disabled=True, billing_verified=True,
         verified_at=(NOW - timedelta(days=1)).isoformat(), account_label="main",
         account_fingerprint=fp, quota_window_start=ANCHOR.isoformat(),
@@ -175,8 +175,18 @@ def test_billing_enforcement_unknown_denies_despite_trusted_flag(tmp_path):
 def test_enforcement_categories(tmp_path, enforcement, cred_bound, expected_ok):
     prof = free_profile(enforcement=enforcement)
     prof["verification_evidence"]["credential_bound"] = cred_bound
+    model = M1
+    if enforcement == "local_inference":
+        # local-inference claims are only valid for local (ollama) providers:
+        # use a cloud provider to prove the denial (the v0.7.0 release gate
+        # denies non-local providers in zero-cost mode anyway)
+        prof["provider"] = "mistral"
+        prof["models"] = ["mistral/m"]
+        prof["quotas"][0]["pool"] = "mistral:acct:" + FP_A
+        prof["verification_evidence"]["endpoint"] = "https://api.mistral.ai/v1"
+        model = "mistral/m"
     gate, store = make_gate(tmp_path, [prof])
-    ok, _reason = gate.registry.live_dispatch_eligible(M1, now=NOW)
+    ok, _reason = gate.registry.live_dispatch_eligible(model, now=NOW)
     assert ok is expected_ok
     store.close()
 
@@ -211,13 +221,16 @@ def test_substitution_after_reservation_rejected(tmp_path):
     did = gate.prepare_dispatch(M1, dict(base))
     for changed in (
         _kw(messages=[Message("user", "CHANGED").to_openai()]),  # payload
-        _kw(model="gemini/other-model"),                          # model/routing
+        _kw(model="ollama/other-model"),                          # model/routing
         _kw(max_tokens=999),                                      # token bound
-        _kw(api_base="https://evil.example"),                     # endpoint routing
         _kw(temperature=0.9),                                     # any semantic param
     ):
         with pytest.raises(CheckpointError, match="authorization denied"):
             gate.finalize_dispatch(M1, did, kwargs=changed)
+    # endpoint substitution is rejected even earlier, at evidence binding
+    from geosgan_hive.errors import CloudConfigError
+    with pytest.raises(CloudConfigError, match="endpoint"):
+        gate.finalize_dispatch(M1, did, kwargs=_kw(api_base="https://evil.example"))
     gate.finalize_dispatch(M1, did, kwargs=base)  # original payload still fine
     store.close()
 
@@ -244,7 +257,7 @@ def test_reservation_cannot_be_replayed_or_transferred(tmp_path):
     assert store.mark_dispatched(did, now_iso=NOW.isoformat(timespec="milliseconds")) is False
     # transfer to another pool/model is a conflicting duplicate
     with pytest.raises(CheckpointError):
-        store.reserve_quota_batch(did, pool="gemini:acct:" + "b" * 64,
+        store.reserve_quota_batch(did, pool="ollama:acct:" + "b" * 64,
                                   items=[{"kind": "requests", "period": "day", "amount": 1}],
                                   anchor_iso=ANCHOR.isoformat(),
                                   limits={("requests", "day"): 10},
@@ -322,7 +335,7 @@ def test_provider_429_after_local_window_reset_still_suspends(tmp_path, monkeypa
     # local window still active + provider 429 -> suspend with Retry-After evidence
     with pytest.raises(ProviderUnavailableError):
         gw.complete([Message("user", "x")], model=M1, max_tokens=8, fallback=policy)
-    assert gw.retry_after_hint("gemini") == 300.0
+    assert gw.retry_after_hint("ollama") == 300.0
     # after the LOCAL window resets, local quota allows a retry (provider may still 429)
     clock["now"] = NOW + timedelta(days=1)
     with pytest.raises(ProviderUnavailableError):  # provider still rate-limited
@@ -396,7 +409,7 @@ def test_dev_v7_database_migrates_to_v8(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r["name"] for r in
                 store._conn.execute("PRAGMA table_info(quota_reservations)").fetchall()}
-    assert v == "8"
+    assert v == "12"
     assert {"model", "request_sha256", "prompt_tokens", "max_output_tokens", "cost_usd",
             "endpoint"} <= cols
     assert store.get_reservation("d-old")["dispatch_id"] == "d-old"  # preserved
@@ -411,10 +424,10 @@ from geosgan_hive.checkpoints import CheckpointStore, PersistMode
 db, anchor, now = sys.argv[1], sys.argv[2], sys.argv[3]
 store = CheckpointStore(db, persist_mode=PersistMode.RESUMABLE, lease_ttl_seconds=60.0)
 res = store.reserve_quota_batch(
-    "d-crash", pool="gemini:acct:" + "a" * 64,
+    "d-crash", pool="ollama:acct:" + "a" * 64,
     items=[{"kind": "requests", "period": "day", "amount": 1}],
     anchor_iso=anchor, limits={("requests", "day"): 10}, now_iso=now,
-    model="gemini/gemini-2.0-flash", request_sha256="ab" * 32, prompt_tokens=5,
+    model="ollama/llama3.2", request_sha256="ab" * 32, prompt_tokens=5,
     max_output_tokens=10, cost_usd=0.0, endpoint=None)
 assert res.value == "created"
 assert store.mark_dispatched("d-crash", now_iso=now) is True  # authorized...

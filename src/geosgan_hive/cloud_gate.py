@@ -82,6 +82,22 @@ def effective_endpoint(model: str, kwargs: dict[str, Any]) -> str | None:
     return kwargs.get("api_base") or PROVIDER_SPECS[provider].default_api_base
 
 
+def _endpoints_match(bound: str, effective: str, *, local: bool) -> bool:
+    """Endpoint binding comparison. Strict string equality by default. For
+    local_inference, loopback names and literals are equivalent (the connection
+    is pinned to the validated literal address anyway), but scheme and port must
+    still match exactly."""
+    if str(bound).rstrip("/") == str(effective).rstrip("/"):
+        return True
+    if not local:
+        return False
+    b, e = urlsplit(str(bound)), urlsplit(str(effective))
+    loopback = ("localhost", "127.0.0.1", "::1")
+    bh, eh = (b.hostname or "").lower(), (e.hostname or "").lower()
+    return (b.scheme == e.scheme and b.port == e.port
+            and bh in loopback and eh in loopback)
+
+
 class ZeroCostGate:
     """The single zero-cost enforcement point in front of every physical dispatch.
     Immutable after construction (enabled() derives from the registry and cannot
@@ -142,6 +158,7 @@ class ZeroCostGate:
             raise CloudConfigError(f"zero-cost gate blocked dispatch of {model!r}: {reason}")
         p = self._registry.profile_for(model)
         ev = p.verification_evidence if p is not None else None
+        local = ev is not None and ev.billing_enforcement.value == "local_inference"
         if ev is not None and ev.endpoint is not None:
             # verify the EFFECTIVE endpoint (explicit api_base or provider default)
             eff = effective_endpoint(model, kwargs)
@@ -151,13 +168,13 @@ class ZeroCostGate:
                     f"to endpoint {ev.endpoint!r} but no effective endpoint can be "
                     "verified for this request — fail closed"
                 )
-            if str(eff).rstrip("/") != ev.endpoint.rstrip("/"):
+            if not _endpoints_match(ev.endpoint, str(eff), local=local):
                 raise CloudConfigError(
                     f"zero-cost gate blocked dispatch of {model!r}: effective endpoint "
                     f"{eff!r} does not match the verification evidence endpoint "
                     f"{ev.endpoint!r}"
                 )
-        if ev is not None and ev.billing_enforcement.value == "local_inference":
+        if local:
             # LOCAL inference is only zero-cost on a LOOPBACK endpoint: an
             # api_base override (e.g. OLLAMA_API_BASE) pointing anywhere remote
             # is rejected even when the evidence declares no endpoint binding
@@ -193,6 +210,17 @@ class ZeroCostGate:
                         f"zero-cost gate blocked dispatch of {model!r}: unparseable "
                         f"resolved address {addr!r} for host {host!r} \u2014 fail closed"
                     ) from exc
+            # A0: pin the connection to the VALIDATED literal loopback address so
+            # the actual connected destination IS the address that was checked and
+            # no second name resolution happens at connect time (closes the DNS
+            # TOCTOU window for local inference; DNS prevalidation alone would NOT
+            # guarantee the actual destination)
+            literal = next((i[4][0] for i in infos if i[4][0] == "127.0.0.1"),
+                           infos[0][4][0])
+            parts = urlsplit(str(eff))
+            host_part = f"[{literal}]" if ":" in literal else literal
+            port_part = f":{parts.port}" if parts.port else ""
+            kwargs["api_base"] = f"{parts.scheme or 'http'}://{host_part}{port_part}"
 
     def candidate_billing_ok(self, model: str) -> tuple[bool, str]:
         """Candidate-level check for fallback chains: the model needs an enabled

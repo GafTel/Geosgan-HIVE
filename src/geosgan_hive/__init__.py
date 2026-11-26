@@ -29,12 +29,33 @@ from .agents import (
     parse_delegation_call,
     parse_tool_call,
 )
+from .api_adapters import register_api_tools
+from .benchmarks import SimulatedCaller, format_report, run_benchmark
+from .catalog import (
+    BillingClassification,
+    CatalogModel,
+    CatalogProvider,
+    EvidenceRecord,
+    OperationalStatus,
+    ProviderCatalog,
+    ProviderCategory,
+    QuotaDimension,
+    catalog_from_dict,
+    load_catalog,
+)
 from .checkpoints import (
     CheckpointStore,
     ExecutionState,
     PersistMode,
     QuotaReservationOutcome,
     RunCheckpoint,
+)
+from .cloud_evidence import (
+    CloudEvidenceRecord,
+    CloudEvidenceVault,
+    EvidenceClass,
+    OverageBehavior,
+    SpendingRestriction,
 )
 from .cloud_gate import ZeroCostGate
 from .cloud_profiles import (
@@ -101,9 +122,26 @@ from .fallback import (
 )
 from .gateway import GatewayLLMClient, LLMResponse, ModelGateway
 from .health import CircuitBreaker, CircuitState, HealthRegistry
+from .http_client import (
+    EndpointRule,
+    HttpLimits,
+    HttpResult,
+    SecureHttpClient,
+    TransportConfig,
+    parse_retry_after,
+    validate_destination,
+)
 from .llm import AsyncLLMClient, FakeLLM, LLMClient
 from .messages import Message
 from .orchestrator import FINISH, OrchestratorResult, Supervisor
+from .outbound import (
+    ApiSession,
+    OutboundAuthorizer,
+    OutboundDecision,
+    OutboundPolicy,
+    build_api_session,
+    canonical_request_digest,
+)
 from .providers import (
     Credentials,
     ModelCapabilities,
@@ -120,6 +158,15 @@ from .quota_engine import (
 )
 from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
+from .routing import (
+    CandidateEvaluation,
+    ModelRouter,
+    PrivacyLevel,
+    RoutingDecision,
+    RoutingMode,
+    RoutingPolicy,
+    RoutingWeights,
+)
 from .run_context import (
     CollaborationEvent,
     CollaborationPolicy,
@@ -141,12 +188,51 @@ from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "AdapterCapabilities",
+    "BillingClassification",
     "BillingEnforcement",
     "BillingModel",
+    "CatalogModel",
+    "CatalogProvider",
+    "EvidenceRecord",
+    "OperationalStatus",
+    "ProviderCatalog",
+    "ProviderCategory",
+    "QuotaDimension",
+    "catalog_from_dict",
+    "load_catalog",
+    "ApiSession",
+    "register_api_tools",
+    "SimulatedCaller",
+    "run_benchmark",
+    "format_report",
+    "CandidateEvaluation",
+    "CloudEvidenceRecord",
+    "CloudEvidenceVault",
+    "EvidenceClass",
+    "OverageBehavior",
+    "SpendingRestriction",
+    "ModelRouter",
+    "PrivacyLevel",
+    "RoutingDecision",
+    "RoutingMode",
+    "RoutingPolicy",
+    "RoutingWeights",
+    "EndpointRule",
+    "HttpLimits",
+    "HttpResult",
+    "OutboundAuthorizer",
+    "OutboundDecision",
+    "OutboundPolicy",
+    "SecureHttpClient",
+    "TransportConfig",
+    "build_api_session",
+    "canonical_request_digest",
+    "parse_retry_after",
+    "validate_destination",
     "TokenEstimationMode",
     "VerificationEvidence",
     "ZeroCostGate",

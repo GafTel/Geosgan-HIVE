@@ -1,0 +1,253 @@
+# GEOSGAN HIVE - Phase 5 (v0.7.0) INFORMATIONAL provider & capability catalog.
+#
+# This file is a DATA PRODUCT. It grants NO runtime permissions: authorization
+# stays with the cloud profiles / ZeroCostGate (see cloud_profiles.py). Unknown,
+# expired or unverifiable evidence never authorizes execution. Volatile free-tier
+# limits are intentionally NOT recorded as numeric guarantees - re-verify the
+# official docs at enablement time. No secrets ever belong in this file.
+#
+# Status legend: active (local inference, loopback only) | evaluation_candidate
+# | blocked (live cloud inference remains BLOCKED in v0.7.0).
+
+catalog_version: 1.0.0
+generated_at: 2026-11-26T00:00:00+00:00
+
+providers:
+  - id: ollama
+    name: Ollama (local inference)
+    category: llm_local
+    base_endpoints: ["http://localhost:11434"]
+    models:
+      - model_id: ollama/llama3.2
+        capabilities: [chat, instruction_following]
+        context_window: 128000
+        tool_support: true
+        hardware_requirements: "local GPU/CPU, model weights stored locally"
+        license: MIT (runtime); model weights under their own licenses
+    capabilities: [chat, tools, local_inference]
+    docs: ["https://github.com/ollama/ollama", "https://docs.ollama.com/"]
+    license: MIT
+    billing: local_inference
+    evidence:
+      - source: official_repository
+        evidence_ref: ollama-github-main
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: none_published, scope: none, documented_in: "https://docs.ollama.com/"}
+    privacy: ["all inference stays on local hardware; no data leaves the machine"]
+    operational_status: active
+    notes: "Primary local inference candidate; loopback-only transport enforced by the gate."
+
+  - id: groq
+    name: Groq Cloud
+    category: llm_cloud
+    base_endpoints: ["https://api.groq.com/openai/v1"]
+    models: []  # free roster rotates; exact versions are pinned at A4 enablement time
+    capabilities: [chat, fast_inference]
+    docs:
+      - "https://console.groq.com/docs/rate-limits"
+      - "https://console.groq.com/docs/models"
+      - "https://console.groq.com/docs/pricing"
+    license: provider terms of service
+    billing: free_tier_unverified
+    evidence:
+      - source: official_docs
+        evidence_ref: groq-rate-limits-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 30
+    quota_dimensions:
+      - {name: requests_per_minute, scope: organization, documented_in: "https://console.groq.com/docs/rate-limits"}
+      - {name: requests_per_day, scope: organization, documented_in: "https://console.groq.com/docs/rate-limits"}
+      - {name: tokens_per_minute, scope: organization, documented_in: "https://console.groq.com/docs/rate-limits"}
+      - {name: tokens_per_day, scope: organization, documented_in: "https://console.groq.com/docs/rate-limits"}
+    privacy: ["prompts are sent to Groq; review provider retention policy before enabling"]
+    operational_status: blocked
+    notes: >-
+      EVALUATION CANDIDATE ONLY. Free tier is rate-limited per organization and the
+      roster rotates; the same API key can call paid models, so zero billing exposure
+      is NOT established. Live dispatch stays blocked until A4 evidence exists.
+
+  - id: openrouter
+    name: OpenRouter
+    category: llm_cloud
+    base_endpoints: ["https://openrouter.ai/api/v1"]
+    models: []
+    capabilities: [chat, multi_provider_routing]
+    docs:
+      - "https://openrouter.ai/docs/api_reference/limits"
+      - "https://openrouter.ai/docs/models"
+      - "https://openrouter.ai/pricing"
+    license: provider terms of service
+    billing: free_tier_unverified
+    evidence:
+      - source: official_docs
+        evidence_ref: openrouter-limits-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 30
+    quota_dimensions:
+      - {name: requests_per_minute, scope: api_key, documented_in: "https://openrouter.ai/docs/api_reference/limits"}
+      - {name: requests_per_day, scope: api_key, documented_in: "https://openrouter.ai/docs/api_reference/limits"}
+    privacy: ["prompts are routed to third-party providers; retention varies per provider"]
+    operational_status: blocked
+    notes: >-
+      EVALUATION CANDIDATE ONLY. ':free' variants are capped without card; the higher
+      cap requires a $10 credit purchase, which is REJECTED (absolute zero authorized
+      expenditure). Negative balance blocks free models; some $0 models require a
+      funded account. ToS forbids multi-account limit bypass. Blocked until A4.
+
+  - id: wikimedia
+    name: Wikimedia / MediaWiki APIs
+    category: public_api
+    base_endpoints: ["https://api.wikimedia.org", "https://en.wikipedia.org/w/api.php"]
+    models: []
+    capabilities: [article_search, article_retrieval, provenance]
+    docs:
+      - "https://www.mediawiki.org/wiki/Wikimedia_APIs/Access_policy"
+      - "https://www.mediawiki.org/wiki/Wikimedia_APIs/Rate_limits"
+      - "https://www.mediawiki.org/wiki/API:Etiquette"
+      - "https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy"
+    license: "content CC BY-SA 4.0 (Wikidata CC0); API under Wikimedia Terms of Use"
+    attribution: "Wikipedia/Wikimedia content requires attribution per CC BY-SA 4.0"
+    billing: public_api_no_charge
+    evidence:
+      - source: official_docs
+        evidence_ref: wikimedia-api-policy-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: requests_per_minute, scope: ip, documented_in: "https://www.mediawiki.org/wiki/Wikimedia_APIs/Rate_limits"}
+      - {name: concurrent_requests, scope: ip, documented_in: "https://www.mediawiki.org/wiki/API:Etiquette"}
+    privacy: ["no personal data sent; descriptive User-Agent with contact required"]
+    operational_status: evaluation_candidate
+    notes: "Read-only adapter planned in A6; limit circumvention is prohibited."
+
+  - id: crossref
+    name: Crossref REST API
+    category: public_api
+    base_endpoints: ["https://api.crossref.org"]
+    models: []
+    capabilities: [publication_search, doi_metadata, references]
+    docs:
+      - "https://www.crossref.org/documentation/retrieve-metadata/rest-api/"
+      - "https://github.com/CrossRef/rest-api-doc"
+    license: open metadata (CC0-style open scholarly metadata)
+    billing: public_api_no_charge
+    evidence:
+      - source: official_docs
+        evidence_ref: crossref-rest-api-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: requests_per_minute, scope: ip, documented_in: "https://www.crossref.org/documentation/retrieve-metadata/rest-api/access-and-authentication/"}
+    privacy: ["polite pool: include mailto contact; no personal data in queries"]
+    operational_status: evaluation_candidate
+
+  - id: github
+    name: GitHub public REST API
+    category: public_api
+    base_endpoints: ["https://api.github.com"]
+    models: []
+    capabilities: [repo_search, repo_metadata, releases, bounded_docs]
+    docs:
+      - "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+      - "https://docs.github.com/en/rest"
+    license: GitHub Terms of Service; repo content under its own licenses
+    billing: public_api_no_charge
+    evidence:
+      - source: official_docs
+        evidence_ref: github-rest-rate-limits-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 30
+    quota_dimensions:
+      - {name: requests_per_minute, scope: ip, documented_in: "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"}  # unauthenticated: 60/h per IP
+      - {name: requests_per_day, scope: ip, documented_in: "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"}
+      - {name: concurrent_requests, scope: account, documented_in: "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"}
+    privacy: ["unauthenticated-first: no token, public data only; shared-IP limit on cloud runners"]
+    operational_status: evaluation_candidate
+    notes: "Read-only; no mutations, no private repos, no code execution. Optional token deferred."
+
+  - id: worldbank
+    name: World Bank Indicators API (V2)
+    category: public_api
+    base_endpoints: ["https://api.worldbank.org/v2"]
+    models: []
+    capabilities: [indicator_discovery, country_stats, time_series]
+    docs:
+      - "https://datahelpdesk.worldbank.org/knowledgebase/articles/889392-about-the-indicators-api-documentation"
+      - "https://datahelpdesk.worldbank.org/knowledgebase/articles/898581-api-basic-call-structures"
+    license: CC BY 4.0
+    attribution: "World Bank data under CC BY 4.0; attribution required"
+    billing: public_api_no_charge
+    evidence:
+      - source: official_docs
+        evidence_ref: worldbank-indicators-v2-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: none_published, scope: none, documented_in: "https://datahelpdesk.worldbank.org/knowledgebase/articles/889392-about-the-indicators-api-documentation"}
+    privacy: ["no key, no auth, no personal data"]
+    operational_status: evaluation_candidate
+    notes: "URL length and indicator-count limits documented; bounded pagination required."
+
+  - id: openmeteo
+    name: Open-Meteo weather API
+    category: public_api
+    base_endpoints: ["https://api.open-meteo.com/v1"]
+    models: []
+    capabilities: [forecast, historical_weather]
+    docs:
+      - "https://open-meteo.com/en/terms"
+      - "https://open-meteo.com/en/docs"
+      - "https://open-meteo.com/en/licence"
+    license: "data CC BY 4.0; code AGPL-3.0"
+    attribution: "Open-Meteo attribution required (CC BY 4.0)"
+    billing: public_api_no_charge
+    evidence:
+      - source: official_docs
+        evidence_ref: openmeteo-terms-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: calls_per_minute, scope: ip, documented_in: "https://open-meteo.com/en/terms"}
+      - {name: calls_per_hour, scope: ip, documented_in: "https://open-meteo.com/en/terms"}
+      - {name: calls_per_day, scope: ip, documented_in: "https://open-meteo.com/en/terms"}
+    privacy: ["non-commercial use only on the free tier; operator attestation required (default false)"]
+    operational_status: evaluation_candidate
+    notes: "Free tier is NON-COMMERCIAL only with no uptime guarantee; no paid endpoints may be used."
+
+  - id: searxng
+    name: SearXNG metasearch
+    category: search_engine
+    base_endpoints: []  # only an explicitly operator-authorized instance may be added
+    models: []
+    capabilities: [web_search, structured_results, provenance]
+    docs:
+      - "https://docs.searxng.org/dev/search_api.html"
+      - "https://docs.searxng.org/admin/searx.limiter.html"
+      - "https://docs.searxng.org/"
+    license: AGPL-3.0 (self-hosted)
+    billing: local_inference  # self-hosted = local compute; public instances are not trusted
+    evidence:
+      - source: official_docs
+        evidence_ref: searxng-docs-2026-11
+        collected_at: 2026-11-26T00:00:00+00:00
+        collected_by: operator
+        ttl_days: 90
+    quota_dimensions:
+      - {name: requests_per_minute, scope: instance, documented_in: "https://docs.searxng.org/admin/searx.limiter.html"}
+    privacy: ["self-hosted instance keeps queries private; public instances have unknown terms"]
+    operational_status: blocked
+    notes: >-
+      No automatic discovery of public instances. A self-hosted/authorized instance
+      needs its own endpoint entry plus a separately scoped transport policy; the
+      public-API SSRF boundary is not weakened for it. Adapter stays disabled until
+      then.

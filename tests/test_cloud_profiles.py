@@ -72,6 +72,23 @@ def free_profile(**overrides) -> dict:
     return base
 
 
+OLLAMA_MODEL = "ollama/llama3.2"
+
+
+def local_profile(**overrides) -> dict:
+    """An ollama local-inference profile (the only provider class allowed by
+    the v0.7.0 zero-cost release gate)."""
+    p = free_profile(**overrides)
+    p["provider"] = "ollama"
+    p["models"] = [OLLAMA_MODEL]
+    p["quotas"] = [{"pool": "ollama:acct:" + "a" * 64, "max_requests": 1500,
+                    "max_tokens": 1_000_000, "period": "day"}]
+    p["verification_evidence"] = {**p["verification_evidence"],
+                                  "billing_enforcement": "local_inference",
+                                  "endpoint": "http://localhost:11434"}
+    return p
+
+
 def registry(profiles, *, zero_cost=True, trusted=False, **kw) -> CloudProfileRegistry:
     kw.setdefault("max_spend_usd", 0.0 if zero_cost else None)
     kw.setdefault("trusted_evidence_binding", trusted)
@@ -127,13 +144,18 @@ def test_free_tier_verified_requires_both_attestations_and_timestamp():
 # ---- billing eligibility in zero-cost mode ----
 
 def test_verified_free_profile_is_eligible_when_verification_current():
-    reg = registry([free_profile()], zero_cost=True, trusted=True)
-    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    reg = registry([local_profile()], zero_cost=True, trusted=True)
+    ok, reason = reg.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is True, reason
     # production default (trusted binding not implemented): blocked
-    reg0 = registry([free_profile()], zero_cost=True)
-    ok, reason = reg0.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    reg0 = registry([local_profile()], zero_cost=True)
+    ok, reason = reg0.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "blocked" in reason.lower()
+    # v0.7.0 release gate: non-local providers denied in zero-cost mode even
+    # with a fully verified + trusted profile
+    reg_g = registry([free_profile()], zero_cost=True, trusted=True)
+    ok, reason = reg_g.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "release gate" in reason.lower()
 
 
 def test_unknown_billing_blocks_zero_cost_live_dispatch():
@@ -153,10 +175,10 @@ def test_paid_profile_blocks_zero_cost_live_dispatch():
 
 
 def test_expired_verification_blocks_zero_cost():
-    p = free_profile(verified_at=(NOW - timedelta(days=31)).isoformat(),
-                     verification_ttl_days=30)
+    p = local_profile(verified_at=(NOW - timedelta(days=31)).isoformat(),
+                      verification_ttl_days=30)
     reg = registry([p], zero_cost=True)
-    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "expired" in reason.lower()
 
 
@@ -488,20 +510,20 @@ def test_absent_cloud_config_preserves_legacy():
 # --- issue 10: attestation != independently verified billing guarantee ---
 
 def test_operator_attestation_alone_does_not_enable_live_dispatch():
-    p = free_profile(billing_verified=False)
+    p = local_profile(billing_verified=False)
     p["verification_evidence"] = None  # attestation only, no trusted evidence
     reg = registry([p], zero_cost=True)
-    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "evidence" in reason.lower()
-    # evidence contract satisfied as well -> allowed
-    reg2 = registry([free_profile(billing_verified=True)], zero_cost=True, trusted=True)
-    ok, _ = reg2.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    # evidence contract satisfied as well -> allowed (local provider)
+    reg2 = registry([local_profile(billing_verified=True)], zero_cost=True, trusted=True)
+    ok, _ = reg2.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is True
     # billing_verified=True WITHOUT evidence is still just an assertion -> blocked
-    no_ev = free_profile(billing_verified=True)
+    no_ev = local_profile(billing_verified=True)
     no_ev["verification_evidence"] = None
     reg3 = registry([no_ev], zero_cost=True)
-    ok, reason = reg3.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg3.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "evidence" in reason.lower()
 
 
@@ -583,12 +605,12 @@ def test_conflicting_account_identity_by_fingerprint_rejected():
 # --- issue 5: explicit verification evidence contract ---
 
 def test_evidence_contract_required_and_bound_to_account():
-    base = free_profile(billing_verified=True)
+    base = local_profile(billing_verified=True)
     # missing evidence -> blocked
     no_ev = dict(base)
     no_ev["verification_evidence"] = None
     reg = registry([no_ev], zero_cost=True)
-    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "evidence" in reason.lower()
     # evidence bound to a DIFFERENT account fingerprint -> construction error
     bad = dict(base)
@@ -606,22 +628,22 @@ def test_evidence_contract_required_and_bound_to_account():
     unb = dict(base)
     unb["verification_evidence"] = dict(base["verification_evidence"], credential_bound=False)
     reg2 = registry([unb], zero_cost=True)
-    ok, reason = reg2.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg2.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "credential" in reason.lower()
     # stale evidence (beyond ttl) -> blocked
     old = dict(base)
     old["verification_evidence"] = dict(base["verification_evidence"],
                                         collected_at=(NOW - timedelta(days=40)).isoformat())
     reg3 = registry([old], zero_cost=True)
-    ok, _ = reg3.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, _ = reg3.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False
     # proper evidence + trusted binding hook -> allowed
     reg4 = registry([base], zero_cost=True, trusted=True)
-    ok, _ = reg4.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, _ = reg4.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is True
     # proper evidence but NO trusted binding (production C2 state) -> still blocked
     reg5 = registry([base], zero_cost=True)
-    ok, reason = reg5.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    ok, reason = reg5.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "blocked" in reason.lower()
 
 
@@ -708,12 +730,16 @@ def test_defensive_revalidation_of_existing_instances():
 
 
 def test_live_dispatch_blocked_until_trusted_binding_implemented():
-    reg = registry([free_profile()], zero_cost=True, trusted=False)
-    ok, reason = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    reg = registry([local_profile()], zero_cost=True, trusted=False)
+    ok, reason = reg.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is False and "not proof of authenticity" in reason
-    reg_t = registry([free_profile()], zero_cost=True, trusted=True)
-    ok, _ = reg_t.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    reg_t = registry([local_profile()], zero_cost=True, trusted=True)
+    ok, _ = reg_t.live_dispatch_eligible(OLLAMA_MODEL, now=NOW)
     assert ok is True
+    # ...and non-local providers stay blocked by the release gate regardless
+    reg_c = registry([free_profile()], zero_cost=True, trusted=True)
+    ok, reason = reg_c.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is False and "release gate" in reason.lower()
 
 
 def test_adapter_capabilities_strictly_typed():

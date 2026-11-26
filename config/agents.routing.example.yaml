@@ -1,0 +1,77 @@
+# GEOSGAN HIVE v0.7.0 - example config with the A3 intelligent routing engine.
+# Automatic routing is OPT-IN: without a 'routing:' block the configured
+# agent models are used (fixed mode), subject to the zero-cost gate.
+#
+# In zero-cost (FREE_ONLY) mode the v0.7.0 release gate allows ONLY local
+# inference (ollama); groq/openrouter and all other cloud providers stay
+# blocked regardless of evidence state.
+
+catalog_path: config/catalog.yaml   # informational catalog (grants nothing)
+
+routing:
+  mode: eligible_default            # fixed (default) | eligible_default | evidence_based
+  weights:                          # validated: each in [0,1], sum must be 1.0
+    quality: 0.35                   # ONLY from trusted_runtime evidence
+    reliability: 0.25
+    capability: 0.15
+    quota: 0.10
+    privacy: 0.10
+    speed: 0.05                     # no measurements exist -> never fabricated
+  allowed_providers: [ollama]       # optional allowlist (empty = all that pass filters)
+  blocked_models: []                # exact model ids to reject
+  privacy: none                     # none | local_only
+  cross_provider_fallback: false    # explicit authorization to switch provider
+  defaults:                         # explicit eligible defaults per agent ("*" = all)
+    researcher: ollama/llama3.2
+    "*": ollama/llama3.2
+  context_window_min: 1
+  policy_version: routing-1.0.0
+
+supervisor:
+  name: supervisor
+  description: Routes the task between the specialist agents and produces the final answer.
+  system_prompt: >-
+    You are the supervisor of the GEOSGAN HIVE team. Coordinate the researcher,
+    developer, analyst and reviewer, then finish with a final answer.
+  model: ollama/llama3.2
+  temperature: 0.2
+  max_steps: 8
+  permissions: {allow_tools: false, allowed_tools: []}
+
+agents:
+  - name: researcher
+    description: Investigates and organizes information.
+    system_prompt: You are a meticulous researcher. Deliver a structured summary.
+    model: ollama/llama3.2
+    permissions: {allow_tools: true, allowed_tools: [calculator, word_count]}
+  - name: developer
+    description: Writes and explains code.
+    system_prompt: You are a senior developer. Produce correct code and explain it.
+    model: ollama/llama3.2
+    permissions: {allow_tools: true, allowed_tools: [calculator]}
+  - name: analyst
+    description: Analyzes data and quantifies findings.
+    system_prompt: You are a rigorous analyst. Report findings with numbers.
+    model: ollama/llama3.2
+    permissions: {allow_tools: true, allowed_tools: [calculator]}
+  - name: reviewer
+    description: Reviews and improves answers.
+    system_prompt: You are a demanding reviewer. Deliver the improved final version.
+    model: ollama/llama3.2
+    permissions: {allow_tools: true, allowed_tools: [word_count]}
+
+collaboration:
+  allow_agent_to_agent: true
+  max_delegation_depth: 2
+  max_handoffs_per_run: 10
+  max_parallel_agents: 3
+
+checkpoint:
+  path: .geosgan_hive/checkpoints.db
+  persist_mode: resumable
+
+# CLI inspection (offline):
+#   geosgan-hive --route --route-agent researcher --agents-config config/agents.routing.example.yaml --checkpoint /tmp/hive.db
+#   geosgan-hive --routing-decisions --agents-config ... --checkpoint /tmp/hive.db
+#   geosgan-hive --benchmark-simulate --agents-config ... --checkpoint /tmp/hive.db
+#   geosgan-hive --cloud-evidence --agents-config ... --checkpoint /tmp/hive.db

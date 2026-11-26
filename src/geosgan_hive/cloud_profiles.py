@@ -52,6 +52,17 @@ class QuotaPeriod(StrEnum):
     MONTH = "month"
 
 
+#: v0.7.0 PRODUCTION RELEASE GATE: in zero-cost (FREE_ONLY) mode ONLY local
+#: inference (ollama, loopback-only transport) may receive live dispatch. Cloud
+#: providers stay blocked independently of profile evidence, the legacy
+#: trusted_evidence_binding flag, or the evidence-vault state (even an injected
+#: vault with syntactically valid provider_enforced records cannot activate
+#: them) until a future, separately authorized acceptance gate re-opens
+#: verified provider-enforced zero-cost paths. Outside zero-cost mode, legacy
+#: semantics are preserved.
+ZERO_COST_RELEASE_LOCAL_PROVIDERS = ("ollama",)
+
+
 class BillingEnforcement(StrEnum):
     """How zero billing exposure is ESTABLISHED provider-side (not inferred from
     model names or local accounting):
@@ -112,7 +123,7 @@ class VerificationEvidence(BaseModel):
     #: the endpoint (api_base host) it applies to. When set, they must match the
     #: profile's provider / the request's endpoint at dispatch time.
     provider: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
-    endpoint: str | None = Field(default=None, pattern=r"^https?://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
+    endpoint: str | None = Field(default=None, pattern=r"^https?://(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9.-]{1,253})(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
     #: how zero billing exposure is established; UNKNOWN (default) fails closed
     billing_enforcement: BillingEnforcement = BillingEnforcement.UNKNOWN
 
@@ -121,6 +132,22 @@ class VerificationEvidence(BaseModel):
     def _aware(cls, v: datetime) -> datetime:
         if v.tzinfo is None:
             raise ValueError("collected_at must be timezone-aware (naive timestamps rejected)")
+        return v
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint_port_range(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"endpoint must be an absolute http(s) URL: {v!r}")
+        if parts.port is None:
+            return v
+        if not 1 <= parts.port <= 65535:
+            raise ValueError(f"endpoint port out of range: {parts.port}")
         return v
 
     def current(self, now: datetime, ttl_days: int) -> bool:
@@ -309,6 +336,7 @@ class CloudProfileRegistry:
         allowed_providers: list[str] | None = None,
         max_spend_usd: float | None = None,
         trusted_evidence_binding: bool = False,
+        evidence_vault: Any = None,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         if zero_cost and max_spend_usd != 0.0:
@@ -401,6 +429,10 @@ class CloudProfileRegistry:
         )
         object.__setattr__(self, "_fp_of_model", MappingProxyType(fp_of_model))
         object.__setattr__(self, "trusted_evidence_binding", bool(trusted_evidence_binding))
+        # Phase 5 A4: optional durable evidence vault. When wired, cloud (non
+        # local-inference) live dispatch additionally requires provider_enforced
+        # vault evidence matching the exact binding. Opt-in via config flag.
+        object.__setattr__(self, "evidence_vault", evidence_vault)
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -411,15 +443,17 @@ class CloudProfileRegistry:
         object.__setattr__(self, name, value)
 
     @classmethod
-    def from_config(cls, cloud: CloudConfig | None) -> CloudProfileRegistry:
+    def from_config(cls, cloud: CloudConfig | None, *,
+                    evidence_vault: Any = None) -> CloudProfileRegistry:
         if cloud is None:
-            return cls(profiles=(), zero_cost=False)
+            return cls(profiles=(), zero_cost=False, evidence_vault=evidence_vault)
         return cls(
             profiles=tuple(cloud.profiles),
             zero_cost=cloud.zero_cost,
             allowed_providers=cloud.allowed_providers,
             max_spend_usd=cloud.max_spend_usd,
             trusted_evidence_binding=getattr(cloud, "trusted_evidence_binding", False),
+            evidence_vault=evidence_vault,
         )
 
     def profile_for(self, model: str) -> CloudProfile | None:
@@ -470,6 +504,17 @@ class CloudProfileRegistry:
             return False, (
                 f"billing={p.billing.value} for {model!r} — only free_tier_verified "
                 "is allowed in zero-cost mode"
+            )
+        # v0.7.0 release gate (ZERO_COST_RELEASE_LOCAL_PROVIDERS): non-local cloud
+        # inference is denied in zero-cost mode INDEPENDENTLY of evidence state -
+        # profile evidence, trusted flags and vault contents included
+        if p.provider not in ZERO_COST_RELEASE_LOCAL_PROVIDERS:
+            return False, (
+                f"v0.7.0 release gate: non-local cloud inference ({p.provider!r}) is "
+                f"denied in zero-cost (FREE_ONLY) mode for {model!r} - only local "
+                "inference (ollama, loopback) is allowed; cloud providers stay blocked "
+                "regardless of evidence-vault state until a future separately "
+                "authorized gate establishes provider-enforced zero-cost guarantees"
             )
         if not p.verification_current(now):
             if p.verified_at is not None and p.verified_at > now:
@@ -525,6 +570,19 @@ class CloudProfileRegistry:
             return False, (
                 f"free-allowance evidence for {model!r} is not credential-bound"
             )
+        # Phase 5 A4: when a durable evidence vault is wired, cloud (non-local)
+        # live dispatch additionally requires provider_enforced vault evidence
+        # bound to the exact provider/model/endpoint/account fingerprint.
+        vault = getattr(self, "evidence_vault", None)
+        if vault is not None and enf != BillingEnforcement.LOCAL_INFERENCE:
+            ok_v, why_v = vault.eligible_for_live_dispatch(
+                provider_id=p.provider, model_id=model,
+                endpoint=ev.endpoint, account_fingerprint=ev.account_fingerprint,
+                now=now)
+            if not ok_v:
+                return False, (
+                    f"cloud evidence vault: {why_v} — no provider-enforced "
+                    f"zero-cost evidence for {model!r}; live dispatch stays blocked")
         return True, (
             "free_tier_verified + evidence bound to account/provider/endpoint + "
             f"billing enforcement={enf.value} + attestation current"

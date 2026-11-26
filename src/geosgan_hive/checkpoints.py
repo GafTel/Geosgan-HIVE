@@ -5,10 +5,11 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -17,7 +18,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 12
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -128,6 +129,152 @@ CREATE TABLE IF NOT EXISTS quota_policy_audit (
     new_policy_hash TEXT NOT NULL,
     operator TEXT NOT NULL,
     carried_json TEXT NOT NULL DEFAULT '[]',
+    at TEXT NOT NULL
+);
+"""
+
+#: Phase 5 (A5): durable public-API request reservations, usage and audit (v9).
+#: Reservations bind the exact authorized operation (provider/endpoint/operation
+#: + one-way sanitized request digest); usage is increment-only (never refunded);
+#: audit rows carry BOUNDED metadata only (no credentials, auth headers or private
+#: payloads). Local windows are HIVE-local accounting, never provider resets.
+_API_SCHEMA = """
+CREATE TABLE IF NOT EXISTS api_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    max_wire_bytes INTEGER NOT NULL,
+    run_id TEXT,
+    lease_owner TEXT,
+    lease_generation INTEGER,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_usage (
+    scope TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (scope, kind, window_start)
+);
+CREATE TABLE IF NOT EXISTS api_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    status_code INTEGER,
+    bytes_in INTEGER NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    policy_decision TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
+"""
+
+#: Phase 5 (A2): reproducible model-benchmark evidence (v10). Evidence records the
+#: EXACT model identity (model_id with a pinned version) and execution_mode
+#: (simulated vs measured). Simulated results are synthetic fixtures and must
+#: NEVER be presented as real model measurements; measured records require an
+#: execution transcript hash + operator attestation. Evidence expires (TTL) and
+#: is swept; rows are bounded metadata + per-case scores (no raw prompts/outputs
+#: beyond the bounded case results). v11 columns (trust_tier, evaluator_id) are
+#: part of the base definition for fresh databases; existing v10 databases get
+#: them via the additive, idempotent ALTER in _migrate_10_to_11.
+_BENCHMARK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS benchmark_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    suite_version TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('simulated', 'measured')),
+    aggregate_score REAL NOT NULL,
+    cases_passed INTEGER NOT NULL,
+    cases_total INTEGER NOT NULL,
+    cases_json TEXT NOT NULL,
+    hardware_profile TEXT NOT NULL DEFAULT '',
+    run_config_json TEXT NOT NULL,
+    provenance TEXT NOT NULL,
+    transcript_sha256 TEXT,
+    runner_attestation TEXT NOT NULL DEFAULT '',
+    trust_tier TEXT NOT NULL DEFAULT 'synthetic_fixture',
+    evaluator_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_model ON benchmark_evidence (model_id);
+"""
+
+#: Phase 5 (A2 gate + A3): routing decisions (v11) and benchmark trust tiers.
+#: routing_decisions stores BOUNDED provenance only (candidate ids, eligibility
+#: decisions, reason codes, selected model, mode, evidence refs, method/policy
+#: versions) — never credentials, raw prompts or private response content.
+#: benchmark_evidence gains trust_tier + evaluator_id via ALTER TABLE in the
+#: migration (additive, idempotent). Trust tiers:
+#:   infrastructure_test | synthetic_fixture  (simulated — never quality evidence)
+#:   operator_reported                        (attested — NOT verified measurement)
+#:   trusted_runtime                          (only via the lease-fenced runtime
+#:                                             recorder; the sole tier eligible for
+#:                                             automatic quality-based routing)
+_ROUTING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS routing_decisions (
+    decision_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    agent TEXT NOT NULL,
+    required_capabilities TEXT NOT NULL,
+    candidates_json TEXT NOT NULL,
+    selected_model TEXT,
+    selection_mode TEXT NOT NULL,
+    evidence_refs TEXT NOT NULL DEFAULT '[]',
+    scoring_method TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routing_run ON routing_decisions (run_id);
+"""
+
+#: Phase 5 A4: durable cloud billing/eligibility evidence (v12). Metadata only:
+#: NEVER raw credentials (only sha256 fingerprints), never account secrets.
+#: evidence_class distinguishes informational classes (public_docs,
+#: operator_declaration, account_authenticated) from provider_enforced, the
+#: only class that can ever support live-dispatch eligibility. revoked +
+#: audit rows implement revocation; expiry is enforced at read/eligibility time.
+_CLOUD_EVIDENCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cloud_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    evidence_class TEXT NOT NULL CHECK (evidence_class IN (
+        'public_docs', 'operator_declaration', 'account_authenticated',
+        'provider_enforced')),
+    account_org_label TEXT NOT NULL DEFAULT '',
+    credential_fingerprint TEXT,          -- sha256 hex only, never a raw secret
+    model_id TEXT,                        -- exact model binding (NULL = provider-wide)
+    endpoint TEXT,                        -- exact endpoint binding (NULL = provider-wide)
+    billing_plan TEXT NOT NULL DEFAULT '',
+    quota_pool TEXT NOT NULL DEFAULT '',
+    spending_restriction TEXT NOT NULL DEFAULT 'none',
+    overage_behavior TEXT NOT NULL DEFAULT 'unknown',
+    source TEXT NOT NULL,
+    collection_method TEXT NOT NULL DEFAULT '',
+    docs_url TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    collected_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    revocation_reason TEXT NOT NULL DEFAULT '',
+    limitations TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_evidence_provider ON cloud_evidence (provider_id);
+CREATE TABLE IF NOT EXISTS cloud_evidence_audit (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id TEXT NOT NULL,
+    event TEXT NOT NULL,                  -- 'recorded' | 'revoked'
+    detail TEXT NOT NULL DEFAULT '',
     at TEXT NOT NULL
 );
 """
@@ -540,6 +687,10 @@ class CheckpointStore:
             _exec_schema(self._conn, _SCHEMA)
             _exec_schema(self._conn, _LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _QUOTA_SCHEMA)    # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _API_SCHEMA)      # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _BENCHMARK_SCHEMA)  # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _ROUTING_SCHEMA)    # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)  # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -567,6 +718,14 @@ class CheckpointStore:
                         self._migrate_6_to_7()
                     elif v == 7:
                         self._migrate_7_to_8()
+                    elif v == 8:
+                        self._migrate_8_to_9()
+                    elif v == 9:
+                        self._migrate_9_to_10()
+                    elif v == 10:
+                        self._migrate_10_to_11()
+                    elif v == 11:
+                        self._migrate_11_to_12()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -674,6 +833,55 @@ class CheckpointStore:
                 )
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_8_to_9(self) -> None:
+        """v8 -> v9 (Phase 5 A5): adds the durable public-API tables (api_reservations,
+        api_usage, api_audit). Purely additive (IF NOT EXISTS); all v8 data preserved.
+        Runs inside the caller's open transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _API_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(9),)
+        )
+
+    def _migrate_9_to_10(self) -> None:
+        """v9 -> v10 (Phase 5 A2): adds benchmark_evidence (model benchmark runs with
+        exact model identity, simulated/measured separation, expiry). Purely additive
+        (IF NOT EXISTS); all v9 data preserved. Runs inside the caller's open
+        transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _BENCHMARK_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(10),)
+        )
+
+    def _migrate_10_to_11(self) -> None:
+        """v10 -> v11 (A2 gate + A3): adds routing_decisions and the benchmark
+        trust-tier/evaluator columns (ALTER TABLE, additive + idempotent); all
+        v10 data preserved. Runs inside the caller's open transaction; an
+        interruption rolls back fully."""
+        _exec_schema(self._conn, _ROUTING_SCHEMA)
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(benchmark_evidence)").fetchall()}
+        if "trust_tier" not in cols:
+            self._conn.execute(
+                "ALTER TABLE benchmark_evidence ADD COLUMN trust_tier TEXT NOT NULL "
+                "DEFAULT 'synthetic_fixture'")
+        if "evaluator_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE benchmark_evidence ADD COLUMN evaluator_id TEXT NOT NULL "
+                "DEFAULT ''")
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(11),)
+        )
+
+    def _migrate_11_to_12(self) -> None:
+        """v11 -> v12 (Phase 5 A4): adds cloud_evidence + cloud_evidence_audit
+        (durable, metadata-only cloud billing/eligibility evidence). Purely
+        additive (IF NOT EXISTS); all v11 data preserved. Runs inside the
+        caller's open transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(12),)
         )
 
     def _harden_permissions(self) -> None:
@@ -2029,6 +2237,600 @@ class CheckpointStore:
                 (pool,),
             ).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
+
+    # ------------------------------------------------------------------
+    # Phase 5 (A5): durable public-API request reservations + audit (schema v9)
+    # ------------------------------------------------------------------
+
+    def reserve_api_request(
+        self,
+        reservation_id: str,
+        *,
+        provider: str,
+        endpoint_id: str,
+        operation_id: str,
+        request_sha256: str,
+        max_wire_bytes: int,
+        budgets: Mapping[str, Mapping[str, int]],  # scope -> kind(requests|wire_bytes) -> limit
+        window_start_iso: str,
+        now_iso: str | None = None,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> QuotaReservationOutcome:
+        """Atomically reserve ONE durable API request budget unit BEFORE any physical
+        HTTP request. One BEGIN IMMEDIATE transaction: lease fencing (when run-bound),
+        replay check (identical -> REPLAYED reconciliation only; conflicting -> reject),
+        budget check for EVERY scope (requests=1, wire_bytes=max_wire_bytes; conservative:
+        the max is counted up front and NEVER refunded), insert reservation, increment
+        usage. Returns CREATED/REPLAYED. Usage is increment-only; uncertain usage is
+        never refunded."""
+        _validate_quota_binding(run_id, lease_owner, lease_generation)
+        if type(max_wire_bytes) is not int or max_wire_bytes < 1:
+            raise CheckpointError("max_wire_bytes must be a strict positive int")
+        if len(request_sha256) != 64 or any(c not in "0123456789abcdef" for c in request_sha256):
+            raise CheckpointError("request_sha256 must be a sha256 hex digest")
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._reserve_api_tx(
+                    reservation_id, provider=provider, endpoint_id=endpoint_id,
+                    operation_id=operation_id, request_sha256=request_sha256,
+                    max_wire_bytes=max_wire_bytes, budgets=dict(budgets),
+                    window_start_iso=window_start_iso, now_iso=now_iso, run_id=run_id,
+                    lease_owner=lease_owner, lease_generation=lease_generation)
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"reserve_api_request transaction failed (SQLite contention): {exc}"
+                ) from exc
+        raise CheckpointError("reserve_api_request failed after bounded retries")
+
+    def _reserve_api_tx(self, reservation_id, *, provider, endpoint_id, operation_id,
+                        request_sha256, max_wire_bytes, budgets, window_start_iso,
+                        now_iso, run_id, lease_owner, lease_generation) -> QuotaReservationOutcome:
+        now = now_iso or self.now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM api_reservations WHERE reservation_id=?",
+                    (reservation_id,),
+                ).fetchone()
+                if existing is not None:
+                    # replay: only identical bindings reconcile; lease fencing applies too
+                    same = (
+                        existing["provider"] == provider
+                        and existing["endpoint_id"] == endpoint_id
+                        and existing["operation_id"] == operation_id
+                        and existing["request_sha256"] == request_sha256
+                        and int(existing["max_wire_bytes"]) == max_wire_bytes
+                        and existing["run_id"] == run_id
+                        and existing["lease_owner"] == lease_owner
+                        and existing["lease_generation"] == lease_generation
+                    )
+                    if not same:
+                        raise CheckpointError(
+                            f"conflicting replay of api reservation {reservation_id!r} "
+                            "(substitution rejected)")
+                    if run_id is not None and not self._verify_lease_locked(
+                            run_id, lease_owner, lease_generation):
+                        raise CheckpointError(
+                            f"stale worker: lease fencing failed for api reservation "
+                            f"{reservation_id!r} on run {run_id!r}")
+                    self._conn.commit()
+                    return QuotaReservationOutcome.REPLAYED
+                if run_id is not None and not self._verify_lease_locked(
+                        run_id, lease_owner, lease_generation):
+                    raise CheckpointError(
+                        f"stale worker: lease fencing failed for run {run_id!r}")
+                scopes = {
+                    f"run:{run_id}": budgets.get(f"run:{run_id}"),
+                    f"provider:{provider}": budgets.get(f"provider:{provider}"),
+                    f"endpoint:{endpoint_id}": budgets.get(f"endpoint:{endpoint_id}"),
+                }
+                for scope, kind_limits in scopes.items():
+                    if kind_limits is None:
+                        continue
+                    for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):
+                        limit = kind_limits.get(kind)
+                        if limit is None:
+                            continue
+                        row = self._conn.execute(
+                            "SELECT used FROM api_usage WHERE scope=? AND kind=? "
+                            "AND window_start=?", (scope, kind, window_start_iso),
+                        ).fetchone()
+                        used = int(row["used"]) if row else 0
+                        if used + amount > int(limit):
+                            raise QuotaExhaustedError(
+                                f"API budget exhausted for {scope} ({kind}): "
+                                f"used={used} +{amount} > limit={limit}")
+                self._conn.execute(
+                    "INSERT INTO api_reservations (reservation_id, provider, endpoint_id, "
+                    "operation_id, request_sha256, max_wire_bytes, run_id, lease_owner, "
+                    "lease_generation, status, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,'reserved',?)",
+                    (reservation_id, provider, endpoint_id, operation_id, request_sha256,
+                     max_wire_bytes, run_id, lease_owner, lease_generation, now))
+                for scope, _kind_limits in scopes.items():
+                    if scope == f"run:{run_id}" and run_id is None:
+                        continue
+                    for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):
+                        self._conn.execute(
+                            "INSERT INTO api_usage (scope, kind, window_start, used) "
+                            "VALUES (?,?,?,?) ON CONFLICT(scope, kind, window_start) "
+                            "DO UPDATE SET used = used + excluded.used",
+                            (scope, kind, window_start_iso, amount))
+                self._conn.commit()
+                return QuotaReservationOutcome.CREATED
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_api_dispatched(
+        self,
+        reservation_id: str,
+        *,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+        now_iso: str | None = None,
+        request_sha256: str | None = None,
+    ) -> bool:
+        """Single-winner dispatch authorization for an API reservation, immediately
+        before the physical request. One BEGIN IMMEDIATE tx: exact binding match
+        (incl. all-None), live lease fencing when run-bound, digest match, and the
+        reserved->dispatched transition. Exactly one caller gets True. No refunds."""
+        _validate_quota_binding(run_id, lease_owner, lease_generation)
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._mark_api_dispatched_tx(
+                    reservation_id, run_id=run_id, lease_owner=lease_owner,
+                    lease_generation=lease_generation, now_iso=now_iso,
+                    request_sha256=request_sha256)
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"mark_api_dispatched transaction failed: {exc}") from exc
+        raise CheckpointError("mark_api_dispatched failed after bounded retries")
+
+    def _mark_api_dispatched_tx(self, reservation_id, *, run_id, lease_owner,
+                                lease_generation, now_iso, request_sha256) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM api_reservations WHERE reservation_id=?",
+                    (reservation_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return False
+                if (row["run_id"] != run_id or row["lease_owner"] != lease_owner
+                        or row["lease_generation"] != lease_generation):
+                    self._conn.commit()
+                    return False
+                if request_sha256 is not None and row["request_sha256"] != request_sha256:
+                    self._conn.commit()
+                    return False
+                if run_id is not None and not self._verify_lease_locked(
+                        run_id, lease_owner, lease_generation):
+                    self._conn.commit()
+                    return False
+                cur = self._conn.execute(
+                    "UPDATE api_reservations SET status='dispatched' "
+                    "WHERE reservation_id=? AND status='reserved'",
+                    (reservation_id,))
+                self._conn.commit()
+                return cur.rowcount == 1
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def record_api_audit(
+        self,
+        *,
+        reservation_id: str,
+        provider: str,
+        endpoint_id: str,
+        operation_id: str,
+        outcome: str,
+        status_code: int | None,
+        bytes_in: int,
+        bytes_out: int,
+        duration_ms: int,
+        policy_decision: str,
+        provenance: str = "",
+        now_iso: str | None = None,
+    ) -> None:
+        """Bounded audit metadata only: NEVER raw credentials, authorization headers
+        or private query payloads."""
+        now = now_iso or self.now_iso()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO api_audit (reservation_id, provider, endpoint_id, "
+                "operation_id, outcome, status_code, bytes_in, bytes_out, duration_ms, "
+                "policy_decision, provenance, at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (reservation_id, provider, endpoint_id, operation_id, outcome,
+                 status_code, int(bytes_in), int(bytes_out), int(duration_ms),
+                 policy_decision, provenance[:500], now))
+            self._conn.commit()
+
+    def api_usage_status(self, scope: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT scope, kind, window_start, used FROM api_usage WHERE scope=? "
+                "ORDER BY window_start, kind", (scope,),
+            ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def api_audit_list(self, *, provider: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if provider is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM api_audit ORDER BY id DESC LIMIT 500").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM api_audit WHERE provider=? ORDER BY id DESC LIMIT 500",
+                    (provider,)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    # ---- benchmark evidence (v10, Phase 5 A2) ----------------------------------
+
+    #: maximum TTL for benchmark evidence (bounded retention)
+    BENCHMARK_MAX_TTL_DAYS = 90
+    #: maximum serialized size of the per-case results blob
+    BENCHMARK_MAX_CASES_BYTES = 256 * 1024
+
+    #: trust tiers for benchmark evidence (see _ROUTING_SCHEMA comment)
+    TRUST_TIERS = ("infrastructure_test", "synthetic_fixture", "operator_reported",
+                   "trusted_runtime")
+    #: the only evaluator id allowed to produce trusted_runtime evidence
+    RUNTIME_EVALUATOR_ID = "hive-runtime-evaluator"
+    _EVALUATOR_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
+    def record_benchmark_evidence(
+        self,
+        *,
+        evidence_id: str,
+        suite_version: str,
+        model_id: str,
+        model_version: str,
+        execution_mode: str,
+        aggregate_score: float,
+        cases_passed: int,
+        cases_total: int,
+        cases_json: str,
+        hardware_profile: str = "",
+        run_config_json: str = "{}",
+        provenance: str = "",
+        transcript_sha256: str | None = None,
+        runner_attestation: str = "",
+        ttl_days: int = 30,
+        trust_tier: str | None = None,
+        evaluator_id: str = "",
+        now_iso: str | None = None,
+    ) -> None:
+        """Atomically persist ONE benchmark evidence record (CALLER path).
+
+        Validation is strict and fail-closed:
+        - execution_mode is 'simulated' or 'measured';
+        - TRUST TIERS: simulated -> infrastructure_test|synthetic_fixture;
+          measured+attestation -> operator_reported ONLY. trusted_runtime is
+          UNCONDITIONALLY rejected here: this public method has NO parameter
+          that can enable it (the lease-fenced runtime recorder calls the
+          private inserter directly). Operator-attested evidence is NOT
+          verified measurement evidence and is never routing-eligible;
+        - a MEASURED record REQUIRES a transcript hash AND a non-empty operator
+          attestation; arbitrary caller-provided hashes never elevate the tier;
+        - evaluator_id is required; RUNTIME_EVALUATOR_ID is RESERVED and
+          unconditionally rejected on this path;
+        - model_id must be an exact pinned identity (contains '@' version pin);
+        - scores within [0,1], case counts consistent, cases_json bounded;
+        - duplicate evidence_id is rejected (no replay/substitution);
+        - expiry is in the future and within the max TTL.
+        One transaction; fail closed on any violation.
+
+        TRUSTED-PROCESS BOUNDARY (documented limitation): this boundary defends
+        against unauthorized API misuse inside the process. It does NOT claim
+        protection against arbitrary privileged Python execution or direct
+        database modification by an already-privileged local actor."""
+        trust_tier, expires = self._validate_benchmark_evidence(
+            execution_mode=execution_mode, trust_tier=trust_tier,
+            evaluator_id=evaluator_id, model_id=model_id,
+            model_version=model_version, aggregate_score=aggregate_score,
+            cases_passed=cases_passed, cases_total=cases_total,
+            cases_json=cases_json, ttl_days=ttl_days,
+            transcript_sha256=transcript_sha256,
+            runner_attestation=runner_attestation,
+            allow_runtime_tier=False, now_iso=now_iso)
+        self._insert_benchmark_evidence(
+            evidence_id=evidence_id, suite_version=suite_version, model_id=model_id,
+            model_version=model_version, execution_mode=execution_mode,
+            aggregate_score=aggregate_score, cases_passed=cases_passed,
+            cases_total=cases_total, cases_json=cases_json,
+            hardware_profile=hardware_profile, run_config_json=run_config_json,
+            provenance=provenance, transcript_sha256=transcript_sha256,
+            runner_attestation=runner_attestation, trust_tier=trust_tier,
+            evaluator_id=evaluator_id, expires=expires, now_iso=now_iso)
+
+    def _validate_benchmark_evidence(
+        self, *, execution_mode, trust_tier, evaluator_id, model_id, model_version,
+        aggregate_score, cases_passed, cases_total, cases_json, ttl_days,
+        transcript_sha256, runner_attestation, allow_runtime_tier: bool,
+        now_iso: str | None,
+    ) -> tuple[str, str]:
+        """Shared strict validation. Returns (resolved_trust_tier, expires).
+        `allow_runtime_tier` is hardcoded False by the public caller path and
+        True ONLY by the lease-fenced runtime recorder; it is never a
+        caller-controlled parameter."""
+        now = now_iso or self.now_iso()
+        if execution_mode not in ("simulated", "measured"):
+            raise CheckpointError(f"invalid execution_mode {execution_mode!r}")
+        # --- trust tier resolution (fail closed) ---
+        if trust_tier is None:
+            trust_tier = "synthetic_fixture" if execution_mode == "simulated" \
+                else "operator_reported"
+        if trust_tier not in self.TRUST_TIERS:
+            raise CheckpointError(f"invalid trust_tier {trust_tier!r}")
+        if trust_tier == "trusted_runtime" and not allow_runtime_tier:
+            raise CheckpointError(
+                "trusted_runtime evidence can only be recorded through the "
+                "lease-fenced runtime recorder (record_runtime_benchmark_evidence) "
+                "— a caller-provided tier, hash or boolean never establishes it")
+        if evaluator_id == self.RUNTIME_EVALUATOR_ID and not allow_runtime_tier:
+            raise CheckpointError(
+                f"evaluator_id {self.RUNTIME_EVALUATOR_ID!r} is reserved for the "
+                "lease-fenced runtime recorder — caller-supplied evidence never "
+                "carries it")
+        if execution_mode == "simulated" and trust_tier not in (
+                "infrastructure_test", "synthetic_fixture"):
+            raise CheckpointError(
+                "simulated evidence can only have infrastructure_test/synthetic_fixture "
+                "trust — relabeling simulated results is rejected")
+        if execution_mode == "measured":
+            if trust_tier != "operator_reported" and not allow_runtime_tier:
+                raise CheckpointError(
+                    "caller-recorded measured evidence is operator_reported at most — "
+                    "not verified measurement evidence")
+            if not allow_runtime_tier and (not transcript_sha256 or not runner_attestation):
+                raise CheckpointError(
+                    "measured benchmark evidence requires transcript_sha256 AND "
+                    "runner_attestation (operator); a hash alone never suffices")
+        if not evaluator_id or not self._EVALUATOR_RE.match(evaluator_id):
+            raise CheckpointError("evaluator_id is required (registered evaluator id)")
+        if not re.fullmatch(r"[a-z0-9_./-]+@[A-Za-z0-9][A-Za-z0-9._:+-]{3,127}", model_id or ""):
+            raise CheckpointError(
+                "model_id must be an exact pinned identity like 'ollama/llama3.2@sha256:...'")
+        if not model_version or len(model_version) > 128:
+            raise CheckpointError("model_version must be a non-empty bounded string")
+        if not 0.0 <= aggregate_score <= 1.0:
+            raise CheckpointError("aggregate_score must be within [0, 1]")
+        if not (0 <= cases_passed <= cases_total) or cases_total < 1 or cases_total > 10_000:
+            raise CheckpointError("inconsistent case counts")
+        if len(cases_json.encode("utf-8")) > self.BENCHMARK_MAX_CASES_BYTES:
+            raise CheckpointError("cases_json too large")
+        if not 1 <= ttl_days <= self.BENCHMARK_MAX_TTL_DAYS:
+            raise CheckpointError(f"ttl_days must be within 1..{self.BENCHMARK_MAX_TTL_DAYS}")
+        created = datetime.fromisoformat(now)
+        expires = (created + timedelta(days=ttl_days)).isoformat(timespec="milliseconds")
+        return trust_tier, expires
+
+    def _insert_benchmark_evidence(
+        self, *, evidence_id, suite_version, model_id, model_version, execution_mode,
+        aggregate_score, cases_passed, cases_total, cases_json, hardware_profile,
+        run_config_json, provenance, transcript_sha256, runner_attestation,
+        trust_tier, evaluator_id, expires, now_iso: str | None,
+    ) -> None:
+        """Private atomic insert of an ALREADY-VALIDATED evidence record. Only
+        record_benchmark_evidence (caller path, non-trusted tiers) and
+        record_runtime_benchmark_evidence (lease-fenced, trusted_runtime) call
+        this; both validate first via _validate_benchmark_evidence."""
+        now = now_iso or self.now_iso()
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT INTO benchmark_evidence (evidence_id, suite_version, "
+                    "model_id, model_version, execution_mode, aggregate_score, "
+                    "cases_passed, cases_total, cases_json, hardware_profile, "
+                    "run_config_json, provenance, transcript_sha256, "
+                    "runner_attestation, trust_tier, evaluator_id, created_at, "
+                    "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (evidence_id, suite_version, model_id, model_version, execution_mode,
+                     float(aggregate_score), int(cases_passed), int(cases_total),
+                     cases_json, hardware_profile[:500], run_config_json[:4096],
+                     provenance[:500], transcript_sha256, runner_attestation[:200],
+                     trust_tier, evaluator_id, now, expires),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise CheckpointError(
+                f"benchmark evidence {evidence_id!r} already exists — replay/"
+                "substitution rejected") from exc
+
+    def record_runtime_benchmark_evidence(
+        self,
+        *,
+        run_id: str,
+        lease_owner: str,
+        lease_generation: int,
+        evidence_id: str,
+        suite_version: str,
+        model_id: str,
+        model_version: str,
+        aggregate_score: float,
+        cases_passed: int,
+        cases_total: int,
+        cases_json: str,
+        transcript_sha256: str,
+        hardware_profile: str = "",
+        run_config_json: str = "{}",
+        ttl_days: int = 30,
+        now_iso: str | None = None,
+    ) -> None:
+        """The ONLY path to trusted_runtime evidence: lease-fenced (the run must
+        be RUNNING with a live lease matching owner+generation — worker-owned
+        identity, never caller-asserted), bound to the runtime evaluator, with a
+        transcript hash. Model-generated content can never authorize or certify
+        evidence: this method takes no model input. Atomic; duplicate ids and
+        stale workers are rejected."""
+        _validate_quota_binding(run_id, lease_owner, lease_generation)
+        if not transcript_sha256 or len(transcript_sha256) != 64:
+            raise CheckpointError("trusted runtime evidence requires a transcript sha256")
+        with self._lock:
+            if not self._verify_lease_locked(run_id, lease_owner, lease_generation):
+                raise CheckpointError(
+                    "stale worker: lease fencing failed for runtime benchmark evidence")
+        # the ONLY trusted_runtime path: lease-fenced above; the validation is
+        # shared but allow_runtime_tier=True is hardcoded HERE (never a caller
+        # parameter of the public recorder)
+        _tier, expires = self._validate_benchmark_evidence(
+            execution_mode="measured", trust_tier="trusted_runtime",
+            evaluator_id=self.RUNTIME_EVALUATOR_ID, model_id=model_id,
+            model_version=model_version, aggregate_score=aggregate_score,
+            cases_passed=cases_passed, cases_total=cases_total,
+            cases_json=cases_json, ttl_days=ttl_days,
+            transcript_sha256=transcript_sha256,
+            runner_attestation=self.RUNTIME_EVALUATOR_ID,
+            allow_runtime_tier=True, now_iso=now_iso)
+        self._insert_benchmark_evidence(
+            evidence_id=evidence_id, suite_version=suite_version, model_id=model_id,
+            model_version=model_version, execution_mode="measured",
+            aggregate_score=aggregate_score, cases_passed=cases_passed,
+            cases_total=cases_total, cases_json=cases_json,
+            hardware_profile=hardware_profile, run_config_json=run_config_json,
+            provenance="trusted runtime measurement (lease-fenced recorder)",
+            transcript_sha256=transcript_sha256,
+            runner_attestation=self.RUNTIME_EVALUATOR_ID,
+            trust_tier="trusted_runtime", evaluator_id=self.RUNTIME_EVALUATOR_ID,
+            expires=expires, now_iso=now_iso)
+
+    def benchmark_evidence_is_routing_eligible(self, row: dict[str, Any],
+                                               suite_cases: int | None = None,
+                                               now_iso: str | None = None) -> bool:
+        """Only COMPLETE, UNEXPIRED, trusted_runtime evidence with the runtime
+        evaluator may feed automatic quality-based routing. Simulated and
+        operator-reported evidence NEVER qualify."""
+        now = now_iso or self.now_iso()
+        if row.get("trust_tier") != "trusted_runtime":
+            return False
+        if row.get("evaluator_id") != self.RUNTIME_EVALUATOR_ID:
+            return False
+        if row.get("execution_mode") != "measured" or not row.get("transcript_sha256"):
+            return False
+        if row.get("expires_at", "") <= now:
+            return False
+        try:
+            cases = json.loads(row.get("cases_json") or "[]")
+        except ValueError:
+            return False
+        if len(cases) != row.get("cases_total") or row.get("cases_total") < 1:
+            return False  # incomplete evidence is not a verified measurement
+        if suite_cases is not None and row.get("cases_total") != suite_cases:
+            return False
+        return True
+
+    # ---- routing decisions (v11, Phase 5 A3) -------------------------------------
+
+    ROUTING_DECISIONS_MAX_BYTES = 64 * 1024
+
+    def record_routing_decision(
+        self,
+        *,
+        decision_id: str,
+        run_id: str | None,
+        agent: str,
+        required_capabilities: list[str],
+        candidates_json: str,
+        selected_model: str | None,
+        selection_mode: str,
+        evidence_refs: list[str] | None = None,
+        scoring_method: str = "ranking-1.0",
+        policy_version: str = "",
+        now_iso: str | None = None,
+    ) -> None:
+        """Atomically persist one BOUNDED routing decision (provenance only: ids,
+        reason codes, mode, evidence refs, method/policy versions — never
+        credentials, raw prompts or private content). Duplicate ids rejected."""
+        now = now_iso or self.now_iso()
+        if len(candidates_json.encode("utf-8")) > self.ROUTING_DECISIONS_MAX_BYTES:
+            raise CheckpointError("candidates_json too large")
+        if selection_mode not in ("fixed", "eligible_default", "evidence_based", "none"):
+            raise CheckpointError(f"invalid selection_mode {selection_mode!r}")
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT INTO routing_decisions (decision_id, run_id, agent, "
+                    "required_capabilities, candidates_json, selected_model, "
+                    "selection_mode, evidence_refs, scoring_method, policy_version, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (decision_id, run_id, agent[:100],
+                     json.dumps(list(required_capabilities))[:2048],
+                     candidates_json, selected_model, selection_mode,
+                     json.dumps(list(evidence_refs or []))[:2048],
+                     scoring_method[:64], policy_version[:64], now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise CheckpointError(
+                f"routing decision {decision_id!r} already exists — replay rejected") from exc
+
+    def list_routing_decisions(self, *, run_id: str | None = None,
+                               limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            if run_id is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM routing_decisions WHERE run_id=? "
+                    "ORDER BY created_at DESC, decision_id DESC LIMIT ?",
+                    (run_id, min(limit, 1000))).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM routing_decisions "
+                    "ORDER BY created_at DESC, decision_id DESC LIMIT ?",
+                    (min(limit, 1000),)).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def get_benchmark_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM benchmark_evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+        return {k: row[k] for k in row.keys()} if row else None
+
+    def list_benchmark_evidence(
+        self, *, model_id: str | None = None, include_expired: bool = False,
+        now_iso: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List benchmark evidence (newest first). Expired records are hidden by
+        default; pass include_expired=True to see them (marked expired)."""
+        now = now_iso or self.now_iso()
+        with self._lock:
+            query = "SELECT * FROM benchmark_evidence"
+            cond, params = [], []
+            if model_id is not None:
+                cond.append("model_id=?")
+                params.append(model_id)
+            if not include_expired:
+                cond.append("expires_at > ?")
+                params.append(now)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY created_at DESC, evidence_id DESC LIMIT 500"
+            rows = self._conn.execute(query, params).fetchall()
+        out = [{k: r[k] for k in r.keys()} for r in rows]
+        for r in out:
+            r["expired"] = r["expires_at"] <= now
+        return out
+
+    def sweep_expired_benchmark_evidence(self, now_iso: str | None = None) -> int:
+        now = now_iso or self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM benchmark_evidence WHERE expires_at <= ?", (now,))
+            return cur.rowcount
 
     def close(self) -> None:
         with self._lock:

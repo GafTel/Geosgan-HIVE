@@ -74,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Team YAML config (default: HIVE_CONFIG env var or config/agents.yaml)",
     )
     parser.add_argument(
+        "--catalog-path",
+        default=None,
+        help="Override the informational provider catalog path (config "
+             "'catalog_path:') for routing commands",
+    )
+    parser.add_argument(
         "--usage-log",
         default=None,
         help="Append per-call usage/cost records as JSONL to this file (or HIVE_USAGE_LOG)",
@@ -136,6 +142,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision", default=None, choices=["completed", "failed"],
                         help="Resolution decision for --resolve-execution")
     parser.add_argument("--evidence", default="", help="Evidence note for --resolve-execution")
+    # Phase 5 (v0.7.0, A2): model benchmark engine management (offline/simulated
+    # by default; measured runs need separate authorization — never executed here)
+    parser.add_argument(
+        "--benchmark-simulate", action="store_true",
+        help="Run the benchmark suite with the deterministic SIMULATED caller "
+             "(synthetic fixtures, no model/network) and store the evidence; exit",
+    )
+    parser.add_argument("--benchmark-model", default="simulated/fixture@sha256:0000",
+                        help="Exact pinned model identity recorded for --benchmark-simulate")
+    parser.add_argument("--benchmark-suite", default=None,
+                        help="Benchmark suite version (default: latest)")
+    parser.add_argument("--benchmark-report", action="store_true",
+                        help="Print the stored benchmark evidence report and exit")
+    parser.add_argument("--benchmark-list", action="store_true",
+                        help="Like --benchmark-report but includes expired records")
+    parser.add_argument("--benchmark-model-filter", default=None,
+                        help="Filter benchmark report by exact model id")
+    parser.add_argument("--route", action="store_true",
+                        help="Show the explainable routing decision for one agent "
+                             "(offline; no dispatch)")
+    parser.add_argument("--route-agent", default="researcher",
+                        help="Agent name for --route (default: researcher)")
+    parser.add_argument("--route-capabilities", default="",
+                        help="Comma-separated required capabilities for --route")
+    parser.add_argument("--route-needs-tools", action="store_true",
+                        help="Require tool support for --route")
+    parser.add_argument("--route-context-tokens", type=int, default=0,
+                        help="Required context tokens for --route")
+    parser.add_argument("--routing-decisions", action="store_true",
+                        help="List durable routing decisions (bounded provenance)")
+    parser.add_argument("--cloud-evidence", action="store_true",
+                        help="List durable cloud evidence records (metadata only; "
+                             "read-only inspection, never authorizes anything)")
+    parser.add_argument("--cloud-evidence-all", action="store_true",
+                        help="Include revoked/expired cloud evidence records")
+    parser.add_argument("--routing-run", default=None,
+                        help="Filter --routing-decisions by run id")
     args = parser.parse_args(argv)
 
     management = bool(
@@ -143,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.recovery_worker or args.pending_approvals is not None
         or args.show_approval or args.approve or args.deny or args.cancel_approval
         or args.tool_executions or args.resolve_execution
+        or args.benchmark_simulate or args.benchmark_report or args.benchmark_list
+        or args.route or args.routing_decisions or args.cloud_evidence
     )
     if args.task is None and not management:
         parser.error("task is required unless a management command is used "
@@ -162,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         config = config.model_copy(
             update={"checkpoint": cc.model_copy(update={"path": args.checkpoint})}
         )
+    if args.catalog_path:
+        config = config.model_copy(update={"catalog_path": args.catalog_path})
     if management and config.checkpoint is None:
         print(
             "Configuration error: no checkpoint store configured "
@@ -327,6 +374,90 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if args.benchmark_simulate and store is not None:
+            from .benchmarks import SUITE_VERSION, SimulatedCaller, format_report, run_benchmark
+
+            suite = args.benchmark_suite or SUITE_VERSION
+            result = run_benchmark(
+                store, caller=SimulatedCaller(), model_id=args.benchmark_model,
+                model_version=args.benchmark_model.split("@", 1)[1], suite_version=suite,
+                execution_mode="simulated",
+                hardware_profile="offline-simulated",
+                run_config={"caller": "SimulatedCaller", "suite": suite},
+                provenance="CLI --benchmark-simulate (synthetic fixtures; NOT a real "
+                           "model measurement)",
+            )
+            print(f"Simulated benchmark recorded: {result.evidence_id} "
+                  f"score={result.aggregate_score:.3f} "
+                  f"cases={result.cases_passed}/{result.cases_total} "
+                  f"mode={result.execution_mode.upper()}")
+            print(format_report(store.list_benchmark_evidence()))
+            return 0
+        if (args.benchmark_report or args.benchmark_list) and store is not None:
+            from .benchmarks import format_report
+
+            rows = store.list_benchmark_evidence(
+                model_id=args.benchmark_model_filter,
+                include_expired=args.benchmark_list)
+            print(format_report(rows))
+            return 0
+        if args.route or args.routing_decisions:
+            from .catalog import load_catalog
+            from .routing import ModelRouter, RoutingPolicy
+
+            catalog = load_catalog(config.catalog_path) if config.catalog_path else None
+            policy = config.routing or RoutingPolicy()  # fixed mode by default
+            router = ModelRouter(
+                policy, catalog=catalog,
+                cloud_registry=getattr(gateway, "_cloud_registry", None),
+                health=getattr(gateway, "health", None),
+                store=store)
+            if args.route:
+                agent = config.supervisor if args.route_agent == config.supervisor.name \
+                    else config.agent(args.route_agent)
+                caps = tuple(c.strip() for c in args.route_capabilities.split(",")
+                             if c.strip())
+                decision = router.select(
+                    agent=agent.name, configured_model=agent.model,
+                    required_capabilities=caps,
+                    needs_tools=args.route_needs_tools,
+                    context_tokens=args.route_context_tokens)
+                print(f"Routing decision {decision.decision_id}")
+                print(f"  agent={decision.agent} mode={decision.selection_mode} "
+                      f"selected={decision.selected_model} reason={decision.reason}")
+                print(f"  policy={decision.policy_version} method={decision.scoring_method} "
+                      f"evidence={list(decision.evidence_refs) or '[]'}")
+                for c in decision.candidates:
+                    score = f"{c.score:.4f}" if c.score is not None else "-"
+                    print(f"    {'ELIGIBLE' if c.eligible else 'rejected'} "
+                          f"{c.model} reason={c.reason} score={score}")
+                return 0
+            rows = store.list_routing_decisions(run_id=args.routing_run) \
+                if store is not None else []
+            print(f"Routing decisions: {len(rows)} record(s)")
+            for r in rows:
+                print(f"  {r['decision_id'][:12]} run={r['run_id']} agent={r['agent']} "
+                      f"mode={r['selection_mode']} selected={r['selected_model']} "
+                      f"method={r['scoring_method']} at={r['created_at']}")
+            return 0
+        if args.cloud_evidence:
+            reg = getattr(gateway, "_cloud_registry", None)
+            vault = getattr(reg, "evidence_vault", None) if reg is not None else None
+            if vault is None:
+                print("Cloud evidence vault: not wired "
+                      "(set cloud.evidence_vault: true in the config)")
+                return 0
+            rows = vault.list_evidence(include_revoked=args.cloud_evidence_all,
+                                       include_expired=args.cloud_evidence_all)
+            print(f"Cloud evidence: {len(rows)} record(s) (metadata only; "
+                  "listing never authorizes dispatch)")
+            for r in rows:
+                print(f"  {r['evidence_id'][:12]} provider={r['provider_id']} "
+                      f"class={r['evidence_class']} model={r['model_id']} "
+                      f"restriction={r['spending_restriction']} "
+                      f"overage={r['overage_behavior']} revoked={bool(r['revoked'])} "
+                      f"expires={r['expires_at']}")
+            return 0
         if args.resume:
             if args.async_:
                 result = asyncio.run(supervisor.aresume(args.resume))

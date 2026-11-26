@@ -66,6 +66,7 @@ def build_tool_gateway(
     config: HiveConfig,
     store: Any = None,
     approval_manager: ApprovalManager | None = None,
+    lease_lookup: Any = None,
 ) -> ToolGateway:
     """Build the production ToolGateway. ALWAYS enforced by the factory.
 
@@ -74,6 +75,11 @@ def build_tool_gateway(
     are available globally (empty list = deny all); new capabilities are off unless
     listed. `strict` fails closed when the durable store is wired but the run
     context is missing.
+
+    A6: when `config.apis` enables public API providers, their typed read-only
+    tools are registered on the same catalog (still deny-by-default via the tool
+    policy AND the per-provider outbound policy). All external API tools are
+    disabled by default.
     """
     catalog, _sandbox = build_tool_catalog(config)
     if approval_manager is None and store is not None and config.tools is not None:
@@ -95,6 +101,18 @@ def build_tool_gateway(
         list(config.supervisor.permissions.allowed_tools),
     )
     policy = build_policy(global_enabled=global_enabled, agent_permissions=agent_permissions)
+    # A6: register specialized public API tools for explicitly enabled providers
+    # (default: none — every external API tool stays disabled). The session is
+    # built through the strict production path (endpoint binding enforced).
+    apis = getattr(config, "apis", None)
+    if apis is not None and apis.enabled and store is not None:
+        from .api_adapters import register_api_tools
+        from .outbound import build_api_session
+
+        session = build_api_session(config, store, approval_manager)
+        if session is not None:
+            register_api_tools(catalog, session, lease_lookup=lease_lookup,
+                               providers=apis.enabled)
     return ToolGateway(
         catalog,
         policy,
