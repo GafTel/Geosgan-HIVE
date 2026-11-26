@@ -757,3 +757,180 @@ def test_worldbank_invalid_identifiers_and_range_rejected(tmp_path, worldbank_se
         assert not r.ok, bad
     assert len(WorldBankHandler.hits) == hits
     store.close()
+
+
+# ---- A6.5 Open-Meteo + A6.6 SearXNG decision ----------------------------------------
+
+class OpenMeteoHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    hits = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).hits.append(self.path)
+        body = json.dumps({
+            "latitude": 40.4, "longitude": -3.7, "timezone": "Europe/Madrid",
+            "units": {"time": "iso8601", "temperature_2m": "°C"},
+            "hourly": {"time": [f"2026-11-26T0{i}:00" for i in range(3)],
+                       "temperature_2m": [12.1, 11.0, 10.2]},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def openmeteo_server():
+    OpenMeteoHandler.hits = []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), OpenMeteoHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield port
+    srv.shutdown()
+
+
+def openmeteo_apis(**overrides):
+    base = {
+        "enabled": ["openmeteo"],
+        "max_wire_bytes_per_request": 1_000_000,
+        "budgets": {"per_endpoint_requests": 100, "per_endpoint_bytes": 10**9,
+                    "per_provider_requests": 100, "per_provider_bytes": 10**9,
+                    "per_run_requests": 50, "per_run_bytes": 10**9},
+        "providers": [{
+            "provider": "openmeteo", "billing": "public_api_no_charge",
+            "outbound_policy": "authorized", "allowed_operations": ["forecast", "historical"],
+            "non_commercial_attestation": True,
+            "endpoints": [
+                {"endpoint_id": "openmeteo-forecast", "scheme": "https",
+                 "host": "api.open-meteo.com", "path_prefixes": ["/v1/forecast"],
+                 "methods": ["GET"]},
+                {"endpoint_id": "openmeteo-archive", "scheme": "https",
+                 "host": "api.open-meteo.com", "path_prefixes": ["/v1/archive"],
+                 "methods": ["GET"]},
+            ],
+        }],
+    }
+    base.update(overrides)
+    return ApiConfig.model_validate(base)
+
+
+def make_om_session(tmp_path, port, apis):
+    store = CheckpointStore(str(tmp_path / "cp.db"), utcnow=lambda: NOW)
+    rules = tuple(
+        EndpointRule(endpoint_id=e.endpoint_id, scheme="http", host="127.0.0.1",
+                     port=port, path_prefixes=tuple(e.path_prefixes), methods=("GET",),
+                     headers={"User-Agent": "hive-test/1.0"})
+        for e in apis.providers[0].endpoints)
+    client = SecureHttpClient(TransportConfig(endpoints=rules,
+                                              limits=HttpLimits(max_retries=1),
+                                              allow_loopback=True))
+    auth = OutboundAuthorizer(store, apis, ApprovalManager(store))
+    return build_offline_test_session(client, auth, store), store
+
+
+def test_openmeteo_requires_noncommercial_attestation():
+    from pydantic import ValidationError
+
+    apis = openmeteo_apis()
+    dumped = apis.model_dump()
+    dumped["providers"][0]["non_commercial_attestation"] = False
+    with pytest.raises(ValidationError, match="NON-COMMERCIAL|attestation"):
+        ApiConfig.model_validate(dumped)
+
+
+def test_openmeteo_forecast_and_historical(tmp_path, openmeteo_server):
+    session, store = make_om_session(tmp_path, openmeteo_server, openmeteo_apis())
+    catalog = ToolCatalog()
+    names = register_api_tools(catalog, session, providers=["openmeteo"])
+    assert names == ["openmeteo_forecast", "openmeteo_historical"]
+    policy = build_policy(global_enabled=names,
+                          agent_permissions={"researcher": (True, names)})
+    gw = ToolGateway(catalog, policy, store=store, approval_manager=ApprovalManager(store))
+
+    r = gw.execute("openmeteo_forecast",
+                   {"latitude": 40.4, "longitude": -3.7, "forecast_days": 3,
+                    "hourly": ["temperature_2m", "precipitation"]}, ctx=ctx())
+    assert r.ok, r.error
+    out = json.loads(r.output)
+    assert out["kind"] == "weather_forecast"
+    assert out["units"]["temperature_2m"] == "°C"
+    assert out["series"]["temperature_2m"] == [12.1, 11.0, 10.2]
+    assert "non-commercial" in out["attribution"]
+    hit = OpenMeteoHandler.hits[-1]
+    assert hit.startswith("/v1/forecast?") and "forecast_days=3" in hit
+    assert "hourly=temperature_2m%2Cprecipitation" in hit or "temperature_2m,precipitation" in hit
+
+    r = gw.execute("openmeteo_historical",
+                   {"latitude": 40.4, "longitude": -3.7,
+                    "start_date": "2026-11-20", "end_date": "2026-11-26"}, ctx=ctx())
+    assert r.ok, r.error
+    assert json.loads(r.output)["kind"] == "historical_weather"
+    assert OpenMeteoHandler.hits[-1].startswith("/v1/archive?")
+    store.close()
+
+
+def test_openmeteo_invalid_coords_vars_dates_rejected(tmp_path, openmeteo_server):
+    session, store = make_om_session(tmp_path, openmeteo_server, openmeteo_apis())
+    catalog = ToolCatalog()
+    register_api_tools(catalog, session, providers=["openmeteo"])
+    names = ["openmeteo_forecast", "openmeteo_historical"]
+    policy = build_policy(global_enabled=names,
+                          agent_permissions={"researcher": (True, names)})
+    gw = ToolGateway(catalog, policy, store=store, approval_manager=ApprovalManager(store))
+    hits = len(OpenMeteoHandler.hits)
+    bads = [
+        ("openmeteo_forecast", {"latitude": 91, "longitude": 0}),
+        ("openmeteo_forecast", {"latitude": 0, "longitude": -181}),
+        ("openmeteo_forecast", {"latitude": 0, "longitude": 0, "forecast_days": 99}),
+        ("openmeteo_forecast", {"latitude": 0, "longitude": 0,
+                                "hourly": ["temperature_2m", "evil_var"]}),
+        ("openmeteo_historical", {"latitude": 0, "longitude": 0,
+                                  "start_date": "2026-13-01", "end_date": "2026-11-26"}),
+        ("openmeteo_historical", {"latitude": 0, "longitude": 0,
+                                  "start_date": "2026-11-26", "end_date": "2026-11-20"}),
+        ("openmeteo_historical", {"latitude": 0, "longitude": 0,
+                                  "start_date": "2026-08-01", "end_date": "2026-11-26"}),
+    ]
+    for tool, bad in bads:
+        r = gw.execute(tool, bad, ctx=ctx())
+        assert not r.ok, (tool, bad)
+    assert len(OpenMeteoHandler.hits) == hits  # nothing was sent
+    store.close()
+
+
+def test_searxng_stays_disabled_and_requires_authorization():
+    """A6.6 decision: no SearXNG tool is registered in v0.7.0 — the public API
+    transport rejects private/loopback instances by design; a separately scoped
+    transport policy is the documented prerequisite."""
+    from pydantic import ValidationError
+
+    from geosgan_hive.api_adapters import SEARXNG_PREREQUISITE
+
+    assert "separately scoped" in SEARXNG_PREREQUISITE
+    # config without explicit instance authorization is rejected
+    ep = [{"endpoint_id": "searxng-instance", "scheme": "https",
+           "host": "search.example.org", "path_prefixes": ["/search"],
+           "methods": ["GET"]}]
+    with pytest.raises(ValidationError, match="searxng_instance_authorized"):
+        ApiConfig.model_validate({"enabled": ["searxng"], "providers": [
+            {"provider": "searxng", "billing": "public_api_no_charge",
+             "endpoints": ep}]})
+    # even authorized, no tool registers (NEVER_REGISTER)
+    apis = ApiConfig.model_validate({"enabled": ["searxng"], "providers": [
+        {"provider": "searxng", "billing": "public_api_no_charge",
+         "searxng_instance_authorized": True, "endpoints": ep}]})
+    store = CheckpointStore(":memory:")
+    rule = EndpointRule(endpoint_id="searxng-instance", scheme="http", host="127.0.0.1",
+                        port=80, path_prefixes=("/search",), methods=("GET",),
+                        headers={"User-Agent": "hive-test/1.0"})
+    client = SecureHttpClient(TransportConfig(endpoints=(rule,), allow_loopback=True))
+    session = build_offline_test_session(
+        client, OutboundAuthorizer(store, apis, ApprovalManager(store)), store)
+    catalog = ToolCatalog()
+    assert register_api_tools(catalog, session, providers=["searxng"]) == []
+    assert catalog.names() == []
+    store.close()

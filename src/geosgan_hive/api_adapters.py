@@ -806,3 +806,172 @@ def worldbank_tools(session, lease_lookup=None):
 
 
 ADAPTER_BUILDERS["worldbank"] = worldbank_tools
+
+
+# ---- A6.5 Open-Meteo --------------------------------------------------------------
+
+#: conservative fixed variable allowlists (documented Open-Meteo variables only)
+OM_HOURLY_VARS = ("temperature_2m", "relative_humidity_2m", "precipitation",
+                  "wind_speed_10m", "weather_code")
+OM_DAILY_VARS = ("temperature_2m_max", "temperature_2m_min", "precipitation_sum",
+                 "wind_speed_10m_max", "sunrise", "sunset")
+
+
+class _OMBase(BaseModel):
+    model_config = {"extra": "forbid"}
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    hourly: list[str] = Field(default_factory=lambda: ["temperature_2m"],
+                              min_length=0, max_length=8)
+    daily: list[str] = Field(default_factory=list, min_length=0, max_length=8)
+
+    @field_validator("hourly")
+    @classmethod
+    def _hourly(cls, v):
+        for x in v:
+            if x not in OM_HOURLY_VARS:
+                raise ValueError(f"hourly variable {x!r} not in the allowlist")
+        return v
+
+    @field_validator("daily")
+    @classmethod
+    def _daily(cls, v):
+        for x in v:
+            if x not in OM_DAILY_VARS:
+                raise ValueError(f"daily variable {x!r} not in the allowlist")
+        return v
+
+
+class OpenMeteoForecastInput(_OMBase):
+    forecast_days: int = Field(default=7, ge=1, le=16)
+
+
+class OpenMeteoHistoricalInput(_OMBase):
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @model_validator(mode="after")
+    def _range(self):
+        from datetime import date
+
+        def parse(s):
+            try:
+                y, m, d = (int(x) for x in s.split("-"))
+                return date(y, m, d)
+            except ValueError as exc:
+                raise ValueError(f"invalid date {s!r}") from exc
+
+        a, b = parse(self.start_date), parse(self.end_date)
+        if b < a:
+            raise ValueError("end_date must be >= start_date")
+        if (b - a).days > 92:
+            raise ValueError("historical range too large (max 93 days)")
+        if a.year < 1940 or b.year > 2100:
+            raise ValueError("dates out of supported range (1940..2100)")
+        return self
+
+
+def _om_series(payload: Any) -> dict[str, Any]:
+    """Bounded extraction of an untrusted Open-Meteo time series."""
+    out: dict[str, Any] = {"units": payload.get("units") if isinstance(payload, dict) else None}
+    if not isinstance(payload, dict):
+        return out
+    hourly = payload.get("hourly")
+    daily = payload.get("daily")
+    series: dict[str, Any] = {}
+    if isinstance(hourly, dict):
+        times = hourly.get("time")
+        if isinstance(times, list):
+            series["time"] = [_bounded_str(t, 30) for t in times[:200]]
+        for k, v in list(hourly.items())[:12]:
+            if k != "time" and isinstance(v, list):
+                series[k] = v[:200]
+    if isinstance(daily, dict):
+        dtimes = daily.get("time")
+        if isinstance(dtimes, list):
+            series["daily_time"] = [_bounded_str(t, 30) for t in dtimes[:200]]
+        for k, v in list(daily.items())[:12]:
+            if k != "time" and isinstance(v, list):
+                series["daily_" + k] = v[:200]
+    out["series"] = series
+    out["latitude"] = payload.get("latitude")
+    out["longitude"] = payload.get("longitude")
+    out["timezone"] = _bounded_str(payload.get("timezone"), 60)
+    return out
+
+
+class OpenMeteoForecastAdapter(ApiToolAdapter):
+    provider = "openmeteo"
+    endpoint_id = "openmeteo-forecast"
+    operation_id = "forecast"
+
+    def build_request(self, args):
+        params = {"latitude": args["latitude"], "longitude": args["longitude"],
+                  "forecast_days": args["forecast_days"]}
+        if args["hourly"]:
+            params["hourly"] = ",".join(args["hourly"])
+        if args["daily"]:
+            params["daily"] = ",".join(args["daily"])
+        return "/v1/forecast", params
+
+    def normalize(self, payload, args):
+        out = _om_series(payload)
+        out.update({
+            "kind": "weather_forecast",
+            "attribution": ("Open-Meteo (https://open-meteo.com), free for "
+                            "non-commercial use (operator attestation required in "
+                            "config). Forecast data is untrusted."),
+            "docs": "https://open-meteo.com/en/docs",
+        })
+        return out
+
+
+class OpenMeteoHistoricalAdapter(ApiToolAdapter):
+    provider = "openmeteo"
+    endpoint_id = "openmeteo-archive"
+    operation_id = "historical"
+
+    def build_request(self, args):
+        params = {"latitude": args["latitude"], "longitude": args["longitude"],
+                  "start_date": args["start_date"], "end_date": args["end_date"]}
+        if args["hourly"]:
+            params["hourly"] = ",".join(args["hourly"])
+        if args["daily"]:
+            params["daily"] = ",".join(args["daily"])
+        return "/v1/archive", params
+
+    def normalize(self, payload, args):
+        out = _om_series(payload)
+        out.update({
+            "kind": "historical_weather",
+            "start_date": args["start_date"],
+            "end_date": args["end_date"],
+            "attribution": ("Open-Meteo historical weather data (CC BY 4.0), "
+                            "non-commercial use only. Untrusted data."),
+            "docs": "https://open-meteo.com/en/docs",
+        })
+        return out
+
+
+def openmeteo_tools(session, lease_lookup=None):
+    specs = [
+        ToolSpec(name="openmeteo_forecast", category="api",
+                 side_effect=SideEffect.READ_ONLY, idempotent=True,
+                 input_model=OpenMeteoForecastInput,
+                 description=("Weather forecast (max 16 days) from Open-Meteo. "
+                             "Non-commercial use only (operator attestation)."),
+                 max_output_bytes=60_000),
+        ToolSpec(name="openmeteo_historical", category="api",
+                 side_effect=SideEffect.READ_ONLY, idempotent=True,
+                 input_model=OpenMeteoHistoricalInput,
+                 description=("Historical weather (max 93-day range) from the Open-Meteo "
+                             "archive API."),
+                 max_output_bytes=60_000),
+    ]
+    return [
+        (specs[0], OpenMeteoForecastAdapter(session, specs[0], lease_lookup=lease_lookup)),
+        (specs[1], OpenMeteoHistoricalAdapter(session, specs[1], lease_lookup=lease_lookup)),
+    ]
+
+
+ADAPTER_BUILDERS["openmeteo"] = openmeteo_tools
