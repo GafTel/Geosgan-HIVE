@@ -97,8 +97,20 @@ Adversaries / inputs:
   portability) — a compromised *parser library* (not document) could in theory
   bypass the in-process guard; hence no credentials in the worker env and
   bounded rlimits are the load-bearing controls.
-- OS-level: an orphaned worker (parent crash) self-terminates via RLIMIT_CPU/AS;
-  not tracked by the pool (documented).
+- OS-level orphan handling (W1 residual gate, tested): every worker runs a
+  daemon **watchdog thread** armed before op execution that self-terminates
+  the process via `os._exit(4)` on a wall-clock deadline (parent deadline +
+  grace, capped at 1 h) and via `os._exit(5)` when `os.getppid()` no longer
+  matches the parent (parent-death detection). This covers workers blocked on
+  I/O or sleeping, which CPU rlimits alone do NOT terminate. The parent
+  additionally kills the whole process group on its own deadline. Residual
+  risk (documented, not claimed away): a process stuck in uninterruptible
+  kernel sleep (D state) cannot be terminated by any userspace mechanism, and
+  a watchdog thread could in theory be starved by a hostile parser library —
+  which is why no credentials exist in the worker env and rlimits remain the
+  load-bearing controls. We do NOT claim orphaned workers are guaranteed to
+  terminate in every conceivable kernel state — only the tested watchdog +
+  killpg mechanisms above.
 
 **Fail closed:**
 - non-POSIX platforms (Windows): `ParserWorkerUnavailable` on every `run()`.

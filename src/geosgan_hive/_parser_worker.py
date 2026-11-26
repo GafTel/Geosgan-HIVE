@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -155,6 +156,17 @@ def _op_spam_file(req: dict[str, Any]) -> dict[str, Any]:
     return {"output_bytes": n}
 
 
+def _op_fds(req: dict[str, Any]) -> dict[str, Any]:
+    """Report open fd targets (proves close_fds: no inherited descriptors)."""
+    targets = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            targets.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            continue  # fd vanished (e.g. the dir-listing fd itself)
+    return {"fds": sorted(targets)}
+
+
 #: the ONLY operations the worker will execute (trusted, hardcoded; W4 adds
 #: real format parsers here). The parent validates op names against this table.
 OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -167,7 +179,43 @@ OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "net_probe": _op_net_probe,
     "spam": _op_spam,
     "spam_file": _op_spam_file,
+    "fds": _op_fds,
 }
+
+
+def _arm_watchdog(req: dict[str, Any]) -> None:
+    """Worker-side wall-clock + parent-death watchdog (W1 residual gate).
+
+    Runs as a daemon thread for the whole op: if the wall-clock deadline
+    (duration from worker start, capped) expires, or the parent process is gone
+    (os.getppid() != expected), the worker SELF-TERMINATES via os._exit — so an
+    orphaned or I/O-blocked worker cannot run forever even when nobody kills
+    it (rlimits alone do not cover sleeping/blocked workers). Residual risk:
+    a process stuck in uninterruptible kernel sleep (D state) cannot be
+    terminated by anyone — documented, not claimed away."""
+    wd = req.get("watchdog") or {}
+    try:
+        deadline_s = float(wd.get("deadline_s", 0)) if wd else 0
+    except (TypeError, ValueError):
+        deadline_s = 0
+    deadline_s = min(max(deadline_s, 0.0), 3600.0)  # hard cap
+    parent_pid = wd.get("parent_pid") if wd else None
+    try:
+        parent_pid = int(parent_pid) if parent_pid is not None else None
+    except (TypeError, ValueError):
+        parent_pid = None
+    deadline = time.monotonic() + deadline_s if deadline_s > 0 else None
+
+    def _wd() -> None:
+        while True:
+            if parent_pid is not None and hasattr(os, "getppid") \
+                    and os.getppid() != parent_pid:
+                os._exit(5)  # parent death detected
+            if deadline is not None and time.monotonic() >= deadline:
+                os._exit(4)  # wall-clock deadline self-termination
+            time.sleep(0.1)
+
+    threading.Thread(target=_wd, daemon=True).start()
 
 
 def main(argv: list[str]) -> int:
@@ -183,6 +231,7 @@ def main(argv: list[str]) -> int:
             raise WorkerProtocolError(f"unknown op {op!r}")
         req.setdefault("input_path", input_path)
         req.setdefault("output_path", output_path)
+        _arm_watchdog(req)  # armed BEFORE any op execution
         result = OPS[op](req)
         resp = {"ok": True, "op": op, **result}
         payload = json.dumps(resp).encode("utf-8")

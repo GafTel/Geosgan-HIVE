@@ -97,8 +97,11 @@ def _bounded_text(value: Any, cap: int) -> str:
 
 
 def sanitize_locator(locator: str) -> str:
-    """Canonical locator for storage: sensitive query parameter VALUES are
-    redacted (never persisted), control chars stripped, length capped."""
+    """Canonical locator for storage (W2 residual gate): sensitive query
+    parameter VALUES, URL userinfo (user:pass@host) and sensitive FRAGMENTS
+    (OAuth-style #access_token=...) are redacted — never persisted; control
+    chars stripped; length capped. Paths are bounded but may still contain
+    operator-sensitive segments, so display surfaces truncate them."""
     raw = str(locator)
     if not raw:
         return ""
@@ -107,12 +110,25 @@ def sanitize_locator(locator: str) -> str:
         parts = urlsplit(cleaned)
     except ValueError:
         return cleaned[:MAX_LOCATOR_CHARS]
-    if parts.scheme and parts.netloc and parts.query:
-        kept = [
-            (k, "[REDACTED]" if _SENSITIVE_PARAM.search(k) else v)
-            for k, v in parse_qsl(parts.query, keep_blank_values=True)
-        ]
-        cleaned = urlunsplit(parts._replace(query=urlencode(kept)))
+    if parts.scheme and parts.netloc:
+        host = parts.hostname or ""
+        try:
+            port = f":{parts.port}" if parts.port else ""
+        except ValueError:
+            port = ""
+        netloc = f"[REDACTED]@{host}{port}" if parts.username or parts.password \
+            else f"{host}{port}"
+        if parts.query:
+            kept = [
+                (k, "[REDACTED]" if _SENSITIVE_PARAM.search(k) else v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            ]
+            query = urlencode(kept)
+        else:
+            query = ""
+        fragment = "[REDACTED]" if _SENSITIVE_PARAM.search(parts.fragment or "") \
+            else parts.fragment
+        cleaned = urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
     return cleaned[:MAX_LOCATOR_CHARS]
 
 
@@ -236,6 +252,17 @@ class SourceRegistry:
         st = SourceType(str(source_type))
         vis = Visibility(str(visibility))
         sto = StoragePolicy(str(storage))
+        # W2 residual gate: origin kind and source type cannot be relabeled —
+        # a fixture origin can only register fixture sources, and a trusted
+        # runtime origin can never mint a fixture source (or vice versa)
+        if origin.kind is OriginKind.OFFLINE_FIXTURE and st is not SourceType.OFFLINE_FIXTURE:
+            raise CheckpointError(
+                "fixture origin cannot be relabeled as production source type "
+                f"{st.value!r} — rejected")
+        if origin.kind is OriginKind.TRUSTED_RUNTIME and st is SourceType.OFFLINE_FIXTURE:
+            raise CheckpointError(
+                "trusted-runtime origin cannot register an offline_fixture source "
+                "— rejected")
         sid = source_id or ("src_" + secrets.token_hex(8))
         if not _SOURCE_ID.match(sid):
             raise CheckpointError(f"invalid source_id {sid!r}")
@@ -499,10 +526,11 @@ class SourceRegistry:
         if d["expired"]:
             raise CheckpointError(f"citation {source_id!r} expired")
         sha = (d["content_sha256"] or d["raw_sha256"] or "")[:16]
+        display_locator = (d["locator"] or "unknown")[:256]  # bounded display metadata
         parts = [
             f"[{d['source_id']}]",
             f"type={d['source_type']} provider={d['provider'] or 'unknown'}",
-            f"locator={d['locator'] or 'unknown'}",
+            f"locator={display_locator}",
             f"retrieved_at={d['retrieved_at']}",
             f"sha256:{sha or 'unknown'}",
             f"license:{d['license']}",

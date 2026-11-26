@@ -285,7 +285,7 @@ def test_rlimit_failure_fails_closed(tmp_path):
 
 def test_ops_registry_is_fixed_and_trusted():
     expected = {"ping", "sha256", "echo_file", "sleep", "env", "rlimits",
-                "net_probe", "spam", "spam_file"}
+                "net_probe", "spam", "spam_file", "fds"}
     assert set(_parser_worker.OPS) == expected
     for fn in _parser_worker.OPS.values():
         assert callable(fn)
@@ -305,3 +305,76 @@ def test_closed_pool_rejects(tmp_path):
     pool.close()
     with pytest.raises(ParserIsolationError, match="closed"):
         pool.run("ping")
+
+
+# ---- W1 residual: worker-side watchdog + fd hygiene ------------------------------
+
+def _spawn_worker_direct(tmp_path, req: dict):
+    """Spawn the trusted worker directly (no pool) with a raw request frame."""
+    import json as _json
+    import subprocess as _sp
+
+    from geosgan_hive.parser_isolation import _WORKER_BOOTSTRAP, ParserResourceLimits
+
+    lim = ParserResourceLimits()
+    cfg = _json.dumps({"rlimits": [
+        ["RLIMIT_AS", lim.max_memory_bytes, lim.max_memory_bytes],
+        ["RLIMIT_CPU", lim.max_cpu_seconds, lim.max_cpu_seconds + 1],
+        ["RLIMIT_FSIZE", lim.max_output_file_bytes, lim.max_output_file_bytes],
+        ["RLIMIT_CORE", 0, 0],
+    ]})
+    d = tmp_path / "direct"
+    d.mkdir()
+    ip, op = d / "in.bin", d / "out.bin"
+    ip.write_bytes(b"x")
+    payload = _json.dumps(req).encode()
+    frame = len(payload).to_bytes(4, "big") + payload
+    src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    proc = _sp.Popen(
+        [sys.executable, "-I", "-c", _WORKER_BOOTSTRAP, src, cfg, str(ip), str(op)],
+        stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE,
+        env={"PATH": os.defpath, "LC_ALL": "C.UTF-8", "HOME": str(d), "TMPDIR": str(d)},
+        cwd=str(d), shell=False, start_new_session=True)
+    out, err = proc.communicate(frame, timeout=30)
+    return proc.returncode, out, err
+
+
+@posix_only
+def test_worker_watchdog_self_terminates_on_deadline(tmp_path):
+    # op sleeps 30s; worker watchdog deadline 0.5s -> worker exits 4 by itself,
+    # with NO parent kill (parent just waits)
+    rc, out, err = _spawn_worker_direct(tmp_path, {
+        "op": "sleep", "seconds": 30,
+        "watchdog": {"deadline_s": 0.5, "parent_pid": os.getpid()}})
+    assert rc == 4
+
+
+@posix_only
+def test_worker_watchdog_detects_parent_death(tmp_path):
+    # parent_pid points to a nonexistent process -> watchdog exits 5 quickly
+    rc, out, err = _spawn_worker_direct(tmp_path, {
+        "op": "sleep", "seconds": 30,
+        "watchdog": {"deadline_s": 60, "parent_pid": 2**22 + 12345}})
+    assert rc == 5
+
+
+@posix_only
+def test_worker_inherits_no_sensitive_file_descriptors(tmp_path):
+    secret_fd_file = tmp_path / "parent-secret.db"
+    secret_fd_file.write_bytes(b"parent-side secret handle")
+    fh = open(secret_fd_file, "rb")  # stays open in the parent during the job
+    try:
+        with _pool(tmp_path) as pool:
+            r = pool.run("fds")
+    finally:
+        fh.close()
+    assert r.ok
+    targets = r.response["fds"]
+    assert all(not t.endswith("parent-secret.db") for t in targets)
+    # only std streams + job-dir files + pipes/sockets/anon
+    ok_prefixes = ("pipe:", "socket:", "anon_inode:", "/dev/")
+    job_root = os.path.realpath(str(tmp_path))
+    for t in targets:
+        if t.startswith(ok_prefixes):
+            continue
+        assert os.path.realpath(t).startswith(job_root + os.sep) or t in ("/dev/null",), t

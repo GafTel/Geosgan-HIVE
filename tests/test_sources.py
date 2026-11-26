@@ -384,6 +384,59 @@ def test_sanitize_locator_unit():
     assert len(sanitize_locator("https://h/" + "p" * 5000)) <= 2048
 
 
+# ---- W2 residual gate ---------------------------------------------------------------
+
+def test_fixture_origin_cannot_be_relabeled_as_production(tmp_path):
+    store, _ = _store(tmp_path)
+    reg = SourceRegistry(store, allow_fixtures=True)
+    # grab a fixture origin via register_fixture's internal path is not public;
+    # emulate forgery: build the private origin object directly (trusted-process
+    # boundary: Python-level access is trusted; the check is defense in depth)
+    from geosgan_hive.sources import OriginKind, _TrustedOrigin
+
+    forged = _TrustedOrigin(kind=OriginKind.OFFLINE_FIXTURE, run_id=None, task_id=None,
+                            lease_owner=None, lease_generation=None, agent_id="x")
+    with pytest.raises(CheckpointError, match="relabeled"):
+        reg.register(origin=forged, source_type=SourceType.WEB_PAGE, provider="web",
+                     locator="https://evil.example.org/")
+    # and the reverse: trusted runtime origin cannot mint a fixture record
+    gen = _run(store)
+    origin = reg.trusted_origin(run_id="run-1", lease_owner="w1",
+                                lease_generation=gen, agent_id="r")
+    with pytest.raises(CheckpointError, match="offline_fixture"):
+        reg.register(origin=origin, source_type=SourceType.OFFLINE_FIXTURE,
+                     provider="p", locator="l")
+    store.close()
+
+
+def test_userinfo_and_sensitive_fragment_redacted(tmp_path):
+    store, _ = _store(tmp_path)
+    reg = SourceRegistry(store, allow_fixtures=True)
+    sid = reg.register_fixture(
+        locator="https://alice:hunter2@proxy.example.org/p?x=1#access_token=TOPSECRET999")
+    with store._lock:
+        raw = store._conn.execute(
+            "SELECT locator FROM sources WHERE source_id=?", (sid,)).fetchone()[0]
+    assert "hunter2" not in raw and "alice" not in raw and "TOPSECRET999" not in raw
+    assert "[REDACTED]@proxy.example.org" in raw
+    assert "#[REDACTED]" in raw  # whole sensitive fragment redacted
+    assert "x=1" in raw
+    db_bytes = open(str(tmp_path / "cp.db"), "rb").read()
+    assert b"hunter2" not in db_bytes and b"TOPSECRET999" not in db_bytes
+    store.close()
+
+
+def test_cite_display_locator_is_bounded(tmp_path):
+    store, _ = _store(tmp_path)
+    reg = SourceRegistry(store, allow_fixtures=True)
+    long_path = "p/" + "a" * 3000
+    sid = reg.register_fixture(locator=f"https://h.example.org/{long_path}")
+    cite = reg.cite(sid)
+    assert len(cite) < 600  # display locator truncated, not the full 3KB path
+    assert "a" * 3000 not in cite
+    store.close()
+
+
 # ---- caller hash cross-checks ------------------------------------------------------------
 
 def test_caller_content_hash_mismatch_rejected(tmp_path):

@@ -352,6 +352,13 @@ class ParserWorkerPool:
                 "max_input_bytes": lim.max_input_bytes,
                 "max_output_bytes": lim.max_output_file_bytes,
             },
+            # worker-side watchdog: self-terminates on wall-clock deadline
+            # (parent deadline + grace) or parent death, so orphaned/blocked
+            # workers do not outlive their job even without a parent kill
+            "watchdog": {
+                "deadline_s": min(deadline_s + 5.0, 3600.0),
+                "parent_pid": os.getpid(),
+            },
         })
         req_payload = json.dumps(request).encode("utf-8")
         if len(req_payload) > lim.max_request_bytes:
@@ -411,6 +418,12 @@ class ParserWorkerPool:
                 return result
             if proc.returncode == 3:
                 result.error = "worker failed closed: resource limits could not be applied"
+                return result
+            if proc.returncode == 4:
+                result.error = "worker watchdog: wall-clock deadline self-termination"
+                return result
+            if proc.returncode == 5:
+                result.error = "worker watchdog: parent death detected, self-terminated"
                 return result
             try:
                 resp = self._parse_response_frame(raw_out, out_trunc)
