@@ -8,6 +8,7 @@ from pathlib import Path
 from .agent_config import CheckpointConfig, load_hive_config
 from .approvals import ApprovalManager
 from .checkpoints import CheckpointStore, ToolExecutionStatus
+from .cloud_profiles import LocalOllamaAdapter
 from .config import Settings
 from .errors import ApprovalError, ConfigError, HiveError
 from .factory import build_team
@@ -293,7 +294,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
             default_timeout_seconds=settings.default_timeout_seconds,
         )
-        supervisor, _agents = build_team(config, gateway, tracker, checkpoint_store=store)
+        # Phase 4: a cloud block must always run with the zero-cost gate wired.
+        # The only production adapter today is local Ollama inference (cost 0.0,
+        # loopback-only); live cloud providers stay fail-closed blocked because
+        # no live-capable adapter is registered for them.
+        cloud_adapter = LocalOllamaAdapter() if config.cloud is not None else None
+        supervisor, _agents = build_team(config, gateway, tracker, checkpoint_store=store,
+                                         cloud_adapter=cloud_adapter)
         if args.max_steps is not None:
             supervisor.max_steps = args.max_steps
 

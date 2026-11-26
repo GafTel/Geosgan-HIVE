@@ -649,3 +649,60 @@ FULL args sha256.
   task + agent + tool + expiry; replay/substitution leave no partial state.
 - Completed tool executions are never replayed; UNKNOWN mutations require
   operator resolution and are never auto-replayed. No exactly-once claims.
+
+## Phase 4: ZERO-COST CLOUD ENGINE (v0.6.0)
+
+Optional `cloud:` config block (absent = legacy `cost_tier()` behavior, unchanged).
+Fail-closed zero-cost mode for low-cost cloud execution (e.g. GitHub Codespaces):
+
+```yaml
+cloud:
+  zero_cost: true            # requires max_spend_usd: 0.0 and a durable checkpoint store
+  max_spend_usd: 0.0         # None/unlimited is rejected in zero-cost mode
+  trusted_evidence_binding: false   # default: production live dispatch stays BLOCKED
+  profiles:                  # operator-verified provider/account profiles (no credentials in YAML)
+    - provider: ollama
+      models: [ollama/llama3.2]
+      billing: free_tier_verified
+      ...
+```
+
+- `config/agents.cloud.yaml` is the ready-to-use profile: all five roles on local
+  Ollama inference (first-class zero-cost option), durable SQLite quota store,
+  WAIT-mode suspension on local quota exhaustion. Run it with
+  `geosgan-hive "task" --agents-config config/agents.cloud.yaml`, or fully
+  offline/scripted via `python examples/demo_cloud.py`.
+- Env overrides: `HIVE_CLOUD_ZERO_COST` (strict bool; invalid values raise a
+  config error, never silently disable protection), `HIVE_CLOUD_MAX_SPEND_USD`.
+- Every physical dispatch (sync/async/retry/fallback/resume) passes the
+  immutable `ZeroCostGate`: billing evidence + freshness + credential/account/
+  provider/endpoint binding, billing-enforcement class (provider hard limit /
+  no-overage free allowance / local inference for ollama only; UNKNOWN denies),
+  bounded max_tokens, conservative token bounds (>= 1 token per payload char
+  unless EXACT), cost estimate vs the $0 cap, then a DURABLE atomic quota
+  reservation (schema v8) and a single-use dispatch authorization revalidating
+  lease owner + generation + quota window + policy. Unknown cost is never zero.
+- Quota pools are shared per account fingerprint across models/runs/processes;
+  local windows are operator-attested accounting, NEVER claimed as provider
+  reset times. Retry-After is honored when valid (capped at 86400s); malformed
+  values are ignored.
+- Permanent billing/config errors mark the run FAILED (lease released); only
+  recoverable conditions (quota exhaustion, transient rate limits, provider
+  unavailability) suspend. Recovery workers never busy-loop or double-resume.
+
+### Intentionally blocked (Phase 4)
+
+- LIVE cloud providers (openai/mistral/anthropic/gemini): no live-capable
+  adapter is registered and trusted billing verification is not implemented, so
+  dispatch fails closed. The manual `trusted_evidence_binding` flag alone is
+  NOT proof of provider-side billing safety. Do not weaken this to demo live
+  providers; no live API calls are made in development or tests.
+
+### Known limitations (Phase 4)
+
+- Local quota accounting cannot observe usage outside HIVE and cannot guarantee
+  provider-side billing or Codespaces availability.
+- LiteLLM's import-time cost-map fetch is disabled via
+  `LITELLM_LOCAL_MODEL_COST_MAP=True` (set before importing litellm) so offline
+  startup performs no network requests; a fresh-process regression test guards it.
+- Devcontainer (`.devcontainer/`) pins Python 3.12 for Codespaces.

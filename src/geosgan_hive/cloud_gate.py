@@ -103,12 +103,13 @@ class ZeroCostGate:
             )
         self._registry = registry
         self.store = store
-        self.engine = QuotaEngine(store, registry, utcnow=utcnow) if store is not None else None
-        self.adapter = adapter
         # default the gate clock to the STORE's clock so quota windows and lease
         # checks always use one consistent time source
-        self._utcnow = utcnow or (store.utcnow if store is not None
-                                  else (lambda: datetime.now(UTC)))
+        utcnow_fn = utcnow or (store.utcnow if store is not None
+                               else (lambda: datetime.now(UTC)))
+        self.engine = QuotaEngine(store, registry, utcnow=utcnow_fn) if store is not None else None
+        self.adapter = adapter
+        self._utcnow = utcnow_fn
         self.default_max_output_tokens = default_max_output_tokens
         object.__setattr__(self, "_frozen", True)
 

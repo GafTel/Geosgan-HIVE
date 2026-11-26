@@ -588,6 +588,48 @@ class FakeCloudAdapter:
         )
 
 
+class LocalOllamaAdapter:
+    """Adapter for local Ollama inference: the FIRST-CLASS zero-cost option.
+
+    Local inference has no per-request provider billing, so estimated cost is
+    exactly 0.0 for ollama/ models (None -> fail closed for anything else).
+    The adapter itself never touches the network (allow_network=False): the
+    gateway performs the loopback-only Ollama call through LiteLLM. Token
+    estimates use the conservative universal upper bound of 1 token per payload
+    character (BOUNDED_HEURISTIC, never chars/4), which satisfies live
+    conservative-bound enforcement.
+    """
+
+    name = "ollama-local"
+    allow_network = False
+    is_test_only = False
+    capabilities = AdapterCapabilities(
+        live_supported=True, token_estimation=TokenEstimationMode.BOUNDED_HEURISTIC
+    )
+
+    def estimate_cost(self, model: str, *, prompt_tokens: int,
+                      max_output_tokens: int) -> float | None:
+        # local inference: no per-request provider billing; unknown for others
+        return 0.0 if model.startswith("ollama/") else None
+
+    def estimate_tokens(self, model: str, *, prompt_chars: int,
+                        max_output_tokens: int) -> TokenEstimate | None:
+        if not model.startswith("ollama/") or max_output_tokens < 1:
+            return None
+        return TokenEstimate(
+            prompt_tokens=max(1, prompt_chars), max_output_tokens=max_output_tokens
+        )
+
+    def quota_pool(self, model: str) -> str | None:
+        return None  # pools come from the profile registry, not the adapter
+
+    def dispatch(self, model: str, messages: list[Any]) -> Any:
+        raise CloudOfflineError(
+            f"adapter {self.name!r} never dispatches itself (allow_network=False); "
+            "the gateway calls the local Ollama endpoint through LiteLLM"
+        )
+
+
 def _strict_int(value: Any, name: str) -> int:
     if type(value) is not int:  # bool is not accepted as an int here
         raise CostUnknownError(f"{name} must be a strict int, got {type(value).__name__}")

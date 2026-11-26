@@ -45,6 +45,7 @@ from .cloud_profiles import (
     CloudProfileRegistry,
     CloudProviderAdapter,
     FakeCloudAdapter,
+    LocalOllamaAdapter,
     QuotaPeriod,
     QuotaResetSemantics,
     QuotaSpec,
@@ -140,7 +141,7 @@ from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AdapterCapabilities",
@@ -156,6 +157,7 @@ __all__ = [
     "CloudProviderAdapter",
     "CostUnknownError",
     "FakeCloudAdapter",
+    "LocalOllamaAdapter",
     "QuotaEngine",
     "QuotaPeriod",
     "QuotaReservation",
