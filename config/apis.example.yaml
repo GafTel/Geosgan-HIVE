@@ -116,3 +116,43 @@ apis:
       # PREREQUISITE NOT MET in v0.7.0: self-hosted/private instances need a
       # separately scoped secure transport policy (the public transport rejects
       # private/loopback destinations). See api_adapters.SEARNXNG_PREREQUISITE.
+
+# --- W3 (v0.8.0): secure web retrieval (separate from the JSON APIs above) ---
+# The `web` provider exposes ONE read-only tool, web_get_page, that fetches a
+# single operator-allowlisted page through the same SecureHttpClient + outbound
+# authorization + durable budgets. DISABLED BY DEFAULT: it activates only when
+# "web" is listed in `enabled` AND a matching web_endpoints policy exists.
+#
+# Each web_endpoints entry narrows one `web` endpoint to:
+#   - allowed_path_prefixes: segment-aware path prefixes (must be within the
+#     endpoint's path_prefixes; '/docs' never authorizes '/docsx')
+#   - allowed_query_params: allowed query parameter NAMES only (values bounded
+#     by max_query_value_chars); sensitive names are additionally redacted from
+#     any stored locator
+#   - allowed_content_types / max_response_bytes / max_extract_chars /
+#     max_html_tags / extraction_deadline_seconds: bounded extraction
+# Model-supplied URLs are canonicalized and validated against this policy;
+# userinfo, wrong host/port, encoded traversal, double encoding, unauthorized
+# query params and fragments are rejected. Successful retrievals register a
+# W2 source (lease-fenced trusted origin) with sha256 provenance + citation.
+# No credentials are ever forwarded to web pages. Failed/truncated retrieval is
+# never mislabeled as a complete source. SearXNG remains disabled.
+#
+#   providers:
+#     - provider: web
+#       billing: public_api_no_charge   # operator attestation, not verified evidence
+#       outbound_policy: approval_required
+#       allowed_operations: [get_page]
+#       endpoints:
+#         - endpoint_id: web-docs
+#           scheme: https
+#           host: docs.example.org        # exact allowlisted host
+#           path_prefixes: ["/docs"]
+#           methods: ["GET"]
+#   web_endpoints:
+#     - endpoint_id: web-docs
+#       allowed_path_prefixes: ["/docs"]
+#       allowed_query_params: [q]
+#       allowed_content_types: [text/html]
+#       max_response_bytes: 2097152
+#       max_extract_chars: 20000
