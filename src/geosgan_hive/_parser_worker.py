@@ -167,6 +167,30 @@ def _op_fds(req: dict[str, Any]) -> dict[str, Any]:
     return {"fds": sorted(targets)}
 
 
+def _make_parse_op(fn_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """W4: document parse ops. The op reads the capped input, calls the trusted
+    parser function (lazy optional-dependency import inside), and writes the
+    bounded JSON result to the output path; the response carries only hashes."""
+
+    def op(req: dict[str, Any]) -> dict[str, Any]:
+        from geosgan_hive import documents as _docs
+
+        fn = getattr(_docs, fn_name)
+        lim = req["limits"]
+        data = _read_input_capped(req["input_path"], int(lim["max_input_bytes"]))
+        res = fn(data, req.get("scope") or {}, lim)
+        payload = json.dumps(res, ensure_ascii=False, default=str).encode("utf-8")
+        cap = int(lim["max_output_bytes"])
+        if len(payload) > cap:
+            raise WorkerProtocolError("parse result exceeds output cap")
+        with open(req["output_path"], "wb") as fh:
+            fh.write(payload)
+        return {"output_bytes": len(payload),
+                "output_sha256": hashlib.sha256(payload).hexdigest()}
+
+    return op
+
+
 #: the ONLY operations the worker will execute (trusted, hardcoded; W4 adds
 #: real format parsers here). The parent validates op names against this table.
 OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -180,6 +204,9 @@ OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "spam": _op_spam,
     "spam_file": _op_spam_file,
     "fds": _op_fds,
+    "parse_pdf": _make_parse_op("worker_parse_pdf"),
+    "parse_docx": _make_parse_op("worker_parse_docx"),
+    "parse_xlsx": _make_parse_op("worker_parse_xlsx"),
 }
 
 

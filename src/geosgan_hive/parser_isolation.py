@@ -84,10 +84,19 @@ class ParserJobTimeout(ParserIsolationError):
 #: that point — never preexec_fn in the multithreaded parent), installs the
 #: network guard, then imports the trusted worker module and runs main().
 _WORKER_BOOTSTRAP = r"""
-import json as _json, resource as _resource, socket as _socket, sys as _sys
+import json as _json, os as _os, resource as _resource, socket as _socket, sys as _sys
 _src = _sys.argv[1]
 _cfg = _json.loads(_sys.argv[2])
 _sys.path.insert(0, _src)
+# interpreter-standard package locations only (site-packages/user-site), computed
+# by the parent from ITS OWN interpreter — never from documents or env vars;
+# needed because -I disables the user site where pip may install extras
+for _p in _cfg.get("extra_paths", []):
+    try:
+        if _p and _os.path.isdir(_p):
+            _sys.path.append(_p)
+    except Exception:
+        pass
 for _name, _soft, _hard in _cfg["rlimits"]:
     try:
         _resource.setrlimit(getattr(_resource, _name), (_soft, _hard))
@@ -132,6 +141,7 @@ class ParserJobResult:
     response: dict[str, Any] | None = None
     output_sha256: str | None = None
     output_bytes: int | None = None
+    output: bytes | None = None  # bounded bulk payload (content cap), for parse results
     request_bytes: int = 0
     started: float = 0.0
     ended: float = 0.0
@@ -169,6 +179,7 @@ class ParserWorkerPool:
         limits: ParserResourceLimits | None = None,
         work_root: str | None = None,
         platform: str | None = None,
+        worker_extra_paths: list[str] | None = None,
     ) -> None:
         if max_workers < 1 or max_workers > 16:
             raise ValueError("max_workers must be in [1, 16]")
@@ -190,6 +201,9 @@ class ParserWorkerPool:
         self._active = 0
         self._closed = False
         self._src_dir = str(Path(__file__).resolve().parent.parent)
+        #: None = interpreter-standard site dirs; [] = none (used by tests to
+        #: prove fail-closed behavior when optional parser deps are missing)
+        self._worker_extra_paths = worker_extra_paths
         if work_root is not None:
             Path(work_root).mkdir(parents=True, exist_ok=True)
 
@@ -344,14 +358,28 @@ class ParserWorkerPool:
             request: dict[str, Any] = dict(args)  # fixed keys below always win
         else:
             request = {}
+        # hard caps come from the POOL and can only be LOWERED by op args
+        # (models/tools must never raise security limits); other op-specific
+        # limits (e.g. max_extract_chars) pass through
+        req_limits: dict[str, Any] = {
+            "max_input_bytes": lim.max_input_bytes,
+            "max_output_bytes": lim.max_output_file_bytes,
+        }
+        arg_limits = request.get("limits")
+        if isinstance(arg_limits, dict):
+            for k, v in arg_limits.items():
+                if k in req_limits:
+                    try:
+                        req_limits[k] = min(req_limits[k], int(v))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    req_limits[k] = v
         request.update({
             "op": op,
             "input_path": input_path,
             "output_path": output_path,
-            "limits": {
-                "max_input_bytes": lim.max_input_bytes,
-                "max_output_bytes": lim.max_output_file_bytes,
-            },
+            "limits": req_limits,
             # worker-side watchdog: self-terminates on wall-clock deadline
             # (parent deadline + grace) or parent death, so orphaned/blocked
             # workers do not outlive their job even without a parent kill
@@ -366,9 +394,16 @@ class ParserWorkerPool:
                 f"request frame {len(req_payload)} exceeds cap {lim.max_request_bytes}")
         frame = len(req_payload).to_bytes(4, "big") + req_payload
 
+        if self._worker_extra_paths is None:
+            import site
+
+            extra_paths = [site.getusersitepackages(), *site.getsitepackages()]
+        else:
+            extra_paths = list(self._worker_extra_paths)
         argv = [
             sys.executable, "-I", "-c", _WORKER_BOOTSTRAP,
-            self._src_dir, json.dumps({"rlimits": self._rlimits_cfg()}),
+            self._src_dir,
+            json.dumps({"rlimits": self._rlimits_cfg(), "extra_paths": extra_paths}),
             input_path, output_path,
         ]
         deadline = started + deadline_s
@@ -447,6 +482,7 @@ class ParserWorkerPool:
 
                 result.output_sha256 = hashlib.sha256(out_data).hexdigest()
                 result.output_bytes = len(out_data)
+                result.output = out_data
             return result
         finally:
             if proc is not None and proc.poll() is None:

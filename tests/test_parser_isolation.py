@@ -285,7 +285,8 @@ def test_rlimit_failure_fails_closed(tmp_path):
 
 def test_ops_registry_is_fixed_and_trusted():
     expected = {"ping", "sha256", "echo_file", "sleep", "env", "rlimits",
-                "net_probe", "spam", "spam_file", "fds"}
+                "net_probe", "spam", "spam_file", "fds",
+                "parse_pdf", "parse_docx", "parse_xlsx"}
     assert set(_parser_worker.OPS) == expected
     for fn in _parser_worker.OPS.values():
         assert callable(fn)

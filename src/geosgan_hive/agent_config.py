@@ -439,6 +439,43 @@ class ApiConfig(BaseModel):
         return self
 
 
+class DocumentsConfig(BaseModel):
+    """W4 (v0.8.0): local document reading. DISABLED BY DEFAULT (enabled=false).
+    All limits are operator maxima: model/tool arguments are CLAMPED to them,
+    never raised. PDF/DOCX/XLSX parse only inside the POSIX parser worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    allowed_formats: list[str] = Field(default_factory=lambda: [
+        "pdf", "docx", "xlsx", "csv", "json", "txt", "md", "html"])
+    max_input_bytes: int = Field(default=10 << 20, ge=1, le=100 << 20)
+    max_extract_chars: int = Field(default=20_000, ge=100, le=200_000)
+    max_pdf_pages: int = Field(default=50, ge=1, le=500)
+    max_docx_blocks: int = Field(default=2_000, ge=10, le=20_000)
+    max_xlsx_sheets: int = Field(default=10, ge=1, le=50)
+    max_xlsx_cells: int = Field(default=20_000, ge=10, le=200_000)
+    max_csv_rows: int = Field(default=5_000, ge=1, le=100_000)
+    max_csv_field_bytes: int = Field(default=100_000, ge=1, le=1 << 20)
+    max_json_depth: int = Field(default=32, ge=1, le=128)
+    worker_max_workers: int = Field(default=2, ge=1, le=8)
+    worker_max_pending: int = Field(default=4, ge=1, le=16)
+    worker_op_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    worker_max_memory_bytes: int = Field(default=512 << 20, ge=16 << 20, le=4 << 30)
+    #: register successful parses as W2 sources (lease-fenced, metadata-only)
+    register_sources: bool = True
+
+    @field_validator("allowed_formats")
+    @classmethod
+    def _formats_ok(cls, v: list[str]) -> list[str]:
+        from .documents import SUPPORTED_FORMATS
+
+        bad = [f for f in v if f not in SUPPORTED_FORMATS]
+        if bad:
+            raise ValueError(f"unsupported document formats: {bad}")
+        return sorted(set(v))
+
+
 class HiveConfig(BaseModel):
     """Whole team configuration: one supervisor plus the specialist agents."""
 
@@ -456,6 +493,8 @@ class HiveConfig(BaseModel):
     #: Phase 5 A3: intelligent routing policy (None = fixed configured models only;
     #: automatic routing is OFF unless explicitly configured here)
     routing: RoutingPolicy | None = None
+    #: Phase 6 W4: local document reading (None or enabled=false = fully disabled)
+    documents: DocumentsConfig | None = None
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:

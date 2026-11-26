@@ -82,6 +82,16 @@ def build_tool_gateway(
     disabled by default.
     """
     catalog, _sandbox = build_tool_catalog(config)
+    # W4: document reading tools — registered ONLY when documents.enabled=true
+    # (default disabled; deny-by-default via the same ToolPolicy). PDF/DOCX/XLSX
+    # parse inside the isolated POSIX parser worker (fail closed elsewhere).
+    docs_cfg = getattr(config, "documents", None)
+    if docs_cfg is not None and docs_cfg.enabled and store is not None:
+        from .documents import DocumentReader, doc_tools
+
+        reader = DocumentReader(store=store, sandbox=_sandbox, config=docs_cfg)
+        for spec, adapter in doc_tools(reader, lease_lookup=lease_lookup):
+            catalog.register(spec, adapter)
     if approval_manager is None and store is not None and config.tools is not None:
         approval_manager = ApprovalManager(
             store,
