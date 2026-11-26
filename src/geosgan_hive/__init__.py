@@ -17,6 +17,7 @@ from .agent_config import (
     Limits,
     Permissions,
     SupervisorSpec,
+    WebEndpointPolicy,
     apply_env_overrides,
     load_hive_config,
 )
@@ -205,6 +206,18 @@ from .tool_registry import RegisteredTool, ToolAdapter, ToolCatalog
 from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical_args, validate_args
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
+from .web_retrieval import (
+    CanonicalWebRequest,
+    WebFetchResult,
+    WebGetPageAdapter,
+    WebGetPageInput,
+    WebRetrievalEngine,
+    WebRetrievalError,
+    build_web_engine,
+    html_to_text,
+    parse_web_url,
+    web_tools,
+)
 
 __version__ = "0.7.0"
 
@@ -243,6 +256,16 @@ __all__ = [
     "StoragePolicy",
     "Visibility",
     "sanitize_locator",
+    "CanonicalWebRequest",
+    "WebFetchResult",
+    "WebGetPageAdapter",
+    "WebGetPageInput",
+    "WebRetrievalEngine",
+    "WebRetrievalError",
+    "build_web_engine",
+    "html_to_text",
+    "parse_web_url",
+    "web_tools",
     "RoutingMode",
     "RoutingPolicy",
     "RoutingWeights",
@@ -352,6 +375,7 @@ __all__ = [
     "SideEffect",
     "Supervisor",
     "SupervisorSpec",
+    "WebEndpointPolicy",
     "TaskNode",
     "TaskStatus",
     "BuiltinToolAdapter",

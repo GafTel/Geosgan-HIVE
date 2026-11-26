@@ -113,6 +113,15 @@ def build_tool_gateway(
         if session is not None:
             register_api_tools(catalog, session, lease_lookup=lease_lookup,
                                providers=apis.enabled)
+            # W3: secure web retrieval tool (only when the `web` provider is
+            # enabled AND operator web endpoint policies exist; deny-by-default
+            # via the same ToolPolicy; outbound auth + budgets via ApiSession)
+            from .web_retrieval import build_web_engine, web_tools
+
+            engine = build_web_engine(config, session, store)
+            if engine is not None:
+                for spec, adapter in web_tools(engine, lease_lookup=lease_lookup):
+                    catalog.register(spec, adapter)
     return ToolGateway(
         catalog,
         policy,
