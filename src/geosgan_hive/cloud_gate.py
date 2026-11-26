@@ -33,8 +33,10 @@ provider billing or quotas.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
+import socket
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
@@ -167,6 +169,30 @@ class ZeroCostGate:
                     f"billing enforcement requires a loopback endpoint, but the "
                     f"effective endpoint is {eff!r} (host {host!r}) \u2014 fail closed"
                 )
+            # DNS resolution must also stay loopback: if the host name resolves to
+            # ANY non-loopback address (e.g. a tampered hosts file mapping
+            # localhost to an external IP), the dispatch fails closed
+            try:
+                infos = socket.getaddrinfo(host, None)
+            except OSError as exc:
+                raise CloudConfigError(
+                    f"zero-cost gate blocked dispatch of {model!r}: cannot resolve "
+                    f"loopback endpoint host {host!r} ({exc}) \u2014 fail closed"
+                ) from exc
+            for info in infos:
+                addr = info[4][0]
+                try:
+                    if not ipaddress.ip_address(addr).is_loopback:
+                        raise CloudConfigError(
+                            f"zero-cost gate blocked dispatch of {model!r}: endpoint "
+                            f"host {host!r} resolves to non-loopback {addr} \u2014 "
+                            "fail closed"
+                        )
+                except ValueError as exc:
+                    raise CloudConfigError(
+                        f"zero-cost gate blocked dispatch of {model!r}: unparseable "
+                        f"resolved address {addr!r} for host {host!r} \u2014 fail closed"
+                    ) from exc
 
     def candidate_billing_ok(self, model: str) -> tuple[bool, str]:
         """Candidate-level check for fallback chains: the model needs an enabled

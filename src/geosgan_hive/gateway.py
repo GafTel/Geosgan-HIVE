@@ -83,6 +83,43 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     return min(parsed, 86400.0)  # cap excessively large hints (<= 24h) safely
 
 
+_LITELLM_TRANSPORT_HARDENED = False
+
+
+def _harden_litellm_transport() -> None:
+    """FREE_ONLY transport hardening, applied once per process right after
+    `import litellm`: LiteLLM's shared module-level HTTP clients follow
+    redirects by default (follow_redirects=True), so a 3xx from an endpoint
+    could open a connection to an UNAUTHORIZED destination. Disabling redirect
+    following makes any 3xx surface as an error (fail closed) instead of a new
+    connection. This is a real production control on the actual transport, not
+    a test spy. Applied to both the sync and async module-level clients."""
+    global _LITELLM_TRANSPORT_HARDENED
+    if _LITELLM_TRANSPORT_HARDENED:
+        return
+    import litellm
+    for name in ("module_level_client", "module_level_aclient"):
+        handler = getattr(litellm, name, None)
+        if handler is None:
+            continue
+        try:
+            handler.follow_redirects = False
+        except Exception:
+            pass
+        client = getattr(handler, "_client", None)
+        if client is None:
+            try:
+                client = handler.client
+            except Exception:
+                client = None
+        if client is not None:
+            try:
+                client.follow_redirects = False
+            except Exception:
+                pass
+    _LITELLM_TRANSPORT_HARDENED = True
+
+
 def _map_litellm_error(exc: BaseException) -> GatewayError:
     """Map a LiteLLM exception to the HIVE error hierarchy."""
     if isinstance(exc, HiveError):
@@ -363,6 +400,7 @@ class ModelGateway:
                 model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
+        _harden_litellm_transport()
 
         if ctx is None:
             if gate is not None and gate.enabled():
@@ -398,6 +436,7 @@ class ModelGateway:
                 model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
+        _harden_litellm_transport()
 
         if ctx is None:
             if gate is not None and gate.enabled():
@@ -1028,6 +1067,7 @@ class ModelGateway:
         """Actual cost from LiteLLM when known; None otherwise (never 0)."""
         try:
             import litellm
+            _harden_litellm_transport()
 
             value = litellm.completion_cost(completion_response=response)
             cost = float(value)
