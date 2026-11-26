@@ -179,6 +179,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="Include revoked/expired cloud evidence records")
     parser.add_argument("--routing-run", default=None,
                         help="Filter --routing-decisions by run id")
+    parser.add_argument("--sources", action="store_true",
+                        help="List registered sources (metadata only; read-only, "
+                             "W2 source registry inspection)")
+    parser.add_argument("--source-run", default=None,
+                        help="Filter --sources by run id")
+    parser.add_argument("--source-id", default=None, metavar="SOURCE_ID",
+                        help="Show one source record (metadata only)")
+    parser.add_argument("--source-excerpt", default=None, metavar="SOURCE_ID",
+                        help="Show an integrity-verified bounded excerpt of a source "
+                             "(operator scope; unavailable if content is not stored)")
+    parser.add_argument("--source-excerpt-chars", type=int, default=500,
+                        help="Max excerpt characters for --source-excerpt")
     args = parser.parse_args(argv)
 
     management = bool(
@@ -188,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.tool_executions or args.resolve_execution
         or args.benchmark_simulate or args.benchmark_report or args.benchmark_list
         or args.route or args.routing_decisions or args.cloud_evidence
+        or args.sources or args.source_id or args.source_excerpt
     )
     if args.task is None and not management:
         parser.error("task is required unless a management command is used "
@@ -457,6 +470,46 @@ def main(argv: list[str] | None = None) -> int:
                       f"restriction={r['spending_restriction']} "
                       f"overage={r['overage_behavior']} revoked={bool(r['revoked'])} "
                       f"expires={r['expires_at']}")
+            return 0
+        if (args.sources or args.source_id or args.source_excerpt) and store is not None:
+            # W2: minimal read-only source inspection (operator scope; metadata
+            # only — the CLI has no sandbox, so workspace excerpts report
+            # 'unavailable' rather than reading files; integrity is still enforced)
+            from .sources import SourceRegistry
+
+            reg = SourceRegistry(store)
+            if args.source_excerpt:
+                try:
+                    ex = reg.excerpt(args.source_excerpt,
+                                     max_chars=max(0, args.source_excerpt_chars))
+                except HiveError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
+                print(f"source={ex['source_id']} available={ex['available']} "
+                      f"integrity={ex['integrity']}")
+                print(ex["excerpt"] if ex["excerpt"] is not None else "(no stored content)")
+                return 0
+            if args.source_id:
+                d = reg.get(args.source_id)
+                if d is None:
+                    print(f"No source {args.source_id!r}", file=sys.stderr)
+                    return 1
+                for key in ("source_id", "run_id", "task_id", "agent_id", "origin_kind",
+                            "source_type", "provider", "locator", "retrieved_at",
+                            "content_sha256", "content_bytes", "license", "attribution",
+                            "visibility", "storage", "workspace_relpath", "expires_at",
+                            "expired", "policy_version", "created_at"):
+                    print(f"  {key}: {d[key]}")
+                return 0
+            rows = reg.list(run_id=args.source_run)
+            print(f"Sources: {len(rows)} record(s) (metadata only; provenance, "
+                  "not factual verification)")
+            for d in rows:
+                print(f"  {d['source_id']} type={d['source_type']} "
+                      f"provider={d['provider']} origin={d['origin_kind']} "
+                      f"run={d['run_id']} visibility={d['visibility']} "
+                      f"storage={d['storage']} expired={d['expired']} "
+                      f"locator={d['locator'][:80]}")
             return 0
         if args.resume:
             if args.async_:

@@ -184,6 +184,15 @@ from .run_context import (
     TaskNode,
     TaskStatus,
 )
+from .sources import (
+    OriginKind,
+    ReadBinding,
+    SourceRegistry,
+    SourceType,
+    StoragePolicy,
+    Visibility,
+    sanitize_locator,
+)
 from .tool_gateway import (
     BuiltinToolAdapter,
     ToolExecutionContext,
@@ -227,6 +236,13 @@ __all__ = [
     "ModelRouter",
     "PrivacyLevel",
     "RoutingDecision",
+    "OriginKind",
+    "ReadBinding",
+    "SourceRegistry",
+    "SourceType",
+    "StoragePolicy",
+    "Visibility",
+    "sanitize_locator",
     "RoutingMode",
     "RoutingPolicy",
     "RoutingWeights",

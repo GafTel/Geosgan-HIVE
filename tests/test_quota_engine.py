@@ -164,8 +164,8 @@ def _make_v5_db(path):
     conn.close()
 
 
-def test_schema_version_is_11_and_fresh_store_has_quota_and_benchmark_tables(tmp_path):
-    assert SCHEMA_VERSION == 12
+def test_schema_version_current_and_fresh_store_has_quota_and_benchmark_tables(tmp_path):
+    assert SCHEMA_VERSION == 13
     store = CheckpointStore(str(tmp_path / "fresh.db"))
     with store._lock:
         names = {r[0] for r in store._conn.execute(
@@ -184,7 +184,7 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         names = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "12"
+    assert v == "13"
     assert {"quota_reservations", "quota_usage", "quota_policies",
             "quota_policy_audit"} <= names
     cp = store.get("r5")
@@ -972,7 +972,7 @@ def test_interrupted_migration_rolls_back_and_recovers(tmp_path, monkeypatch):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "12" and {"quota_reservations", "quota_usage", "quota_policies",
+    assert v == "13" and {"quota_reservations", "quota_usage", "quota_policies",
                          "api_reservations", "benchmark_evidence", "routing_decisions",
                          "quota_policy_audit"} <= tables
     assert store.get("r5") is not None
@@ -1196,7 +1196,7 @@ def test_dev_v6_database_migrates_to_v7_explicitly(tmp_path):
             "PRAGMA table_info(quota_policies)").fetchall()}
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "12"
+    assert v == "13"
     assert {"constraints_json", "reset_semantics"} <= cols
     assert "quota_policy_audit" in tables
     # stored rows preserved and hashes recomputed consistently

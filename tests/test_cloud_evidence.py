@@ -392,7 +392,7 @@ def test_v11_to_v12_migration_additive_and_rollback(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "12" and SCHEMA_VERSION == 12
+    assert v == "13" and SCHEMA_VERSION == 13
     assert {"cloud_evidence", "cloud_evidence_audit"} <= tables
     # vault works on the migrated store
     vault = CloudEvidenceVault(store, accept_provider_enforced=True)
@@ -432,7 +432,7 @@ def test_v11_to_v12_migration_additive_and_rollback(tmp_path):
     with store._lock:
         v = store._conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert v == "12"
+    assert v == "13"
     store.close()
 
 

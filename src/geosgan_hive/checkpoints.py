@@ -18,7 +18,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -274,6 +274,53 @@ CREATE TABLE IF NOT EXISTS cloud_evidence_audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     evidence_id TEXT NOT NULL,
     event TEXT NOT NULL,                  -- 'recorded' | 'revoked'
+    detail TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
+"""
+
+#: Phase 6 W2 (v0.8.0): source registry + citation integrity (v13). Metadata
+#: only: NEVER raw document content, excerpts, credentials, sensitive URL query
+#: parameters (locators are sanitized before storage) or private payloads.
+#: workspace_relpath is workspace-RELATIVE only (never an absolute path).
+#: origin_kind distinguishes trusted_runtime (lease-fenced retrieval/extraction
+#: paths) from offline_fixture (deterministic test fixtures; never production).
+_SOURCES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sources (
+    source_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    task_id TEXT,
+    agent_id TEXT NOT NULL DEFAULT '',
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN ('trusted_runtime', 'offline_fixture')),
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'web_page', 'api_response', 'document', 'offline_fixture', 'other')),
+    provider TEXT NOT NULL DEFAULT '',
+    locator TEXT NOT NULL DEFAULT '',
+    locator_sha256 TEXT,
+    retrieved_at TEXT NOT NULL,
+    raw_sha256 TEXT,
+    content_sha256 TEXT,
+    extract_method TEXT NOT NULL DEFAULT '',
+    extract_version TEXT NOT NULL DEFAULT '',
+    raw_bytes INTEGER,
+    content_bytes INTEGER,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    license TEXT,
+    attribution TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'run' CHECK (visibility IN ('run', 'team')),
+    storage TEXT NOT NULL DEFAULT 'metadata_only' CHECK (storage IN ('metadata_only', 'workspace')),
+    workspace_relpath TEXT,
+    expires_at TEXT,
+    policy_version TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sources_run ON sources (run_id);
+CREATE INDEX IF NOT EXISTS idx_sources_content ON sources (content_sha256);
+CREATE TABLE IF NOT EXISTS source_audit (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     at TEXT NOT NULL
 );
@@ -691,6 +738,7 @@ class CheckpointStore:
             _exec_schema(self._conn, _BENCHMARK_SCHEMA)  # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _ROUTING_SCHEMA)    # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)  # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _SOURCES_SCHEMA)         # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -726,6 +774,8 @@ class CheckpointStore:
                         self._migrate_10_to_11()
                     elif v == 11:
                         self._migrate_11_to_12()
+                    elif v == 12:
+                        self._migrate_12_to_13()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -882,6 +932,16 @@ class CheckpointStore:
         _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(12),)
+        )
+
+    def _migrate_12_to_13(self) -> None:
+        """v12 -> v13 (Phase 6 W2): adds sources + source_audit (source registry
+        and citation integrity, metadata-only). Purely additive (IF NOT EXISTS);
+        all v12 data preserved. Runs inside the caller's open transaction; an
+        interruption rolls back fully."""
+        _exec_schema(self._conn, _SOURCES_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(13),)
         )
 
     def _harden_permissions(self) -> None:
