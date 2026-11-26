@@ -7,7 +7,13 @@ provider endpoint is reachable, so the offline guarantee is preserved (no live
 API call is possible). The socket CONSTRUCTOR is never patched.
 """
 
+import os
 import socket
+
+# LiteLLM fetches its remote model-cost map at import time unless the local
+# map is selected; set it before ANY test module imports litellm (mirrors
+# geosgan_hive/__init__.py, which sets it before its own lazy litellm import).
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import pytest
 
