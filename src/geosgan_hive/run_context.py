@@ -117,6 +117,12 @@ class RunContext:
     tracker: UsageTracker | None = None
     closed: bool = field(default=False)
     tool_budgets: ToolBudgets = field(default_factory=ToolBudgets)
+    # Phase 4 C4: worker-owned lease identity, set ONCE by the process that created
+    # or claimed the run (create_run / claim_lease_gen return values) and immutable
+    # afterwards. Durable gates MUST use this identity — never adopt the current
+    # owner by reading SQLite.
+    lease_owner: str | None = None
+    lease_generation: int | None = None
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()

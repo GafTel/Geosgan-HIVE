@@ -19,7 +19,14 @@ from .checkpoints import (
     counters_to_json,
     steps_to_json,
 )
-from .errors import CheckpointError, GatewayError, ProviderUnavailableError
+from .errors import (
+    CheckpointError,
+    CloudConfigError,
+    CostUnknownError,
+    GatewayError,
+    ProviderUnavailableError,
+    QuotaExhaustedError,
+)
 from .llm import LLMClient
 from .messages import Message
 from .providers import parse_model
@@ -377,7 +384,10 @@ class Supervisor:
         now = store.utcnow()
         # cooldown = max(configured cooldown, largest Retry-After hint the provider
         # sent); the hint is persisted via next_attempt_at, so it is honored even
-        # after a process restart. Quota reset times are never invented.
+        # after a process restart. Quota reset times are never invented: for LOCAL
+        # quota exhaustion the next attempt is derived from the PERSISTED quota
+        # window anchor (our own accounting — reliable evidence, not a provider
+        # reset claim).
         cooldown = self.suspend_cooldown_seconds
         gw = getattr(self.llm, "gateway", None)
         hint_fn = getattr(gw, "retry_after_hint", None)
@@ -387,14 +397,37 @@ class Supervisor:
                 cooldown = max(cooldown, float(hint_fn(provider)))
             except Exception:
                 pass
+        quota_note = ""
+        # local quota exhaustion is detectable anywhere in the cause chain
+        node: BaseException | None = exc
+        quota_hit = False
+        while node is not None:
+            if isinstance(node, QuotaExhaustedError):
+                quota_hit = True
+                break
+            node = node.__cause__
+        if quota_hit and gw is not None:
+            try:
+                gate_fn = getattr(gw, "cloud_gate", None)
+                gate = gate_fn() if gate_fn is not None else None
+                if gate is not None and gate.enabled():
+                    q = gate.quota_retry_at(getattr(self.llm, "model", "") or "", now=now)
+                    if q is not None:
+                        cooldown = max(cooldown, max(0.0, (q - now).total_seconds()))
+                        quota_note = (
+                            f" [quota-exhausted; reliable local next window="
+                            f"{q.isoformat(timespec='milliseconds')}]"
+                        )
+            except Exception:
+                pass  # never let evidence computation break the suspension itself
         next_attempt = (now + timedelta(seconds=cooldown)).isoformat(timespec="milliseconds")
         deadline = (now + timedelta(seconds=self.max_wait_seconds)).isoformat(
             timespec="milliseconds"
         )
         store.mark_waiting(
-            run_id, owner=owner, error=str(exc), counters_json=counters, steps_json=steps_json,
-            route_json=route_json, transcript_json=transcript_json, step_count=step,
-            next_attempt_at=next_attempt, deadline_at=deadline,
+            run_id, owner=owner, error=str(exc) + quota_note, counters_json=counters,
+            steps_json=steps_json, route_json=route_json, transcript_json=transcript_json,
+            step_count=step, next_attempt_at=next_attempt, deadline_at=deadline,
         )
         if ctx is not None:
             ctx.record_event(
@@ -414,12 +447,17 @@ class Supervisor:
         ctx, root_task_id = self._open_run(task, run_id)
         try:
             if self.checkpoint_store is not None and owner is not None:
-                self.checkpoint_store.create_run(
+                cp = self.checkpoint_store.create_run(
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                # worker-owned lease identity recorded in the execution context
+                # (from THIS worker's own create call — never adopted from SQLite)
+                if ctx is not None:
+                    ctx.lease_owner = owner
+                    ctx.lease_generation = cp.lease_generation
                 self._start_lease_keeper(run_id, owner)
             result = self._run_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
@@ -469,11 +507,17 @@ class Supervisor:
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
-        if not store.claim_lease(run_id, owner):
+        gen = store.claim_lease_gen(run_id, owner)
+        if gen is None:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
-        store.mark_running(run_id, owner=owner)
+        gen = store.mark_running_gen(run_id, owner=owner)
+        if gen is None:
+            raise CheckpointError(f"cannot resume run {run_id!r}: lease lost")
         self._start_lease_keeper(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
+        # worker-owned identity from THIS worker's own claim/transition
+        ctx.lease_owner = owner
+        ctx.lease_generation = gen
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",
@@ -568,6 +612,20 @@ class Supervisor:
                     OrchestratorResult(
                         task=task, final_answer=f"Model gateway error: {exc}", route=route,
                         transcript=transcript, steps=step, run_id=run_id, failed=True,
+                    ),
+                    ctx, transcript, failed=True,
+                )
+            except (CloudConfigError, CostUnknownError) as exc:
+                # permanent billing/evidence/configuration failure (e.g. expired
+                # verification evidence, unknown billing exposure): the run must
+                # NOT stay RUNNING indefinitely — fail it, releasing the lease
+                return self._finalize(
+                    run_id, resume_owner,
+                    OrchestratorResult(
+                        task=task,
+                        final_answer=f"Permanent cloud/billing configuration error: {exc}",
+                        route=route, transcript=transcript, steps=step, run_id=run_id,
+                        failed=True,
                     ),
                     ctx, transcript, failed=True,
                 )
@@ -668,12 +726,15 @@ class Supervisor:
         ctx, root_task_id = self._open_run(task, run_id)
         try:
             if self.checkpoint_store is not None and owner is not None:
-                self.checkpoint_store.create_run(
+                cp = self.checkpoint_store.create_run(
                     run_id=run_id, owner=owner, task=task, agent="supervisor",
                     model=getattr(self.llm, "model", "") or "",
                     config_json=self.checkpoint_config_json or "",
                     root_task_id=root_task_id,
                 )
+                if ctx is not None:
+                    ctx.lease_owner = owner
+                    ctx.lease_generation = cp.lease_generation
                 self._start_lease_keeper_async(run_id, owner)
             result = await self._arun_loop(task, run_id, ctx, root_task_id, resume_owner=owner)
             result.root_task_id = root_task_id
@@ -726,11 +787,16 @@ class Supervisor:
         if cp.deadline_at and store.now_iso() >= cp.deadline_at:
             store.mark_failed(run_id, owner=None, error="maximum wait deadline exceeded")
             raise CheckpointError(f"run {run_id!r} exceeded its maximum wait deadline")
-        if not store.claim_lease(run_id, owner):
+        gen = store.claim_lease_gen(run_id, owner)
+        if gen is None:
             raise CheckpointError(f"run {run_id!r} is leased by another worker")
-        store.mark_running(run_id, owner=owner)
+        gen = store.mark_running_gen(run_id, owner=owner)
+        if gen is None:
+            raise CheckpointError(f"cannot resume run {run_id!r}: lease lost")
         self._start_lease_keeper_async(run_id, owner)
         ctx = self.collaboration.context_for(run_id)
+        ctx.lease_owner = owner
+        ctx.lease_generation = gen
         root_task_id = cp.root_task_id or uuid4().hex  # original root task id restored
         ctx.create_task(
             task_id=root_task_id, parent_task_id=None, agent="supervisor",
@@ -825,6 +891,20 @@ class Supervisor:
                     OrchestratorResult(
                         task=task, final_answer=f"Model gateway error: {exc}", route=route,
                         transcript=transcript, steps=step, run_id=run_id, failed=True,
+                    ),
+                    ctx, transcript, failed=True,
+                )
+            except (CloudConfigError, CostUnknownError) as exc:
+                # permanent billing/evidence/configuration failure (e.g. expired
+                # verification evidence, unknown billing exposure): the run must
+                # NOT stay RUNNING indefinitely — fail it, releasing the lease
+                return self._finalize(
+                    run_id, resume_owner,
+                    OrchestratorResult(
+                        task=task,
+                        final_answer=f"Permanent cloud/billing configuration error: {exc}",
+                        route=route, transcript=transcript, steps=step, run_id=run_id,
+                        failed=True,
                     ),
                     ctx, transcript, failed=True,
                 )

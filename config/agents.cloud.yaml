@@ -1,0 +1,128 @@
+# GEOSGAN HIVE - Phase 4 ZERO-COST CLOUD profile (v0.6.0).
+#
+# Fully offline-capable: every role runs on LOCAL Ollama inference, the
+# first-class zero-cost option (no per-request provider billing, no API key).
+# Usage:
+#   geosgan-hive "task" --agents-config config/agents.cloud.yaml
+#   python examples/demo_cloud.py            # scripted, no Ollama server needed
+#
+# SECURITY / ZERO-COST POLICY (fail-closed):
+# - Never put API keys or secrets in this file; credentials come from env vars only.
+# - cloud.zero_cost=true requires max_spend_usd=0.0 (strictly zero; None/unlimited
+#   is rejected) and a durable checkpoint store (never :memory:).
+# - The cloud profile below is LOCAL INFERENCE (provider ollama): billing
+#   enforcement = local_inference, which is only accepted for ollama.
+# - LIVE CLOUD PROVIDERS (openai/mistral/anthropic/gemini) REMAIN BLOCKED by
+#   default: no live-capable adapter is registered for them, trusted evidence
+#   binding is a data contract (not proof), and unknown billing fails closed.
+#   Do not enable them by editing flags here; zero-cost live dispatch requires
+#   implemented trusted billing verification first.
+# - Local quota accounting cannot observe usage outside HIVE and is not proof of
+#   provider-side billing safety; local windows are not provider reset times.
+
+collaboration:
+  allow_agent_to_agent: true
+  max_delegation_depth: 2
+  max_handoffs_per_run: 10
+  max_parallel_agents: 3
+
+# Durable store is MANDATORY in zero-cost mode: the shared quota engine lives in
+# this SQLite database (*.db is gitignored; never commit it).
+checkpoint:
+  path: .geosgan_hive/checkpoints.db
+  persist_mode: resumable
+  lease_ttl_seconds: 60.0
+  worker_poll_seconds: 5.0
+
+# WAIT mode suspends a run when the local quota is exhausted and resumes it after
+# the next LOCAL quota window (persisted evidence; never an invented provider reset).
+fallback:
+  mode: wait
+  cooldown_seconds: 60.0
+  max_wait_seconds: 86400.0
+
+cloud:
+  zero_cost: true
+  max_spend_usd: 0.0            # strictly 0 in zero-cost mode (fail-closed)
+  # Operator switch for evidence/credential binding. Enabled here ONLY for the
+  # local-inference profile below; production live cloud dispatch stays blocked
+  # (default False in configs without this flag).
+  trusted_evidence_binding: true
+  profiles:
+    - provider: ollama
+      models: [ollama/llama3.2]
+      billing: free_tier_verified
+      verified_free: true
+      overage_billing_disabled: true
+      billing_verified: true
+      # Operator attestation (a claim, not evidence); expires after ttl_days.
+      verified_at: 2026-01-01T00:00:00+00:00
+      verification_ttl_days: 3650
+      account_label: local-default
+      # sha256 of the local account identifier; the raw id is never stored.
+      account_fingerprint: 8c931dc6efa42ad1cefa78a555f8167696d839730cbc98294cb353d4fe3eb1c2
+      quota_window_start: 2026-01-01T00:00:00+00:00
+      # Local accounting windows are operator-attested, NOT provider-confirmed.
+      quota_reset_semantics: operator_attested
+      verification_evidence:
+        source: local_inference_runtime
+        evidence_ref: local-ollama-default
+        collected_at: 2026-01-01T00:00:00+00:00
+        collected_by: operator
+        credential_bound: true
+        # Local inference: no per-request provider billing (ollama only).
+        billing_enforcement: local_inference
+        account_fingerprint: 8c931dc6efa42ad1cefa78a555f8167696d839730cbc98294cb353d4fe3eb1c2
+        endpoint: http://localhost:11434
+      quotas:
+        # Shared account pool: all models of this account draw from one pool.
+        - pool: ollama:acct:8c931dc6efa42ad1cefa78a555f8167696d839730cbc98294cb353d4fe3eb1c2
+          max_requests: 1000
+          max_tokens: 4000000
+          period: day
+
+supervisor:
+  name: supervisor
+  description: Routes the task between the specialist agents and produces the final answer.
+  system_prompt: >-
+    You are the supervisor of the GEOSGAN HIVE team. Coordinate the researcher,
+    developer, analyst and reviewer, then finish with a final answer.
+  model: ollama/llama3.2
+  temperature: 0.2
+  max_steps: 8
+  permissions: {allow_tools: false, allowed_tools: []}
+  limits: {max_calls_per_run: 50, timeout_seconds: 60, max_cost_usd_per_run: 0.0, max_tokens: 512}
+
+agents:
+  - name: researcher
+    description: Investigates and organizes information.
+    system_prompt: You are a meticulous researcher. Deliver a structured summary.
+    model: ollama/llama3.2
+    temperature: 0.2
+    permissions:
+      allow_tools: true
+      allowed_tools: [calculator, current_datetime, word_count]
+      allow_delegation: true
+      allowed_agents: [analyst, reviewer]
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60, max_tokens: 512}
+  - name: developer
+    description: Writes and explains code.
+    system_prompt: You are a senior developer. Produce correct code and explain it.
+    model: ollama/llama3.2
+    temperature: 0.1
+    permissions: {allow_tools: true, allowed_tools: [calculator]}
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60, max_tokens: 512}
+  - name: analyst
+    description: Analyzes data and quantifies findings.
+    system_prompt: You are a rigorous analyst. Report findings with numbers.
+    model: ollama/llama3.2
+    temperature: 0.2
+    permissions: {allow_tools: true, allowed_tools: [calculator, word_count]}
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60, max_tokens: 512}
+  - name: reviewer
+    description: Reviews and improves answers.
+    system_prompt: You are a demanding reviewer. Deliver the improved final version.
+    model: ollama/llama3.2
+    temperature: 0.2
+    permissions: {allow_tools: true, allowed_tools: [word_count]}
+    limits: {max_tool_steps: 5, max_calls_per_run: 20, timeout_seconds: 60, max_tokens: 512}

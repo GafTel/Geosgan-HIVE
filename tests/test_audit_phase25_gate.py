@@ -225,6 +225,9 @@ gw = ModelGateway(tracker=tracker,
 gw.set_durable_store(store)
 engine = CollaborationEngine(policy=CollaborationPolicy(), tracker=tracker)
 gw.set_context_lookup(engine.context_for)
+ctx = engine.context_for("crash")
+ctx.lease_owner = "w"  # worker-owned identity in the execution context
+ctx.lease_generation = 0
 
 def crash(**kwargs):
     os._exit(9)  # hard crash: after the durable reservation, at the provider call

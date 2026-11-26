@@ -235,3 +235,23 @@ class ApprovalError(ToolError):
 class SandboxViolationError(ToolError):
     """A file operation violated workspace isolation (traversal, symlink escape,
     special file, denied name, outside root) — fail closed."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (C2): zero-cost cloud engine
+# ---------------------------------------------------------------------------
+
+class CloudConfigError(ConfigError):
+    """Malformed/unauthorized cloud provider profile or cloud config block."""
+
+
+class CostUnknownError(HiveError):
+    """A cost or token usage that cannot be bounded/known — in zero-cost mode
+    this fails closed BEFORE any live dispatch. Unknown is never treated as 0."""
+
+    error_class = ErrorClass.UNKNOWN
+    terminal = False
+
+
+class CloudOfflineError(HiveError):
+    """A strictly-offline (fake) adapter was asked to perform a live dispatch."""

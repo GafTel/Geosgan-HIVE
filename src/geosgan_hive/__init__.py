@@ -1,5 +1,14 @@
 """GEOSGAN HIVE: hybrid multi-agent AI system with a collaboration engine."""
 
+import os as _os
+
+# Offline startup: LiteLLM otherwise fetches its remote model-cost map from
+# raw.githubusercontent.com at import time. Use the bundled local cost map so
+# importing/using HIVE performs no outbound network requests unless a live
+# provider call is explicitly made. Supported LiteLLM mechanism (env var must be
+# set before `import litellm`, which happens lazily inside the gateway).
+_os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 from .agent_config import (
     CORE_ROLES,
     AgentSpec,
@@ -24,7 +33,26 @@ from .checkpoints import (
     CheckpointStore,
     ExecutionState,
     PersistMode,
+    QuotaReservationOutcome,
     RunCheckpoint,
+)
+from .cloud_gate import ZeroCostGate
+from .cloud_profiles import (
+    AdapterCapabilities,
+    BillingEnforcement,
+    BillingModel,
+    CloudProfile,
+    CloudProfileRegistry,
+    CloudProviderAdapter,
+    FakeCloudAdapter,
+    LocalOllamaAdapter,
+    QuotaPeriod,
+    QuotaResetSemantics,
+    QuotaSpec,
+    TokenEstimate,
+    TokenEstimationMode,
+    VerificationEvidence,
+    bounded_token_estimate,
 )
 from .collaboration import (
     CollaborationEngine,
@@ -40,8 +68,11 @@ from .errors import (
     BudgetExceededError,
     CapabilityMismatchError,
     CheckpointError,
+    CloudConfigError,
+    CloudOfflineError,
     ConfigError,
     ContextWindowExceededError,
+    CostUnknownError,
     DelegationError,
     DelegationRejectedError,
     ErrorClass,
@@ -83,6 +114,10 @@ from .providers import (
     parse_model,
     resolve_credentials,
 )
+from .quota_engine import (
+    QuotaEngine,
+    QuotaReservation,
+)
 from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
 from .run_context import (
@@ -106,9 +141,31 @@ from .tool_spec import SideEffect, ToolBudgets, ToolSpec, args_sha256, canonical
 from .tools import ToolRegistry, default_registry
 from .usage import UsageRecord, UsageSummary, UsageTracker
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
+    "AdapterCapabilities",
+    "BillingEnforcement",
+    "BillingModel",
+    "TokenEstimationMode",
+    "VerificationEvidence",
+    "ZeroCostGate",
+    "CloudConfigError",
+    "CloudOfflineError",
+    "CloudProfile",
+    "CloudProfileRegistry",
+    "CloudProviderAdapter",
+    "CostUnknownError",
+    "FakeCloudAdapter",
+    "LocalOllamaAdapter",
+    "QuotaEngine",
+    "QuotaPeriod",
+    "QuotaReservation",
+    "QuotaReservationOutcome",
+    "QuotaResetSemantics",
+    "QuotaSpec",
+    "TokenEstimate",
+    "bounded_token_estimate",
     "Agent",
     "AgentResult",
     "AgentSpec",

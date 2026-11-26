@@ -337,7 +337,7 @@ def test_mutating_tool_fails_closed_on_expired_lease(tmp_path):
     store.close()
 
 
-def test_schema_v3_database_migrates_through_v4_to_v5(tmp_path):
+def test_schema_v3_database_migrates_through_v4_to_v6(tmp_path):
     db = str(tmp_path / "old.db")
     store = CheckpointStore(db, persist_mode=PersistMode.RESUMABLE, lease_ttl_seconds=60.0)
     store.create_run(run_id="old", owner="w", task="t", agent="a", model="m",
@@ -358,8 +358,9 @@ def test_schema_v3_database_migrates_through_v4_to_v5(tmp_path):
         tables = {r[0] for r in store2._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         cols = {r["name"] for r in store2._conn.execute("PRAGMA table_info(runs)").fetchall()}
-    assert v == "5"
-    assert {"tool_executions", "approvals"} <= tables
+    assert v == "8"
+    assert {"tool_executions", "approvals", "quota_reservations", "quota_usage",
+            "quota_policies", "quota_policy_audit"} <= tables
     assert {"lease_generation", "tool_reservations"} <= cols
     assert store2.get("old") is not None  # pre-existing run row survives the chain
     store2.close()

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
+from .cloud_gate import ZeroCostGate
+from .cloud_profiles import CloudProfileRegistry
 from .errors import (
     AuthenticationError as HiveAuthenticationError,
 )
@@ -17,6 +21,8 @@ from .errors import (
 from .errors import (
     BudgetExceededError,
     CheckpointError,
+    CloudConfigError,
+    ConfigError,
     ErrorClass,
     FallbackExhaustedError,
     GatewayConnectionError,
@@ -69,9 +75,88 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None  # malformed Retry-After is ignored, never guessed
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None  # nonfinite/negative hints are not evidence
+    return min(parsed, 86400.0)  # cap excessively large hints (<= 24h) safely
+
+
+class _OfflineEncoding:
+    """Duck-typed tiktoken encoding that NEVER downloads BPE files.
+
+    LiteLLM's ollama completion path loads a tiktoken encoding lazily, which
+    on a cold cache fetches from a remote host. HIVE installs this stub as
+    litellm's cached encoding so no such fetch can ever happen; token counts
+    from it are only heuristic hints for litellm's internal logging - HIVE's
+    zero-cost gate uses its own conservative bounds and the provider response
+    carries the authoritative usage."""
+
+    def encode(self, text, *a, **k):
+        return list(range(max(1, -(-len(str(text)) // 4))))
+
+    def encode_ordinary(self, text, *a, **k):
+        return self.encode(text)
+
+    def decode(self, tokens, *a, **k):
+        return ""
+
+    def name(self):
+        return "hive-offline-heuristic"
+
+
+_LITELLM_TRANSPORT_HARDENED = False
+
+
+def _harden_litellm_transport() -> None:
+    """FREE_ONLY transport hardening, applied once per process right after
+    `import litellm`: LiteLLM's shared module-level HTTP clients follow
+    redirects by default (follow_redirects=True), so a 3xx from an endpoint
+    could open a connection to an UNAUTHORIZED destination. Disabling redirect
+    following makes any 3xx surface as an error (fail closed) instead of a new
+    connection. This is a real production control on the actual transport, not
+    a test spy. Applied to both the sync and async module-level clients.
+
+    Also disables LiteLLM's local token counter: on cold caches tiktoken
+    downloads BPE files from a remote host during provider calls (observed on
+    the ollama path). HIVE never needs it - the zero-cost gate uses its own
+    conservative bounds and usage comes from the provider response."""
+    global _LITELLM_TRANSPORT_HARDENED
+    if _LITELLM_TRANSPORT_HARDENED:
+        return
+    import litellm
+    try:
+        litellm.disable_token_counter = True  # no tiktoken BPE downloads (offline)
+    except Exception:
+        pass
+    try:
+        import litellm.main as _litellm_main
+        if getattr(_litellm_main, "_encoding_cache", None) is None:
+            _litellm_main._encoding_cache = _OfflineEncoding()
+        _litellm_main.__dict__.setdefault("encoding", _litellm_main._encoding_cache)
+    except Exception:
+        pass
+    for name in ("module_level_client", "module_level_aclient"):
+        handler = getattr(litellm, name, None)
+        if handler is None:
+            continue
+        try:
+            handler.follow_redirects = False
+        except Exception:
+            pass
+        client = getattr(handler, "_client", None)
+        if client is None:
+            try:
+                client = handler.client
+            except Exception:
+                client = None
+        if client is not None:
+            try:
+                client.follow_redirects = False
+            except Exception:
+                pass
+    _LITELLM_TRANSPORT_HARDENED = True
 
 
 def _map_litellm_error(exc: BaseException) -> GatewayError:
@@ -124,6 +209,9 @@ class ModelGateway:
         health: HealthRegistry | None = None,
         fallback_engine: FallbackEngine | None = None,
         default_fallback: FallbackPolicy | None = None,
+        cloud_registry: CloudProfileRegistry | None = None,
+        cloud_adapter: Any = None,
+        default_max_output_tokens: int | None = None,
     ) -> None:
         self.tracker = tracker if tracker is not None else UsageTracker()
         self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -149,11 +237,88 @@ class ModelGateway:
         # optional durable store: every physical dispatch reservation is committed
         # to SQLite BEFORE the provider request is sent (Phase 2.5 gate requirement)
         self._durable_store: Any = None
+        # Phase 4 C4: central zero-cost gate in front of EVERY physical dispatch
+        self._cloud_registry = cloud_registry
+        self._cloud_adapter = cloud_adapter
+        self._default_max_output_tokens = default_max_output_tokens
+        self._cloud_gate: ZeroCostGate | None = None
 
     def set_durable_store(self, store: Any) -> None:
         """Wire a CheckpointStore so each physical dispatch is durably reserved
         (monotonic, atomic, before the request) for runs that have one."""
+        if (store is None and self._cloud_registry is not None
+                and self._cloud_registry.zero_cost):
+            # zero-cost enforcement can never be silently disabled by dropping
+            # the durable store
+            raise ConfigError(
+                "zero-cost mode requires the durable store; set_durable_store(None) "
+                "is rejected while a zero-cost cloud registry is wired"
+            )
+        if (store is not None and self._cloud_gate is not None
+                and self._cloud_gate.enabled() and store is not self._cloud_gate.store):
+            # swapping the quota store would weaken enforcement
+            raise ConfigError(
+                "refusing to swap the durable quota store while a zero-cost gate is "
+                "active — zero-cost enforcement cannot be silently weakened"
+            )
         self._durable_store = store
+        self._cloud_gate = None  # rebuild lazily with the new store
+
+    def set_cloud_registry(self, registry: CloudProfileRegistry) -> None:
+        """Wire the cloud profile registry (factory path). While a registry is
+        wired, it can never be replaced by a different one (that would silently
+        change enforcement)."""
+        if (self._cloud_registry is not None and registry is not self._cloud_registry):
+            raise ConfigError(
+                "refusing to replace the wired cloud registry — replacing it could "
+                "silently weaken zero-cost enforcement"
+            )
+        self._cloud_registry = registry
+        self._cloud_gate = None
+
+    def set_cloud_gate(self, gate: ZeroCostGate) -> None:
+        """Wire an explicit ZeroCostGate (tests / custom wiring). An active
+        zero-cost gate can only be replaced by the SAME gate object; a different
+        gate/registry/adapter/store that could weaken enforcement is rejected."""
+        if self._cloud_gate is not None and self._cloud_gate.enabled() \
+                and gate is not self._cloud_gate:
+            raise ConfigError(
+                "refusing to replace an active zero-cost gate with a different gate "
+                "— zero-cost enforcement cannot be silently disabled or weakened"
+            )
+        if (self._cloud_registry is not None and self._cloud_registry.zero_cost
+                and not gate.enabled()):
+            raise ConfigError(
+                "refusing to replace an active zero-cost gate with an inactive one — "
+                "zero-cost enforcement cannot be silently disabled"
+            )
+        if (self._cloud_registry is not None
+                and gate.registry is not self._cloud_registry):
+            raise ConfigError(
+                "gate registry differs from the wired cloud registry — rejected"
+            )
+        if self._cloud_registry is None:
+            self._cloud_registry = gate.registry
+        self._cloud_gate = gate
+
+    def cloud_gate(self) -> ZeroCostGate | None:
+        """The active zero-cost gate (built lazily from registry + durable store)."""
+        return self._get_cloud_gate()
+
+    def _get_cloud_gate(self) -> ZeroCostGate | None:
+        """Lazily build the zero-cost gate from the registry + durable store.
+        In zero-cost mode a missing durable store fails closed at dispatch time."""
+        if self._cloud_gate is not None:
+            return self._cloud_gate
+        if self._cloud_registry is None:
+            return None
+        self._cloud_gate = ZeroCostGate(
+            self._cloud_registry,
+            self._durable_store,
+            adapter=self._cloud_adapter,
+            default_max_output_tokens=self._default_max_output_tokens,
+        )
+        return self._cloud_gate
 
     def retry_after_hint(self, provider: Provider | str) -> float:
         """Largest Retry-After hint (seconds) observed for this provider, 0 if none."""
@@ -180,9 +345,10 @@ class ModelGateway:
 
     def _reserve_physical(self, ctx: Any, run_id: str | None) -> None:
         """Reserve one physical attempt: in-memory cap check first, then the durable
-        SQLite commit BEFORE the request is sent. If the durable commit fails (run
-        no longer RUNNING: lease lost/recovered), the in-memory reservation is
-        rolled back (nothing was persisted or dispatched) and dispatch is blocked."""
+        SQLite commit BEFORE the request is sent. The lease identity is the
+        WORKER-OWNED binding from the execution context — never adopted by reading
+        SQLite. If the durable commit fails (run no longer RUNNING / stale worker),
+        the in-memory reservation is rolled back and dispatch is blocked."""
         if not ctx.reserve_physical_request():
             raise BudgetExceededError(
                 f"Physical provider-request limit "
@@ -190,9 +356,15 @@ class ModelGateway:
             )
         store = self._durable_store
         if store is not None and run_id is not None:
-            row = store.get(run_id)
-            owner = row.lease_owner if row is not None else None
-            gen = row.lease_generation if row is not None else None
+            owner = getattr(ctx, "lease_owner", None)
+            gen = getattr(ctx, "lease_generation", None)
+            if owner is None or gen is None:
+                ctx.release_physical_reservation()
+                raise CheckpointError(
+                    f"run {run_id!r}: worker-owned lease identity missing from the "
+                    "execution context — physical dispatch fails closed (identity "
+                    "is never adopted from SQLite)"
+                )
             if not store.reserve_physical_durable(
                 run_id, lease_owner=owner, lease_generation=gen
             ):
@@ -202,20 +374,91 @@ class ModelGateway:
                     "dispatch blocked"
                 )
 
+    _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+    def _zero_cost_proxy_guard(self, kwargs: dict[str, Any]) -> None:
+        """FREE_ONLY guard: a zero-cost dispatch to a LOOPBACK endpoint must never
+        be rerouted through an uncontrolled proxy. HTTP(S)_PROXY/ALL_PROXY would
+        redirect the underlying TCP connection even when api_base is loopback, so
+        if a proxy is configured and NO_PROXY does not cover the endpoint host the
+        dispatch fails closed (operator must add the host to NO_PROXY)."""
+        endpoint = kwargs.get("api_base")
+        if not endpoint:
+            return
+        host = (urlsplit(str(endpoint)).hostname or "").lower()
+        if host not in self._LOOPBACK_HOSTS:
+            return  # non-loopback endpoints are already rejected by the gate
+        env = self._environ if self._environ is not None else os.environ
+        proxies = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+                   if env.get(k) or env.get(k.lower())]
+        if not proxies:
+            return
+        no_proxy = {h.strip().lower()
+                    for k in ("NO_PROXY", "no_proxy")
+                    for h in (env.get(k) or "").split(",") if h.strip()}
+        covered = host in no_proxy or any(h in no_proxy for h in self._LOOPBACK_HOSTS) \
+            or "*" in no_proxy
+        if not covered:
+            no_proxy_raw = env.get("NO_PROXY") or env.get("no_proxy") or ""
+            raise CloudConfigError(
+                f"zero-cost dispatch to loopback endpoint {endpoint!r} would be routed "
+                f"through proxy env {proxies} (NO_PROXY={no_proxy_raw!r} does not "
+                f"cover {host!r}) \u2014 fail closed; add the endpoint host to NO_PROXY "
+                "or unset the proxy vars"
+            )
+
+    def _gate_binding(self, run_id: str | None) -> tuple[str | None, int | None]:
+        """Worker-owned lease identity for run-bound dispatches, taken from the
+        EXECUTION CONTEXT (never adopted by reading SQLite). Missing run/context/
+        binding fails closed when the zero-cost gate is active."""
+        if run_id is None:
+            return None, None
+        ctx = self._run_context(run_id)
+        owner = getattr(ctx, "lease_owner", None) if ctx is not None else None
+        gen = getattr(ctx, "lease_generation", None) if ctx is not None else None
+        if owner is None or gen is None:
+            raise CheckpointError(
+                f"zero-cost run-bound dispatch of run {run_id!r} requires the "
+                "worker-owned lease binding in the execution context (missing -> "
+                "fail closed)"
+            )
+        return owner, gen
+
     def _dispatch_sync(self, kwargs: dict[str, Any], *, model: str, run_id: str | None) -> Any:
-        """One physical dispatch: reserve the physical attempt atomically (durably
-        when wired), acquire the request slot ONLY around the in-flight request
-        (never during backoff, cooldown, checkpointing or delegation waits), then
-        call LiteLLM."""
+        """One physical dispatch. Zero-cost gate (when active): phase 1 reserves the
+        durable quota BEFORE the slot; the request slot is acquired next and held
+        ONLY around the in-flight request (never during backoff/cooldown/checkpoint
+        waits); phase 2 revalidates lease+evidence+window+policy and grants the
+        single-use authorization IMMEDIATELY BEFORE the LiteLLM invocation."""
+        gate = self._get_cloud_gate()
+        dispatch_id = ""
+        owner = gen = None
+        if gate is not None and gate.enabled():
+            owner, gen = self._gate_binding(run_id)
+            dispatch_id = gate.prepare_dispatch(
+                model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
+        _harden_litellm_transport()
 
         if ctx is None:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return litellm.completion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.sync_semaphore()
         sem.acquire()
         try:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return litellm.completion(**kwargs)
         finally:
             sem.release()
@@ -223,15 +466,35 @@ class ModelGateway:
     async def _dispatch_async(
         self, kwargs: dict[str, Any], *, model: str, run_id: str | None
     ) -> Any:
+        gate = self._get_cloud_gate()
+        dispatch_id = ""
+        owner = gen = None
+        if gate is not None and gate.enabled():
+            owner, gen = self._gate_binding(run_id)
+            dispatch_id = gate.prepare_dispatch(
+                model, kwargs, run_id=run_id, lease_owner=owner, lease_generation=gen)
         ctx = self._run_context(run_id)
         import litellm
+        _harden_litellm_transport()
 
         if ctx is None:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return await litellm.acompletion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.semaphore()
         await sem.acquire()
         try:
+            if gate is not None and gate.enabled():
+                gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
+                                       lease_owner=owner, lease_generation=gen,
+                                       kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return await litellm.acompletion(**kwargs)
         finally:
             sem.release()
@@ -384,6 +647,7 @@ class ModelGateway:
         fallback_attempts = 0
         last_error: BaseException | None = None
         tried: list[str] = []
+        gate = self._get_cloud_gate()
         for candidate in chain:
             if candidate != primary and fallback_attempts >= policy.max_fallback_attempts:
                 break
@@ -395,6 +659,22 @@ class ModelGateway:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                            metadata={"model": candidate, "reason": decision.reason})
                 continue
+            if gate is not None and gate.enabled():
+                billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
+                if not billing_ok:
+                    if candidate == primary:
+                        # the PRIMARY failing the zero-cost billing/evidence gate is
+                        # a permanent configuration/billing condition — it must
+                        # fail the run, never be suspended and retried
+                        raise CloudConfigError(
+                            f"zero-cost gate rejected the primary model {primary!r}: "
+                            f"{billing_reason}"
+                        )
+                    # no automatic paid/unknown-cost fallback in zero-cost mode
+                    self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
+                               metadata={"model": candidate,
+                                         "reason": f"zero-cost gate: {billing_reason}"})
+                    continue
             probes = self._claim_probes(candidate, ctx, agent)
             if probes is None:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
@@ -657,6 +937,7 @@ class ModelGateway:
         fallback_attempts = 0
         last_error: BaseException | None = None
         tried: list[str] = []
+        gate = self._get_cloud_gate()
         for candidate in chain:
             if candidate != primary and fallback_attempts >= policy.max_fallback_attempts:
                 break
@@ -668,6 +949,21 @@ class ModelGateway:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                            metadata={"model": candidate, "reason": decision.reason})
                 continue
+            if gate is not None and gate.enabled():
+                billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
+                if not billing_ok:
+                    if candidate == primary:
+                        # permanent billing/config condition on the primary: fail,
+                        # never suspend-and-retry unknown billing conditions
+                        raise CloudConfigError(
+                            f"zero-cost gate rejected the primary model {primary!r}: "
+                            f"{billing_reason}"
+                        )
+                    # no automatic paid/unknown-cost fallback in zero-cost mode
+                    self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
+                               metadata={"model": candidate,
+                                         "reason": f"zero-cost gate: {billing_reason}"})
+                    continue
             probes = self._claim_probes(candidate, ctx, agent)
             if probes is None:
                 self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
@@ -810,6 +1106,7 @@ class ModelGateway:
         """Actual cost from LiteLLM when known; None otherwise (never 0)."""
         try:
             import litellm
+            _harden_litellm_transport()
 
             value = litellm.completion_cost(completion_response=response)
             cost = float(value)
