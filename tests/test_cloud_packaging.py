@@ -11,7 +11,6 @@ cloud demo in a fresh subprocess, and version consistency.
 """
 
 import os
-import socket
 import subprocess
 import sys
 import tomllib
@@ -43,13 +42,7 @@ CLOUD_YAML = REPO_ROOT / "config" / "agents.cloud.yaml"
 MODEL = "ollama/llama3.2"
 
 
-@pytest.fixture
-def no_network(monkeypatch):
-    def blocked(*a, **k):
-        raise AssertionError("network access attempted during offline test")
-    monkeypatch.setattr(socket.socket, "connect", blocked)
-    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
-    monkeypatch.setattr(socket, "create_connection", blocked)
+# no_network fixture lives in tests/conftest.py (loopback-tolerant)
 
 
 @pytest.fixture

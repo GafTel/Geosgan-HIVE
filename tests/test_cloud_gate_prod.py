@@ -14,7 +14,6 @@ Failing-first, fully offline (mocked LiteLLM + network spy). Covers:
 """
 
 import json
-import socket
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -153,13 +152,7 @@ def litellm_spy(monkeypatch):
     return calls
 
 
-@pytest.fixture
-def no_network(monkeypatch):
-    def blocked(*a, **k):
-        raise AssertionError("network access attempted during offline test")
-    monkeypatch.setattr(socket.socket, "connect", blocked)
-    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
-    monkeypatch.setattr(socket, "create_connection", blocked)
+# no_network fixture lives in tests/conftest.py (loopback-tolerant)
 
 
 def make_gateway(store, gate, ctx_lookup=None):

@@ -10,7 +10,6 @@ async path, and rejection of test-only mock adapters for live estimation."""
 
 import asyncio
 import json
-import socket
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -164,15 +163,8 @@ def litellm_spy(monkeypatch):
     return calls
 
 
-@pytest.fixture
-def no_network(monkeypatch):
-    """Spy that forbids outbound connections (asyncio's event loop needs
-    socketpair, so the constructor itself must stay intact)."""
-    def blocked(*args, **kwargs):
-        raise AssertionError("network access attempted during offline test")
-    monkeypatch.setattr(socket.socket, "connect", blocked)
-    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
-    monkeypatch.setattr(socket, "create_connection", blocked)
+# no_network fixture lives in tests/conftest.py (loopback-tolerant so asyncio's
+# event loop works on Windows, where socketpair is emulated over 127.0.0.1)
 
 
 # ---- wiring / fail-closed ----
