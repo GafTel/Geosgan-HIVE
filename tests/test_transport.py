@@ -127,8 +127,10 @@ def test_real_loopback_transport_end_to_end(tmp_path, local_server, monkeypatch,
     answer = gw.complete([Message(role="user", content="hi")], model=MODEL,
                          agent="supervisor", max_tokens=64)
     assert answer == "hello from real local transport"
-    assert handler.seen and handler.seen[0]["path"] == "/api/generate"
-    assert handler.seen[0]["host"].startswith("127.0.0.1:")  # loopback only
+    # every request litellm makes (incl. internal /api/show lookups) goes to the
+    # pinned literal loopback address of the test server
+    assert handler.seen and "/api/generate" in [s["path"] for s in handler.seen]
+    assert all(s["host"].startswith("127.0.0.1:") for s in handler.seen)
     # the gateway hardened the real transport: no redirect following, and no
     # tiktoken BPE downloads (litellm's local token counter disabled)
     import litellm

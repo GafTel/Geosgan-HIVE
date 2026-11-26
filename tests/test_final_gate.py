@@ -117,8 +117,9 @@ def test_gateway_routes_only_to_bound_loopback_endpoint(tmp_path, monkeypatch, n
     assert captured, "expected at least one physical dispatch"
     for kwargs in captured:
         assert kwargs["model"].startswith("ollama/")
-        # every physical request targets the evidence-bound LOOPBACK endpoint
-        assert kwargs.get("api_base") == "http://localhost:11434"
+        # every physical request targets the evidence-bound LOOPBACK endpoint,
+        # pinned to the validated literal address
+        assert kwargs.get("api_base") == "http://127.0.0.1:11434"
     store.close()
 
 
@@ -196,7 +197,7 @@ def test_proxy_env_with_no_proxy_loopback_allows_dispatch(tmp_path, monkeypatch,
     client = GatewayLLMClient(_gw, model=MODEL, agent="supervisor")
     resp = client.complete([Message(role="user", content="hi")])
     assert resp  # completed (returns the answer string)
-    assert calls and calls[0]["api_base"] == "http://localhost:11434"
+    assert calls and calls[0]["api_base"] == "http://127.0.0.1:11434"  # pinned literal
     store.close()
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -104,6 +106,35 @@ class _OfflineEncoding:
 
     def name(self):
         return "hive-offline-heuristic"
+
+
+_OLLAMA_ENV_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _pinned_ollama_env(kwargs: dict):
+    """A0: LiteLLM resolves SOME internal Ollama calls via the OLLAMA_API_BASE
+    env var or the localhost:11434 default instead of the per-call api_base
+    (e.g. model-info /api/show lookups inside litellm.completion). While a gated
+    local dispatch runs, point that env var at the gate-PINNED literal loopback
+    address, so no unpinned name resolution can occur anywhere in the call.
+    The env var is process-global, so the set-call-restore section is serialized
+    with a lock (gated local dispatches to one shared local endpoint are
+    effectively sequential anyway). Restored afterwards."""
+    api_base = str(kwargs.get("api_base") or "")
+    if not (api_base.startswith("http://127.0.0.1") or api_base.startswith("http://[::1]")):
+        yield
+        return
+    with _OLLAMA_ENV_LOCK:
+        old = os.environ.get("OLLAMA_API_BASE")
+        os.environ["OLLAMA_API_BASE"] = api_base
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("OLLAMA_API_BASE", None)
+            else:
+                os.environ["OLLAMA_API_BASE"] = old
 
 
 _LITELLM_TRANSPORT_HARDENED = False
@@ -448,7 +479,9 @@ class ModelGateway:
                                        kwargs=kwargs)
             if gate is not None and gate.enabled():
                 self._zero_cost_proxy_guard(kwargs)
-            return litellm.completion(**kwargs)
+            with (_pinned_ollama_env(kwargs) if gate is not None and gate.enabled()
+                  else contextlib.nullcontext()):
+                return litellm.completion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.sync_semaphore()
         sem.acquire()
@@ -459,7 +492,9 @@ class ModelGateway:
                                        kwargs=kwargs)
             if gate is not None and gate.enabled():
                 self._zero_cost_proxy_guard(kwargs)
-            return litellm.completion(**kwargs)
+            with (_pinned_ollama_env(kwargs) if gate is not None and gate.enabled()
+                  else contextlib.nullcontext()):
+                return litellm.completion(**kwargs)
         finally:
             sem.release()
 
@@ -484,7 +519,9 @@ class ModelGateway:
                                        kwargs=kwargs)
             if gate is not None and gate.enabled():
                 self._zero_cost_proxy_guard(kwargs)
-            return await litellm.acompletion(**kwargs)
+            with (_pinned_ollama_env(kwargs) if gate is not None and gate.enabled()
+                  else contextlib.nullcontext()):
+                return await litellm.acompletion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.semaphore()
         await sem.acquire()
@@ -495,7 +532,9 @@ class ModelGateway:
                                        kwargs=kwargs)
             if gate is not None and gate.enabled():
                 self._zero_cost_proxy_guard(kwargs)
-            return await litellm.acompletion(**kwargs)
+            with (_pinned_ollama_env(kwargs) if gate is not None and gate.enabled()
+                  else contextlib.nullcontext()):
+                return await litellm.acompletion(**kwargs)
         finally:
             sem.release()
 
