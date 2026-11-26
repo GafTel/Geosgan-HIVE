@@ -112,7 +112,7 @@ class VerificationEvidence(BaseModel):
     #: the endpoint (api_base host) it applies to. When set, they must match the
     #: profile's provider / the request's endpoint at dispatch time.
     provider: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
-    endpoint: str | None = Field(default=None, pattern=r"^https?://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
+    endpoint: str | None = Field(default=None, pattern=r"^https?://(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9.-]{1,253})(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
     #: how zero billing exposure is established; UNKNOWN (default) fails closed
     billing_enforcement: BillingEnforcement = BillingEnforcement.UNKNOWN
 
@@ -121,6 +121,22 @@ class VerificationEvidence(BaseModel):
     def _aware(cls, v: datetime) -> datetime:
         if v.tzinfo is None:
             raise ValueError("collected_at must be timezone-aware (naive timestamps rejected)")
+        return v
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint_port_range(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"endpoint must be an absolute http(s) URL: {v!r}")
+        if parts.port is None:
+            return v
+        if not 1 <= parts.port <= 65535:
+            raise ValueError(f"endpoint port out of range: {parts.port}")
         return v
 
     def current(self, now: datetime, ttl_days: int) -> bool:

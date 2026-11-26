@@ -74,7 +74,8 @@ class QuotaScope(StrEnum):
 
 
 _HTTPS_URL = re.compile(
-    r"^https://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./:?#&=%~+-]*)?$")
+    r"^https://(\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9.-]{1,253})(:[0-9]{1,5})?"
+    r"(/[a-zA-Z0-9_./:?#&=%~+-]*)?$")
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 

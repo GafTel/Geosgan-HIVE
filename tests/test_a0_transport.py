@@ -353,6 +353,20 @@ def test_ipv6_loopback_literal_pinning(tmp_path, monkeypatch, no_network):
     store.close()
 
 
+def test_evidence_endpoint_pattern_allows_bracketed_ipv6_literal():
+    """Pattern-level regression (runs even where IPv6 sockets are unavailable,
+    unlike the socket test above which skips): a bracketed IPv6 literal is a
+    valid evidence endpoint (local Ollama on [::1]); malformed URLs are not."""
+    from pydantic import ValidationError
+
+    CloudProfile.model_validate(_profile("http://[::1]:11434"))  # must not raise
+    CloudProfile.model_validate(_profile("https://[2001:db8::1]:443/x"))
+    for bad in ("http://[::1", "http://::1]:80", "http://[gg::1]:80", "ftp://[::1]:80",
+                "http://[::1]:99999", "http://exa mple.com"):
+        with pytest.raises(ValidationError):
+            CloudProfile.model_validate(_profile(bad))
+
+
 def test_async_dispatch_uses_same_endpoint_protection(tmp_path, local_server, monkeypatch,
                                                        no_network):
     import asyncio
