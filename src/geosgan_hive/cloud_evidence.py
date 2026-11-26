@@ -311,29 +311,38 @@ class CloudEvidenceVault:
         if not candidates:
             return False, E_NO_PROVIDER_ENFORCED
         now_iso = now.isoformat(timespec="milliseconds")
+        first_reason = None
         for r in candidates:
+            # a record is usable only if it passes EVERY binding/check; scan all
+            # candidates so one revoked/expired record does not mask a valid one
+            reason = None
             if r["revoked"]:
-                return False, E_REVOKED
-            if r["expires_at"] <= now_iso:
-                return False, E_EXPIRED
-            if r["provider_id"] != provider_id:
-                return False, E_PROVIDER_MISMATCH
-            if r["model_id"] is not None and r["model_id"] != model_id:
-                return False, E_MODEL_MISMATCH
-            if r["endpoint"] is not None and endpoint is not None and r["endpoint"] != endpoint:
-                return False, E_ENDPOINT_MISMATCH
-            if r["credential_fingerprint"] != account_fingerprint:
-                return False, E_CREDENTIAL_MISMATCH
-            if r["spending_restriction"] not in (
+                reason = E_REVOKED
+            elif r["expires_at"] <= now_iso:
+                reason = E_EXPIRED
+            elif r["provider_id"] != provider_id:
+                reason = E_PROVIDER_MISMATCH
+            elif r["model_id"] is not None and r["model_id"] != model_id:
+                reason = E_MODEL_MISMATCH
+            elif r["endpoint"] is not None and endpoint is not None \
+                    and r["endpoint"] != endpoint:
+                reason = E_ENDPOINT_MISMATCH
+            elif r["credential_fingerprint"] != account_fingerprint:
+                reason = E_CREDENTIAL_MISMATCH
+            elif r["spending_restriction"] not in (
                     "hard_limit_usd0", "allowance_no_overage"):
-                return False, E_NO_HARD_LIMIT
-            if r["overage_behavior"] in ("charge", "unknown"):
-                return False, E_CHARGEABLE_OVERAGE
-            if r["source"] not in AUTHENTICATED_SOURCES or not r["collection_method"]:
-                return False, E_UNAUTHENTICATED_SOURCE
-            if r["collected_at"] > now_iso:
-                return False, E_FUTURE_TIMESTAMP
-        return True, E_OK
+                reason = E_NO_HARD_LIMIT
+            elif r["overage_behavior"] in ("charge", "unknown"):
+                reason = E_CHARGEABLE_OVERAGE
+            elif r["source"] not in AUTHENTICATED_SOURCES or not r["collection_method"]:
+                reason = E_UNAUTHENTICATED_SOURCE
+            elif r["collected_at"] > now_iso:
+                reason = E_FUTURE_TIMESTAMP
+            if reason is None:
+                return True, E_OK  # one fully-valid record is sufficient
+            if first_reason is None:
+                first_reason = reason
+        return False, first_reason or E_NO_PROVIDER_ENFORCED
 
 
 __all__ = [

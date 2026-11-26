@@ -706,3 +706,119 @@ cloud:
   `LITELLM_LOCAL_MODEL_COST_MAP=True` (set before importing litellm) so offline
   startup performs no network requests; a fresh-process regression test guards it.
 - Devcontainer (`.devcontainer/`) pins Python 3.12 for Codespaces.
+
+## Phase 5: FREE API & MODEL INTELLIGENCE ENGINE (v0.7.0)
+
+Zero authorized API expenditure. Everything below is offline-testable; no live
+provider requests are made or authorized in this release.
+
+### A0 - local-inference transport hardening
+Sync and async dispatch share the same effective-endpoint protection; the
+process-global `OLLAMA_API_BASE` mutation is restored after success, failure and
+cancellation; concurrent gateways never observe each other's temporary
+endpoint; IPv6 loopback literals are handled; redirect/proxy protections stay
+on.
+
+### A1 - informational provider & capability catalog (`config/catalog.yaml`)
+Typed, versioned catalog (provider, models with exact ids, capabilities, docs,
+licensing, billing classification, evidence freshness, quota dimensions, privacy,
+status). The catalog NEVER grants permissions; unknown/expired evidence never
+authorizes execution; volatile free-tier numbers are not hardcoded as
+guarantees.
+
+### A5 - secure public API transport (`SecureHttpClient`, stdlib only)
+HTTPS-only production requests with certificate + original-hostname/SNI
+verification; DNS results validated and the connection pinned to the validated
+numeric address (actual connected peer verified, no second uncontrolled
+resolution, DNS-rebinding resistant); private/loopback/link-local/multicast/
+reserved destinations rejected for public APIs (IPv4/IPv6/IPv4-mapped handled);
+redirects and environment proxies disabled; no model-controlled URLs/methods/
+headers; bounded request/response/decompression sizes, total request deadlines,
+bounded resolver workers + queue, deadline-aware cancellation-aware semaphore.
+Durable atomic per-run/per-provider/per-endpoint request+byte budgets (schema
+v9), lease-fenced, replay-proof. Outbound authorization reuses ToolGateway +
+ApprovalManager (DISABLED / APPROVAL_REQUIRED / AUTHORIZED, bound to the exact
+validated operation, run, agent, tool version, canonical args, destination,
+policy, expiry; revalidated before dispatch; full preview, not just a hash).
+`build_offline_test_session` is test-only and unreachable from production
+config/CLI/model output. Schema v8 -> v9 migration is atomic with full rollback.
+
+### A6 - specialized read-only public API adapters (all disabled by default)
+Wikimedia (search/get_page, en+es, descriptive UA, CC BY-SA attribution),
+Crossref (works search, DOI metadata, bibliographic references from actual
+`reference` records), GitHub public REST (search/repos/releases/bounded docs,
+unauthenticated-first), World Bank indicators, Open-Meteo (requires explicit
+operator non-commercial attestation, default false). SearXNG stays DISABLED
+until a separately scoped private-instance transport policy is authorized.
+Canonical UTF-8 percent-encoding for Unicode titles and DOI characters
+(parentheses, colons, slashes); the transport rejects traversal, encoded
+separators, double encoding and non-canonical escapes. External content is
+untrusted (prompt-injection inert); missing values are never fabricated;
+attribution/licensing preserved.
+
+### A2 - reproducible model benchmark engine (offline)
+Versioned deterministic suites (v2.0.0: 60 cases, 5 roles x en/es; v1.0.0 kept
+for provenance) with machine-checkable scoring (exact/contains/json_fields/
+regex) - no LLM judge, no execution of generated code. Evidence records exact
+pinned model identity, suite, hardware, run config, provenance, TTL. TRUST
+TIERS: simulated (infrastructure_test/synthetic_fixture) and operator-reported
+(`measured` + transcript hash + operator attestation) are NEVER routing-
+eligible; only `trusted_runtime` evidence - recorded exclusively through the
+lease-fenced runtime recorder with worker-owned lease fencing and the reserved
+runtime evaluator id - can feed quality ranking. The public recorder has no
+parameter that can mint that tier. CLI: `--benchmark-simulate`,
+`--benchmark-report`, `--benchmark-list`. NO real model-quality measurement has
+been performed or established in this release.
+
+### A3 - intelligent routing engine (opt-in; off by default)
+`routing:` block in the config (`mode: fixed|eligible_default|evidence_based`,
+validated weights summing to 1, allow/block lists, privacy, explicit eligible
+defaults, cross-provider fallback flag). Mandatory eligibility filters run
+BEFORE any ranking (authorization, billing, evidence freshness, identity,
+capabilities, context, tools, privacy, health, quotas, budgets, fallback
+authorization). Deterministic ranking over measured components only; unknown
+quality/speed never fabricated; deterministic tie-breaking. Zero-cost
+eligibility is a filter, never a score. The router selects but NEVER authorizes;
+revalidation happens immediately before dispatch; provenance is durable
+(schema v11 `routing_decisions`, bounded metadata only). CLI: `--route`,
+`--routing-decisions`. Disabling routing never disables the zero-cost gate.
+
+### A4 - cloud evidence & billing verification infrastructure (offline)
+Typed evidence classes (public_docs / operator_declaration /
+account_authenticated / provider_enforced) in a durable vault (schema v12),
+bound to provider/account/credential-fingerprint (sha256 only)/exact
+model/endpoint/plan/quota-pool/spending-restriction/overage/source/timestamps/
+revocation/policy version. Only provider_enforced can ever support eligibility,
+and recording it requires a code-level ingestion flag that config/CLI/fixtures
+can never set. Evidence import never auto-activates anything. CLI:
+`--cloud-evidence [--cloud-evidence-all]` (read-only).
+
+### v0.7.0 production release gate (zero-cost mode)
+In zero-cost (FREE_ONLY) mode ONLY local inference (ollama, loopback transport)
+may receive live dispatch. Groq, OpenRouter and every other non-local cloud
+provider are DENIED regardless of profile evidence, the legacy
+`trusted_evidence_binding` flag, or the evidence-vault state - even an injected
+vault with syntactically valid provider_enforced records cannot activate them.
+A future, separately authorized gate may re-open verified provider-enforced
+zero-cost paths. Outside zero-cost mode, legacy semantics are preserved.
+
+### Provider eligibility (v0.7.0)
+- ollama (local): allowed in zero-cost mode via loopback-only transport.
+- groq / openrouter / all other cloud LLM providers: BLOCKED (release gate).
+- public APIs: read-only tools, approval-gated, disabled by default.
+- searxng: DISABLED (needs a separately scoped private-instance policy).
+
+### Offline demos (9)
+`PYTHONPATH=src python examples/demo_{offline,collaboration,fallback,tool_engine,cloud,apis,secure_api,benchmarks,routing,cloud_evidence}.py`
+
+### Known limitations (Phase 5)
+- OS `getaddrinfo` cannot be forcibly interrupted: DNS waits are bounded and
+  fail closed; abandoned resolver workers are never claimed terminated and can
+  never initiate HTTP dispatch. A residual DNS TOCTOU is bounded by numeric
+  pinning + connected-peer verification, not eliminated by DNS prevalidation.
+- Local quota windows are HIVE-side accounting, not provider-confirmed resets.
+- The trusted-process boundary is honest: API-level checks do not defend against
+  arbitrary privileged local code or direct database modification.
+- Windows CI skips 18 POSIX-only tests (documented platform-specific skips).
+- No real model-quality ranking has been established; evidence-based routing
+  stays unavailable until genuinely trusted measurements exist.
