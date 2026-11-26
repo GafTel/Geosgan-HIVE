@@ -632,3 +632,128 @@ def test_github_path_segments_rejected_before_request(tmp_path, github_server):
         assert not r.ok, bad
     assert len(GitHubHandler.hits) == hits
     store.close()
+
+
+# ---- A6.4 World Bank ---------------------------------------------------------------
+
+class WorldBankHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    hits = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).hits.append(self.path)
+        if self.path.startswith("/v2/indicator"):
+            body = json.dumps([{"page": 1}, [
+                {"id": "NY.GDP.MKTP.CD", "name": "GDP (current US$)", "unit": "",
+                 "source": {"value": "World Bank national accounts"}},
+                {"id": "SP.POP.TOTL", "name": "Population, total", "unit": "",
+                 "source": {"value": "World Bank"}}]]).encode()
+        elif "/indicator/" in self.path:
+            body = json.dumps([{"page": 1}, [
+                {"date": "2023", "value": 47105341, "unit": "",
+                 "country": {"value": "Spain"}, "indicator": {"value": "Population"}},
+                {"date": "2022", "value": None, "unit": "",
+                 "country": {"value": "Spain"}, "indicator": {"value": "Population"}},
+            ]]).encode()
+        else:
+            body = b"[null,[]]"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def worldbank_server():
+    WorldBankHandler.hits = []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), WorldBankHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield port
+    srv.shutdown()
+
+
+def worldbank_apis(**overrides):
+    base = {
+        "enabled": ["worldbank"],
+        "max_wire_bytes_per_request": 2_000_000,
+        "budgets": {"per_endpoint_requests": 100, "per_endpoint_bytes": 10**9,
+                    "per_provider_requests": 100, "per_provider_bytes": 10**9,
+                    "per_run_requests": 50, "per_run_bytes": 10**9},
+        "providers": [{
+            "provider": "worldbank", "billing": "public_api_no_charge",
+            "outbound_policy": "authorized",
+            "allowed_operations": ["list_indicators", "indicator_data"],
+            "endpoints": [{"endpoint_id": "worldbank-v2", "scheme": "https",
+                           "host": "api.worldbank.org", "path_prefixes": ["/v2"],
+                           "methods": ["GET"]}],
+        }],
+    }
+    base.update(overrides)
+    return ApiConfig.model_validate(base)
+
+
+def make_wb_session(tmp_path, port, apis):
+    store = CheckpointStore(str(tmp_path / "cp.db"), utcnow=lambda: NOW)
+    rule = EndpointRule(endpoint_id="worldbank-v2", scheme="http", host="127.0.0.1",
+                        port=port, path_prefixes=("/v2",), methods=("GET",),
+                        headers={"User-Agent": "hive-test/1.0"})
+    client = SecureHttpClient(TransportConfig(endpoints=(rule,),
+                                              limits=HttpLimits(max_retries=1),
+                                              allow_loopback=True))
+    auth = OutboundAuthorizer(store, apis, ApprovalManager(store))
+    return build_offline_test_session(client, auth, store), store
+
+
+def test_worldbank_indicators_and_series_missing_stays_null(tmp_path, worldbank_server):
+    session, store = make_wb_session(tmp_path, worldbank_server, worldbank_apis())
+    catalog = ToolCatalog()
+    names = register_api_tools(catalog, session, providers=["worldbank"])
+    assert names == ["worldbank_list_indicators", "worldbank_indicator_data"]
+    policy = build_policy(global_enabled=names,
+                          agent_permissions={"researcher": (True, names)})
+    gw = ToolGateway(catalog, policy, store=store, approval_manager=ApprovalManager(store))
+
+    r = gw.execute("worldbank_list_indicators", {"per_page": 10, "page": 1}, ctx=ctx())
+    assert r.ok, r.error
+    out = json.loads(r.output)
+    assert out["results"][0]["id"] == "NY.GDP.MKTP.CD"
+    assert "CC BY 4.0" in out["attribution"]
+    assert "format=json" in WorldBankHandler.hits[-1]
+
+    r = gw.execute("worldbank_indicator_data",
+                   {"country": "ES", "indicator": "SP.POP.TOTL",
+                    "start_year": 2022, "end_year": 2023}, ctx=ctx())
+    assert r.ok, r.error
+    out = json.loads(r.output)
+    assert out["kind"] == "indicator_series"
+    assert out["results"][0]["value"] == 47105341
+    assert out["results"][1]["value"] is None  # missing NEVER becomes 0
+    assert "never reported as 0" in out["missing_value_semantics"]
+    hit = WorldBankHandler.hits[-1]
+    assert hit.startswith("/v2/country/ES/indicator/SP.POP.TOTL")
+    assert "date=2022%3A2023" in hit or "date=2022:2023" in hit
+    store.close()
+
+
+def test_worldbank_invalid_identifiers_and_range_rejected(tmp_path, worldbank_server):
+    session, store = make_wb_session(tmp_path, worldbank_server, worldbank_apis())
+    catalog = ToolCatalog()
+    register_api_tools(catalog, session, providers=["worldbank"])
+    policy = build_policy(global_enabled=["worldbank_indicator_data"],
+                          agent_permissions={"researcher": (True, ["worldbank_indicator_data"])})
+    gw = ToolGateway(catalog, policy, store=store, approval_manager=ApprovalManager(store))
+    hits = len(WorldBankHandler.hits)
+    for bad in ({"country": "E1", "indicator": "X", "start_year": 2020, "end_year": 2021},
+                {"country": "ES", "indicator": "a/b", "start_year": 2020, "end_year": 2021},
+                {"country": "ES", "indicator": "X", "start_year": 2021, "end_year": 2020},
+                {"country": "ES", "indicator": "X", "start_year": 1900, "end_year": 2100},
+                {"country": "ES", "indicator": "X", "start_year": 2000, "end_year": 2100}):
+        r = gw.execute("worldbank_indicator_data", bad, ctx=ctx())
+        assert not r.ok, bad
+    assert len(WorldBankHandler.hits) == hits
+    store.close()
