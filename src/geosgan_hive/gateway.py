@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from .cloud_gate import ZeroCostGate
 from .cloud_profiles import CloudProfileRegistry
@@ -296,6 +298,39 @@ class ModelGateway:
                     "dispatch blocked"
                 )
 
+    _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+    def _zero_cost_proxy_guard(self, kwargs: dict[str, Any]) -> None:
+        """FREE_ONLY guard: a zero-cost dispatch to a LOOPBACK endpoint must never
+        be rerouted through an uncontrolled proxy. HTTP(S)_PROXY/ALL_PROXY would
+        redirect the underlying TCP connection even when api_base is loopback, so
+        if a proxy is configured and NO_PROXY does not cover the endpoint host the
+        dispatch fails closed (operator must add the host to NO_PROXY)."""
+        endpoint = kwargs.get("api_base")
+        if not endpoint:
+            return
+        host = (urlsplit(str(endpoint)).hostname or "").lower()
+        if host not in self._LOOPBACK_HOSTS:
+            return  # non-loopback endpoints are already rejected by the gate
+        env = self._environ if self._environ is not None else os.environ
+        proxies = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+                   if env.get(k) or env.get(k.lower())]
+        if not proxies:
+            return
+        no_proxy = {h.strip().lower()
+                    for k in ("NO_PROXY", "no_proxy")
+                    for h in (env.get(k) or "").split(",") if h.strip()}
+        covered = host in no_proxy or any(h in no_proxy for h in self._LOOPBACK_HOSTS) \
+            or "*" in no_proxy
+        if not covered:
+            no_proxy_raw = env.get("NO_PROXY") or env.get("no_proxy") or ""
+            raise CloudConfigError(
+                f"zero-cost dispatch to loopback endpoint {endpoint!r} would be routed "
+                f"through proxy env {proxies} (NO_PROXY={no_proxy_raw!r} does not "
+                f"cover {host!r}) \u2014 fail closed; add the endpoint host to NO_PROXY "
+                "or unset the proxy vars"
+            )
+
     def _gate_binding(self, run_id: str | None) -> tuple[str | None, int | None]:
         """Worker-owned lease identity for run-bound dispatches, taken from the
         EXECUTION CONTEXT (never adopted by reading SQLite). Missing run/context/
@@ -334,6 +369,8 @@ class ModelGateway:
                 gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
                                        lease_owner=owner, lease_generation=gen,
                                        kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return litellm.completion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.sync_semaphore()
@@ -343,6 +380,8 @@ class ModelGateway:
                 gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
                                        lease_owner=owner, lease_generation=gen,
                                        kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return litellm.completion(**kwargs)
         finally:
             sem.release()
@@ -365,6 +404,8 @@ class ModelGateway:
                 gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
                                        lease_owner=owner, lease_generation=gen,
                                        kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return await litellm.acompletion(**kwargs)
         self._reserve_physical(ctx, run_id)
         sem = ctx.semaphore()
@@ -374,6 +415,8 @@ class ModelGateway:
                 gate.finalize_dispatch(model, dispatch_id, run_id=run_id,
                                        lease_owner=owner, lease_generation=gen,
                                        kwargs=kwargs)
+            if gate is not None and gate.enabled():
+                self._zero_cost_proxy_guard(kwargs)
             return await litellm.acompletion(**kwargs)
         finally:
             sem.release()

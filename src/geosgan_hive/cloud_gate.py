@@ -37,6 +37,7 @@ import json
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .checkpoints import CheckpointStore, _add_months, quota_window_for
@@ -153,6 +154,18 @@ class ZeroCostGate:
                     f"zero-cost gate blocked dispatch of {model!r}: effective endpoint "
                     f"{eff!r} does not match the verification evidence endpoint "
                     f"{ev.endpoint!r}"
+                )
+        if ev is not None and ev.billing_enforcement.value == "local_inference":
+            # LOCAL inference is only zero-cost on a LOOPBACK endpoint: an
+            # api_base override (e.g. OLLAMA_API_BASE) pointing anywhere remote
+            # is rejected even when the evidence declares no endpoint binding
+            eff = effective_endpoint(model, kwargs)
+            host = urlsplit(str(eff)).hostname if eff else None
+            if host is None or host.lower() not in ("localhost", "127.0.0.1", "::1"):
+                raise CloudConfigError(
+                    f"zero-cost gate blocked dispatch of {model!r}: local_inference "
+                    f"billing enforcement requires a loopback endpoint, but the "
+                    f"effective endpoint is {eff!r} (host {host!r}) \u2014 fail closed"
                 )
 
     def candidate_billing_ok(self, model: str) -> tuple[bool, str]:
