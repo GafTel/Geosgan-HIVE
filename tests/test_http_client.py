@@ -338,7 +338,6 @@ def test_tls_hostname_mismatch_rejected(https_server):
     ctx_srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx_srv.load_cert_chain(TLS_DIR / "wrong.pem", TLS_DIR / "wrong.key")
     # rebuild server with wrong cert
-    import tests.test_http_client as _self  # noqa: F401
     Handler.mode = "ok"
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.socket = ctx_srv.wrap_socket(srv.socket, server_side=True)

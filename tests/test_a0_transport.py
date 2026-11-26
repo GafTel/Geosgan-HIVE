@@ -332,7 +332,7 @@ def test_ipv6_loopback_literal_pinning(tmp_path, monkeypatch, no_network):
     class Srv6(ThreadingHTTPServer):
         address_family = _s.AF_INET6
 
-    Srv6.seen = []
+    H6.seen = []  # isolate the handler's seen list (shared class attr otherwise)
     try:
         srv = Srv6(("::1", 0), H6)
     except OSError:
