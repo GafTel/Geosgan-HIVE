@@ -97,7 +97,9 @@ def main():
     client = SecureHttpClient(TransportConfig(endpoints=(rule,),
                                               limits=HttpLimits(max_retries=1),
                                               allow_loopback=True))  # TEST-ONLY flag
-    session = ApiSession(client, auth, store)
+    # test_endpoint_override: offline demo only — the loopback rule replaces the
+    # https rule of the same endpoint id; production (build_api_session) is strict
+    session = ApiSession(client, auth, store, test_endpoint_override=True)
 
     call = dict(provider="wikimedia", endpoint_id="wiki", operation_id="search",
                 method="GET", path="/w/api/search", params={"q": "geospatial hive"},

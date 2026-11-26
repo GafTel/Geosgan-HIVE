@@ -13,6 +13,16 @@ request (bounded + secret-redacted), not just a hash.
 
 Never automatically transmits workspace files, conversation history, private
 documents or credentials; external content is untrusted and grants nothing.
+
+Billing note: provider `billing` classes in config are OPERATOR ATTESTATIONS,
+not verified evidence; unknown billing exposure fails closed. HIVE-local
+request/byte budgets cannot guarantee zero provider-side charges.
+
+Authorization and transport are bound at construction: every authorized
+endpoint id must map to a transport rule with the identical scheme/host/port/
+path prefixes/methods (see ApiSession._verify_endpoint_binding). The
+`test_endpoint_override` constructor flag exists ONLY for offline loopback
+fixtures; production construction (build_api_session) never sets it.
 """
 
 from __future__ import annotations
@@ -30,7 +40,7 @@ from uuid import uuid4
 from .agent_config import ApiConfig, ApiProviderConfig
 from .approvals import ApprovalManager
 from .checkpoints import CheckpointStore, QuotaReservationOutcome
-from .errors import HiveError
+from .errors import ConfigError, HiveError
 from .http_client import (
     EndpointRule,
     HttpLimits,
@@ -264,12 +274,43 @@ class ApiSession:
 
     def __init__(self, client: SecureHttpClient, authorizer: OutboundAuthorizer,
                  store: CheckpointStore, *, clock=time.monotonic,
-                 sleep=time.sleep) -> None:
+                 sleep=time.sleep, test_endpoint_override: bool = False) -> None:
         self.client = client
         self.auth = authorizer
         self.store = store
         self._clock = clock
         self._sleep = sleep
+        if not test_endpoint_override:
+            # Authorization config and physical transport config must not be
+            # independently substituted: every enabled provider endpoint must
+            # map to a transport rule with the EXACT same scheme/host/port/
+            # path prefixes/methods. Production construction (build_api_session)
+            # derives both from one config and always passes this check.
+            self._verify_endpoint_binding()
+
+    def _verify_endpoint_binding(self) -> None:
+        apis = self.auth.apis
+        for p in apis.providers:
+            if p.provider not in apis.enabled:
+                continue
+            for e in p.endpoints:
+                rule = self.client.rule_for(e.endpoint_id)
+                if rule is None:
+                    raise ConfigError(
+                        f"authorized endpoint {e.endpoint_id!r} (provider {p.provider!r}) "
+                        "has no transport rule in the client — authorization/transport "
+                        "binding mismatch")
+                expected_port = e.port or (443 if e.scheme == "https" else 80)
+                if (rule.scheme != e.scheme or rule.host != e.host
+                        or rule.default_port() != expected_port
+                        or tuple(rule.path_prefixes) != tuple(e.path_prefixes)
+                        or tuple(rule.methods) != tuple(m.upper() for m in e.methods)):
+                    raise ConfigError(
+                        f"authorized endpoint {e.endpoint_id!r} does not match its transport "
+                        f"rule: config={e.scheme}://{e.host}:{expected_port} "
+                        f"{e.path_prefixes} {e.methods} vs rule={rule.scheme}://"
+                        f"{rule.host}:{rule.default_port()} {rule.path_prefixes} "
+                        f"{rule.methods} — substitution rejected")
 
     def request(self, *, provider: str, endpoint_id: str, operation_id: str,
                 method: str, path: str, params: Mapping[str, Any] | None = None,
@@ -293,13 +334,16 @@ class ApiSession:
         # pre-dispatch revalidation below (consume is single-use, so consuming
         # first would make the revalidation check unable to find the approval).
         budgets = self._budgets(provider, endpoint_id, run_id)
-        window = self.store.now_iso()[:10]  # HIVE-local day window (never a provider reset)
         max_wire = self.auth.apis.max_wire_bytes_per_request
         attempts = 0
         max_attempts = self.client.config.limits.max_retries + 1
         consumed_approval: str | None = None  # one approval per logical call
         while True:
             attempts += 1
+            # the HIVE-local accounting window is recalculated IMMEDIATELY
+            # BEFORE each durable reservation, so a retry that crosses a day
+            # boundary is charged to the correct window (never a provider reset)
+            window = self.store.now_iso()[:10]
             reservation_id = uuid4().hex
             outcome = self.store.reserve_api_request(
                 reservation_id, provider=provider, endpoint_id=endpoint_id,

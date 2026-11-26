@@ -236,14 +236,24 @@ class ApiEndpointConfig(BaseModel):
 
 
 class ApiProviderConfig(BaseModel):
-    """One public API provider. Billing must be a verified no-charge class;
-    unknown billing exposure is rejected (fail closed). External access is
-    DISABLED unless listed in ApiConfig.enabled AND its outbound policy allows."""
+    """One public API provider. External access is DISABLED unless listed in
+    ApiConfig.enabled AND its outbound policy allows.
+
+    `billing` is an OPERATOR ATTESTATION, not independently verified billing
+    evidence: the operator declares that the provider cannot charge for the
+    configured operations. Unknown/unattested billing exposure is rejected
+    (fail closed). Independently verified billing evidence (provider-enforced
+    hard limits, attested no-overage policies) is future A4 work. Local
+    request/byte budgets (ApiBudgets) limit HIVE-side usage only and can NEVER
+    guarantee zero provider-side charges."""
 
     model_config = ConfigDict(extra="forbid")
 
     provider: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
-    billing: str = "unknown"  # must be public_api_no_charge | local_inference
+    #: operator-attested no-charge class; must be public_api_no_charge | local_inference.
+    #: validate_default=True: the fail-closed "unknown" default is validated too
+    #: (pydantic otherwise skips validators on defaults -> fail open).
+    billing: str = Field(default="unknown", validate_default=True)
     outbound_policy: str = "disabled"  # disabled | approval_required | authorized
     allowed_operations: list[str] = Field(default_factory=list)  # for authorized
     non_commercial_attestation: bool = False  # required for open-meteo
@@ -251,11 +261,12 @@ class ApiProviderConfig(BaseModel):
 
     @field_validator("billing")
     @classmethod
-    def _billing_known_no_charge(cls, v: str) -> str:
+    def _billing_attested_no_charge(cls, v: str) -> str:
         if v not in ("public_api_no_charge", "local_inference"):
             raise ValueError(
-                f"billing {v!r} is not a verified no-charge class — unknown billing "
-                "exposure is rejected (fail closed)"
+                f"billing {v!r} is not an operator-attested no-charge class — unknown "
+                "billing exposure is rejected (fail closed); attestation alone is not "
+                "verified evidence"
             )
         return v
 

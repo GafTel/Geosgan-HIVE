@@ -72,7 +72,12 @@ _PATH_SAFE = re.compile(r"^[a-zA-Z0-9_./-]*$")
 
 class HttpLimits(BaseModel):
     """Enforceable per-request limits. A read timeout alone is NOT a total
-    deadline: total_deadline_seconds bounds connect+send+all reads."""
+    deadline. Coverage of total_deadline_seconds: it starts BEFORE DNS
+    resolution and bounds TCP connect + TLS handshake + request transmission
+    + response reception (every send/recv checks the remaining time).
+    DNS resolution is bounded separately by dns_timeout_seconds (a safe total
+    DNS deadline cannot be guaranteed because the OS resolver call is not
+    interruptible; resolution runs on an abandoned daemon thread on timeout)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -83,6 +88,7 @@ class HttpLimits(BaseModel):
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
     read_timeout_seconds: float = Field(default=10.0, gt=0)
     total_deadline_seconds: float = Field(default=30.0, gt=0)
+    dns_timeout_seconds: float = Field(default=5.0, gt=0)
     max_concurrent_requests: int = Field(default=4, ge=1)
     max_retries: int = Field(default=2, ge=0, le=10)
     max_pages: int = Field(default=10, ge=1, le=1000)
@@ -114,8 +120,34 @@ class EndpointRule(BaseModel):
                 raise ValueError(f"method {m!r} not allowed")
         return out
 
+    @field_validator("path_prefixes")
+    @classmethod
+    def _prefixes_safe(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        for p in v:
+            if (not p.startswith("/") or not _PATH_SAFE.match(p) or "//" in p
+                    or ".." in p.split("/") or "." in p.split("/")):
+                raise ValueError(f"unsafe path prefix {p!r}")
+        return v
+
     def default_port(self) -> int:
         return self.port or (443 if self.scheme == "https" else 80)
+
+
+def _normalize_prefix(prefix: str) -> str:
+    return prefix.rstrip("/") or "/"
+
+
+def _path_allowed(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Segment-aware prefix match: '/w/api' authorizes '/w/api' and
+    '/w/api/...' ONLY — a lookalike such as '/w/apix' is rejected."""
+    for p in prefixes:
+        pp = _normalize_prefix(p)
+        if pp == "/":
+            if path.startswith("/"):
+                return True
+        elif path == pp or path.startswith(pp + "/"):
+            return True
+    return False
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -246,6 +278,49 @@ class _LimitedRaw(io.RawIOBase):
         return n
 
 
+class _HeaderCapRaw(io.RawIOBase):
+    """Counts response bytes until the end of the header block (the first blank
+    line, i.e. \\r\\n\\r\\n or \\n\\n, possibly straddling reads) and raises
+    ResponseLimitExceededError AS SOON AS max_response_header_bytes is exceeded
+    DURING reception — before http.client's header parser can buffer an
+    oversized header block. After the terminator it passes through untouched
+    (the wire-byte cap in _LimitedRaw still bounds the body)."""
+
+    def __init__(self, raw: _LimitedRaw, *, max_header_bytes: int):
+        self._raw = raw
+        self._cap = max_header_bytes
+        self._seen = 0
+        self._tail = b""
+        self._done = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b):
+        n = self._raw.readinto(b)
+        if not n or self._done:
+            return n
+        buf = self._tail + bytes(memoryview(b)[:n])
+        end = -1
+        for term in (b"\r\n\r\n", b"\n\n"):
+            i = buf.find(term)
+            if i != -1 and (end == -1 or i < end):
+                end = i + len(term)
+        if end != -1:
+            self._seen += end
+            self._done = True
+            self._tail = b""
+        else:
+            # keep a short tail so a terminator split across reads is detected
+            self._tail = buf[-3:] if len(buf) >= 3 else buf
+            self._seen += len(buf) - len(self._tail)
+        if self._seen > self._cap:
+            raise ResponseLimitExceededError(
+                f"response headers exceeded {self._cap} bytes DURING reception "
+                f"(seen {self._seen}); aborting before buffering more")
+        return n
+
+
 class _LimitedFile:
     """BufferedReader wrapper that releases the socket's io-reference on close,
     mirroring socket.makefile() semantics (see _LimitedSocket.makefile)."""
@@ -279,19 +354,61 @@ class _LimitedSocket:
     socket.makefile() does: http.client's getresponse() calls sock.close() when
     the response says the connection will close, but the body still has to be
     read from the response's file object afterwards. Without the io-ref the fd
-    would be released too early and resp.read() would fail with EBADF."""
+    would be released too early and resp.read() would fail with EBADF.
 
-    def __init__(self, sock: socket.socket, raw: _LimitedRaw):
+    The reader is additionally wrapped in _HeaderCapRaw so the response-header
+    byte limit is enforced WHILE the headers are being received, not only after
+    they were parsed. sendall() is overridden so request transmission respects
+    the remaining total deadline and cancellation."""
+
+    def __init__(self, sock: socket.socket, raw: _LimitedRaw, *,
+                 max_header_bytes: int | None = None,
+                 limits: HttpLimits | None = None,
+                 deadline: float | None = None,
+                 clock: Callable[[], float] | None = None,
+                 cancel: threading.Event | None = None):
         self._sock = sock
         self._raw = raw
+        self._max_header_bytes = max_header_bytes
+        self._limits = limits
+        self._deadline = deadline
+        self._clock = clock or time.monotonic
+        self._cancel = cancel
 
     def makefile(self, mode: str = "rb", *a: Any, **k: Any):
         assert "r" in mode
         sock = self._sock
+        reader: io.RawIOBase = self._raw
+        if self._max_header_bytes is not None:
+            reader = _HeaderCapRaw(self._raw, max_header_bytes=self._max_header_bytes)
+        br = io.BufferedReader(reader)
         if hasattr(sock, "_io_refs"):  # CPython socket io-ref semantics
             sock._io_refs += 1
-            return _LimitedFile(io.BufferedReader(self._raw), sock)
-        return io.BufferedReader(self._raw)
+            return _LimitedFile(br, sock)
+        return br
+
+    def sendall(self, data, flags: int = 0):
+        """Request transmission is covered by the total deadline: before every
+        send, check cancellation and the remaining time, and cap the socket
+        timeout at the remaining deadline."""
+        if self._cancel is not None and self._cancel.is_set():
+            raise TransportCancelledError("request cancelled during send")
+        if self._deadline is not None:
+            remaining = self._deadline - self._clock()
+            if remaining <= 0:
+                raise TransportDeadlineExceededError(
+                    "total request deadline exceeded during request transmission")
+            timeout = remaining
+            if self._limits is not None:
+                timeout = min(self._limits.read_timeout_seconds, remaining)
+            self._sock.settimeout(timeout)
+        try:
+            return self._sock.sendall(data, flags)
+        except TimeoutError as exc:
+            raise TransportDeadlineExceededError(
+                f"send timeout within total deadline: {exc}") from exc
+        except OSError as exc:
+            raise TransportError(f"connection error during send: {exc}") from exc
 
     def __getattr__(self, name: str):
         return getattr(self._sock, name)
@@ -355,12 +472,14 @@ class SecureHttpClient:
         if method.upper() not in rule.methods:
             raise EndpointNotAllowedError(
                 f"method {method!r} not allowed on endpoint {rule.endpoint_id!r}")
-        if not any(path.startswith(p) for p in rule.path_prefixes):
+        if not _PATH_SAFE.match(path) or not path.startswith("/"):
+            raise EndpointNotAllowedError(f"unsafe path {path!r}")
+        if any(seg in ("..", ".") for seg in path.split("/")):
+            raise EndpointNotAllowedError(f"path traversal segment in {path!r}")
+        if not _path_allowed(path, rule.path_prefixes):
             raise EndpointNotAllowedError(
                 f"path {path!r} is not under an allowed prefix of "
                 f"{rule.endpoint_id!r}: {rule.path_prefixes}")
-        if ".." in path or not _PATH_SAFE.match(path):
-            raise EndpointNotAllowedError(f"unsafe path {path!r}")
         query = ""
         if params:
             parts = []
@@ -398,18 +517,47 @@ class SecureHttpClient:
             headers["Content-Length"] = str(len(body))
         return headers
 
+    def rule_for(self, endpoint_id: str) -> EndpointRule | None:
+        """Public accessor for the allowlisted rule of an endpoint id (used to
+        bind authorization config to transport config at construction)."""
+        return self._rules.get(endpoint_id)
+
     # -- destination resolution + pinning --------------------------------------
 
-    def _resolve_pinned(self, rule: EndpointRule) -> ipaddress._BaseAddress:
+    def _resolve_pinned(self, rule: EndpointRule, *, deadline: float) -> ipaddress._BaseAddress:
+        """Resolve the allowlisted host with a BOUNDED DNS wait: the resolver
+        runs on a daemon thread and is awaited for at most min(dns_timeout,
+        remaining total deadline). A safe TOTAL DNS deadline cannot be
+        guaranteed (the OS getaddrinfo call is not interruptible), so on
+        timeout the thread is abandoned and the request fails closed."""
         port = rule.default_port()
-        try:
-            infos = self._resolver(rule.host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        except OSError as exc:
+        remaining = deadline - self._clock()
+        dns_wait = min(self._config.limits.dns_timeout_seconds, max(0.0, remaining))
+        if dns_wait <= 0:
+            raise TransportDeadlineExceededError(
+                "total request deadline expired before DNS resolution")
+        outcome: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                outcome["infos"] = self._resolver(
+                    rule.host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            except OSError as exc:
+                outcome["error"] = exc
+
+        t = threading.Thread(target=work, daemon=True, name="hive-dns")
+        t.start()
+        t.join(dns_wait)
+        if t.is_alive():
+            raise TransportDeadlineExceededError(
+                f"DNS resolution of {rule.host!r} exceeded the bounded DNS timeout "
+                f"({dns_wait:.3f}s); resolver thread abandoned (daemon)")
+        if "error" in outcome:
             raise DestinationRejectedError(
-                f"cannot resolve allowlisted host {rule.host!r}: {exc}") from exc
+                f"cannot resolve allowlisted host {rule.host!r}: {outcome['error']}")
         valid = []
         errors = []
-        for info in infos:
+        for info in outcome["infos"]:
             addr = info[4][0]
             try:
                 valid.append(validate_destination(addr, allow_loopback=self._config.allow_loopback))
@@ -443,8 +591,11 @@ class SecureHttpClient:
             raise RequestLimitExceededError(
                 f"request size {req_bytes} exceeds limit "
                 f"{self._config.limits.max_request_bytes}")
-        pinned = self._resolve_pinned(rule)
         limits = self._config.limits
+        # the TOTAL deadline starts BEFORE DNS and covers connect(+TLS handshake)
+        # + request transmission + response reception; DNS has its own bounded
+        # timeout (dns_timeout_seconds) because the OS resolver is not
+        # interruptible.
         deadline = self._clock() + limits.total_deadline_seconds
         state = {"wire": 0}
         self._sem.acquire()
@@ -452,10 +603,13 @@ class SecureHttpClient:
         try:
             if cancel is not None and cancel.is_set():
                 raise TransportCancelledError("cancelled before connect")
+            pinned = self._resolve_pinned(rule, deadline=deadline)
             port = rule.default_port()
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise TransportDeadlineExceededError("deadline expired before connect")
+            # connect timeout bounds TCP connect AND the TLS handshake (the
+            # wrap_socket call happens inside HTTPSConnection.connect)
             timeout = min(limits.connect_timeout_seconds, remaining)
             if rule.scheme == "https":
                 ctx = self._ssl_context or ssl.create_default_context()
@@ -465,16 +619,27 @@ class SecureHttpClient:
                     raise EndpointNotAllowedError("plain http requires allow_loopback (test-only)")
                 conn = _PinnedHTTPConnection(rule.host, port, timeout=timeout)
             conn.pinned_ip = str(pinned)
-            conn.connect()
+            try:
+                conn.connect()
+            except ssl.SSLError:
+                raise  # TLS verification/handshake failures keep their precise type
+            except TimeoutError as exc:
+                raise TransportDeadlineExceededError(
+                    f"connect/TLS handshake exceeded the remaining deadline: {exc}") from exc
+            except OSError as exc:
+                raise TransportError(f"connect failed: {exc}") from exc
             # verify the ACTUAL connected peer equals the validated pinned address
             peer = conn.sock.getpeername()[0]
             if _unbracket(peer) != str(pinned):
                 raise DestinationRejectedError(
                     f"connected peer {peer} != validated destination {pinned}")
-            # bounded reads from here on (headers AND body)
+            # bounded reads from here on (headers AND body); the header byte cap
+            # is enforced DURING header reception via _HeaderCapRaw
             raw = _LimitedRaw(conn.sock, limits=limits, deadline=deadline,
                               clock=self._clock, cancel=cancel, state=state)
-            conn.sock = _LimitedSocket(conn.sock, raw)  # type: ignore[assignment]
+            conn.sock = _LimitedSocket(  # type: ignore[assignment]
+                conn.sock, raw, max_header_bytes=limits.max_response_header_bytes,
+                limits=limits, deadline=deadline, clock=self._clock, cancel=cancel)
             conn.request(method.upper(), url, body=body, headers=hdrs)
             resp = conn.getresponse()
             header_bytes = sum(len(k) + len(v) + 4 for k, v in resp.getheaders())
