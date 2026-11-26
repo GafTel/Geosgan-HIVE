@@ -337,3 +337,146 @@ def register_api_tools(
             catalog.register(spec, adapter)
             registered.append(spec.name)
     return registered
+
+
+# ---- A6.2 Crossref --------------------------------------------------------------
+
+class CrossrefSearchInput(_QueryModel):
+    max_results: int = Field(default=10, ge=1, le=20)
+
+
+class CrossrefGetDoiInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    doi: str = Field(min_length=1, max_length=300)
+
+    @field_validator("doi")
+    @classmethod
+    def _doi_safe(cls, v: str) -> str:
+        d = v.strip()
+        # charset restricted to what the transport path validator allows
+        # (no '/', '%', control chars; the leading '10.' prefix is a slash-free
+        # segment boundary handled by the path builder below)
+        if not _DOI_RE.match(d):
+            raise ValueError("doi must look like 10.1234/abc-def (allowed chars: "
+                             "letters, digits, '.', '_', '-'; no parentheses)")
+        return d
+
+
+_CROSSREF_SELECT = ("DOI,title,author,published,container-title,URL,license,type,"
+                    "publisher,volume,page")
+
+
+def _crossref_item(msg: Any) -> dict[str, Any]:
+    """Defensive extraction from an untrusted Crossref `message` object."""
+    if not isinstance(msg, dict):
+        return {}
+    authors = []
+    raw_authors = msg.get("author")
+    if isinstance(raw_authors, list):
+        for a in raw_authors[:10]:
+            if isinstance(a, dict):
+                fam = _bounded_str(a.get("family"), 200)
+                giv = _bounded_str(a.get("given"), 200)
+                authors.append(f"{fam}, {giv}".strip(", "))
+    title = msg.get("title")
+    title_s = title[0] if isinstance(title, list) and title and isinstance(title[0], str) \
+        else _bounded_str(title, 500)
+    published = msg.get("published")
+    date_s = ""
+    if isinstance(published, dict):
+        parts = published.get("date-parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], list):
+            date_s = "-".join(str(p) for p in parts[0][:3] if isinstance(p, int))
+    container = msg.get("container-title")
+    container_s = container[0] if isinstance(container, list) and container \
+        and isinstance(container[0], str) else _bounded_str(container, 300)
+    license_url = ""
+    lic = msg.get("license")
+    if isinstance(lic, list) and lic and isinstance(lic[0], dict):
+        license_url = _bounded_str(lic[0].get("URL"), 300)
+    return {
+        "doi": _bounded_str(msg.get("DOI"), 300),
+        "title": title_s,
+        "authors": authors,
+        "published": date_s,
+        "container": container_s,
+        "url": _bounded_str(msg.get("URL"), 300),
+        "license": license_url,
+        "type": _bounded_str(msg.get("type"), 60),
+        "publisher": _bounded_str(msg.get("publisher"), 200),
+    }
+
+
+class CrossrefSearchAdapter(ApiToolAdapter):
+    provider = "crossref"
+    endpoint_id = "crossref-works"
+    operation_id = "search_works"
+
+    def _params(self, args):
+        p = {"query": args["query"], "rows": args["max_results"],
+             "select": _CROSSREF_SELECT}
+        pc = self.session.auth.provider_config("crossref")
+        if pc is not None and pc.polite_mailto:
+            p["mailto"] = pc.polite_mailto  # polite pool; never a credential
+        return p
+
+    def build_request(self, args):
+        return "/works", self._params(args)
+
+    def normalize(self, payload, args):
+        items = payload.get("message", {}).get("items") if isinstance(payload, dict) else None
+        results = [_crossref_item(m) for m in (items or [])[:20] if isinstance(m, dict)]
+        return {
+            "kind": "publication_search",
+            "query": args["query"],
+            "total": len(results),
+            "results": results,
+            "attribution": ("Crossref metadata (https://www.crossref.org), CC0 where "
+                            "applicable. Metadata only — does NOT grant full-text access."),
+            "docs": "https://api.crossref.org/swagger-ui/index.html",
+        }
+
+
+class CrossrefGetDoiAdapter(ApiToolAdapter):
+    provider = "crossref"
+    endpoint_id = "crossref-works"
+    operation_id = "get_doi"
+
+    def build_request(self, args):
+        # the DOI's '/' is a path-segment boundary; charset already restricted
+        return f"/works/{args['doi']}", {}
+
+    def normalize(self, payload, args):
+        msg = payload.get("message") if isinstance(payload, dict) else None
+        item = _crossref_item(msg) if isinstance(msg, dict) else {}
+        item.setdefault("doi", args["doi"])
+        return {
+            "kind": "doi_metadata",
+            "result": item,
+            "attribution": ("Crossref metadata, CC0 where applicable. Bibliographic "
+                            "reference only — not full text."),
+            "docs": "https://api.crossref.org/swagger-ui/index.html",
+        }
+
+
+def crossref_tools(session, lease_lookup=None):
+    search_spec = ToolSpec(
+        name="crossref_search_works", category="api", side_effect=SideEffect.READ_ONLY,
+        idempotent=True, input_model=CrossrefSearchInput,
+        description=("Search scholarly publications via the Crossref REST API "
+                     "(bounded, polite pool). Metadata only — no full text."),
+        max_output_bytes=60_000,
+    )
+    doi_spec = ToolSpec(
+        name="crossref_get_doi", category="api", side_effect=SideEffect.READ_ONLY,
+        idempotent=True, input_model=CrossrefGetDoiInput,
+        description="Retrieve bibliographic metadata for one DOI via Crossref.",
+        max_output_bytes=30_000,
+    )
+    return [
+        (search_spec, CrossrefSearchAdapter(session, search_spec, lease_lookup=lease_lookup)),
+        (doi_spec, CrossrefGetDoiAdapter(session, doi_spec, lease_lookup=lease_lookup)),
+    ]
+
+
+ADAPTER_BUILDERS["crossref"] = crossref_tools
