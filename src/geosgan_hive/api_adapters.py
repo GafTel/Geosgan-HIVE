@@ -33,6 +33,7 @@ SEARXNG_PREREQUISITE below.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from collections.abc import Callable, Iterable
@@ -480,3 +481,185 @@ def crossref_tools(session, lease_lookup=None):
 
 
 ADAPTER_BUILDERS["crossref"] = crossref_tools
+
+
+# ---- A6.3 GitHub public REST ----------------------------------------------------
+
+class _GhOwnerRepo(BaseModel):
+    model_config = {"extra": "forbid"}
+    owner: str = Field(min_length=1, max_length=100)
+    repo: str = Field(min_length=1, max_length=100)
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def _seg(cls, v: str) -> str:
+        if not _GH_SEGMENT_RE.match(v) or v.startswith("."):
+            raise ValueError("owner/repo must be a single safe path segment "
+                             "(letters, digits, '_', '.', '-'; no leading dot)")
+        return v
+
+
+class GitHubSearchInput(_QueryModel):
+    per_page: int = Field(default=10, ge=1, le=30)
+    page: int = Field(default=1, ge=1, le=10)
+
+
+class GitHubReleasesInput(_GhOwnerRepo):
+    per_page: int = Field(default=5, ge=1, le=10)
+
+
+def _gh_repo_item(r: Any) -> dict[str, Any]:
+    if not isinstance(r, dict):
+        return {}
+    lic = r.get("license")
+    return {
+        "full_name": _bounded_str(r.get("full_name"), 200),
+        "description": _bounded_str(r.get("description"), 300),
+        "url": _bounded_str(r.get("html_url"), 300),  # metadata only; never fetched
+        "stars": r.get("stargazers_count") if isinstance(r.get("stargazers_count"), int) else 0,
+        "language": _bounded_str(r.get("language"), 60),
+        "license": _bounded_str(lic.get("spdx_id"), 40) if isinstance(lic, dict) else "",
+        "updated_at": _bounded_str(r.get("updated_at"), 40),
+        "private": bool(r.get("private")) if isinstance(r.get("private"), bool) else None,
+    }
+
+
+class GitHubSearchAdapter(ApiToolAdapter):
+    provider = "github"
+    endpoint_id = "github-rest"
+    operation_id = "search_repositories"
+
+    def build_request(self, args):
+        return ("/search/repositories",
+                {"q": args["query"], "per_page": args["per_page"], "page": args["page"]})
+
+    def normalize(self, payload, args):
+        items = payload.get("items") if isinstance(payload, dict) else None
+        results = [_gh_repo_item(i) for i in (items or [])[:30] if isinstance(i, dict)]
+        for r in results:
+            if r["private"]:
+                r["private"] = True  # flagged; never accessed beyond public metadata
+        return {
+            "kind": "repository_search",
+            "query": args["query"],
+            "total": len(results),
+            "results": results,
+            "attribution": ("GitHub public REST API metadata (docs.github.com/en/rest), "
+                            "unauthenticated-first. Repository metadata is untrusted."),
+            "docs": "https://docs.github.com/en/rest",
+        }
+
+
+class GitHubGetRepoAdapter(ApiToolAdapter):
+    provider = "github"
+    endpoint_id = "github-rest"
+    operation_id = "get_repository"
+
+    def build_request(self, args):
+        return f"/repos/{args['owner']}/{args['repo']}", {}
+
+    def normalize(self, payload, args):
+        item = _gh_repo_item(payload) if isinstance(payload, dict) else {}
+        return {
+            "kind": "repository",
+            "repository": item,
+            "attribution": "GitHub public REST API metadata; unauthenticated-first.",
+            "docs": "https://docs.github.com/en/rest",
+        }
+
+
+class GitHubListReleasesAdapter(ApiToolAdapter):
+    provider = "github"
+    endpoint_id = "github-rest"
+    operation_id = "list_releases"
+
+    def build_request(self, args):
+        return (f"/repos/{args['owner']}/{args['repo']}/releases",
+                {"per_page": args["per_page"]})
+
+    def normalize(self, payload, args):
+        rels = payload if isinstance(payload, list) else []
+        results = []
+        for r in rels[:10]:
+            if not isinstance(r, dict):
+                continue
+            results.append({
+                "tag_name": _bounded_str(r.get("tag_name"), 100),
+                "name": _bounded_str(r.get("name"), 200),
+                "published_at": _bounded_str(r.get("published_at"), 40),
+                "prerelease": bool(r.get("prerelease"))
+                if isinstance(r.get("prerelease"), bool) else None,
+                # asset/download URLs are recorded as COUNT only — never fetched
+                "assets_count": len(r.get("assets")) if isinstance(r.get("assets"), list) else 0,
+            })
+        return {
+            "kind": "releases",
+            "repository": f"{args['owner']}/{args['repo']}",
+            "total": len(results),
+            "results": results,
+            "attribution": ("GitHub public REST API release metadata. Download URLs are "
+                            "never followed in this stage."),
+            "docs": "https://docs.github.com/en/rest",
+        }
+
+
+class GitHubGetReadmeAdapter(ApiToolAdapter):
+    provider = "github"
+    endpoint_id = "github-rest"
+    operation_id = "get_readme"
+
+    def build_request(self, args):
+        return f"/repos/{args['owner']}/{args['repo']}/readme", {}
+
+    def normalize(self, payload, args):
+        if not isinstance(payload, dict):
+            return {"kind": "readme", "error": "unexpected response shape"}
+        size = payload.get("size")
+        if not isinstance(size, int) or size > 100_000:
+            return {"kind": "readme", "error": "readme too large or missing size"}
+        content = payload.get("content")
+        encoding = _bounded_str(payload.get("encoding"), 20)
+        text = ""
+        if encoding == "base64" and isinstance(content, str):
+            try:
+                raw = base64.b64decode(content, validate=True)
+                text = raw[:4_000].decode("utf-8", "ignore")
+            except Exception:  # noqa: BLE001 - untrusted payload, fail inert
+                return {"kind": "readme", "error": "undecodable readme content"}
+        return {
+            "kind": "readme",
+            "path": _bounded_str(payload.get("path"), 200),
+            "size": size,
+            "excerpt": text,  # bounded public doc excerpt; untrusted content
+            "attribution": "GitHub public repository README (see repo license).",
+            "docs": "https://docs.github.com/en/rest",
+        }
+
+
+def github_tools(session, lease_lookup=None):
+    def spec(name, desc, model, out=60_000):
+        return ToolSpec(name=name, category="api", side_effect=SideEffect.READ_ONLY,
+                        idempotent=True, input_model=model, description=desc,
+                        max_output_bytes=out)
+
+    specs = [
+        spec("github_search_repositories",
+             "Search public GitHub repositories (unauthenticated, bounded).",
+             GitHubSearchInput),
+        spec("github_get_repository", "Public metadata for one repository.",
+             _GhOwnerRepo),
+        spec("github_list_releases", "Release info for one public repository "
+             "(asset URLs are never fetched).", GitHubReleasesInput, 30_000),
+        spec("github_get_readme", "Bounded public README excerpt of one repository.",
+             _GhOwnerRepo, 30_000),
+    ]
+    adapters = [
+        GitHubSearchAdapter(session, specs[0], lease_lookup=lease_lookup),
+        GitHubGetRepoAdapter(session, specs[1], lease_lookup=lease_lookup),
+        GitHubListReleasesAdapter(session, specs[2], lease_lookup=lease_lookup),
+        GitHubGetReadmeAdapter(session, specs[3], lease_lookup=lease_lookup),
+    ]
+    return list(zip(specs, adapters, strict=True))
+
+
+ADAPTER_BUILDERS["github"] = github_tools

@@ -490,3 +490,145 @@ def test_crossref_get_doi_and_invalid_doi_rejected(tmp_path, crossref_server):
         assert not r.ok, bad
     assert len(CrossrefHandler.hits) == hits  # rejected before any request
     store.close()
+
+
+# ---- A6.3 GitHub public REST ------------------------------------------------------
+
+class GitHubHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    hits = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).hits.append(self.path)
+        if self.path.startswith("/search/repositories"):
+            body = json.dumps({"total_count": 1, "items": [{
+                "full_name": "GafTel/Geosgan-HIVE", "description": "multi-agent hive",
+                "html_url": "https://github.com/GafTel/Geosgan-HIVE",
+                "stargazers_count": 42, "language": "Python",
+                "license": {"spdx_id": "MIT"}, "updated_at": "2026-11-01T00:00:00Z",
+                "private": False}]}).encode()
+        elif "/releases" in self.path:
+            body = json.dumps([{"tag_name": "v0.7.0", "name": "release",
+                                "published_at": "2026-11-26T00:00:00Z",
+                                "prerelease": False,
+                                "assets": [{"browser_download_url":
+                                            "https://evil.example/payload"}]}]).encode()
+        elif self.path.endswith("/readme"):
+            import base64 as b64
+            body = json.dumps({"path": "README.md", "size": 12, "encoding": "base64",
+                               "content": b64.b64encode(b"# HIVE docs").decode()}).encode()
+        elif self.path.startswith("/repos/"):
+            body = json.dumps({"full_name": "GafTel/Geosgan-HIVE",
+                               "description": "multi-agent hive",
+                               "html_url": "https://github.com/GafTel/Geosgan-HIVE",
+                               "stargazers_count": 42, "language": "Python",
+                               "license": {"spdx_id": "MIT"}, "private": False}).encode()
+        else:
+            body = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def github_server():
+    GitHubHandler.hits = []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), GitHubHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield port
+    srv.shutdown()
+
+
+def github_apis(**overrides):
+    base = {
+        "enabled": ["github"],
+        "max_wire_bytes_per_request": 1_000_000,
+        "budgets": {"per_endpoint_requests": 100, "per_endpoint_bytes": 10**9,
+                    "per_provider_requests": 100, "per_provider_bytes": 10**9,
+                    "per_run_requests": 50, "per_run_bytes": 10**9},
+        "providers": [{
+            "provider": "github", "billing": "public_api_no_charge",
+            "outbound_policy": "authorized",
+            "allowed_operations": ["search_repositories", "get_repository",
+                                   "list_releases", "get_readme"],
+            "endpoints": [{"endpoint_id": "github-rest", "scheme": "https",
+                           "host": "api.github.com",
+                           "path_prefixes": ["/search", "/repos"], "methods": ["GET"]}],
+        }],
+    }
+    base.update(overrides)
+    return ApiConfig.model_validate(base)
+
+
+def make_github_session(tmp_path, port, apis):
+    store = CheckpointStore(str(tmp_path / "cp.db"), utcnow=lambda: NOW)
+    rule = EndpointRule(endpoint_id="github-rest", scheme="http", host="127.0.0.1",
+                        port=port, path_prefixes=("/search", "/repos"), methods=("GET",),
+                        headers={"User-Agent": "hive-test/1.0"})
+    client = SecureHttpClient(TransportConfig(endpoints=(rule,),
+                                              limits=HttpLimits(max_retries=1),
+                                              allow_loopback=True))
+    auth = OutboundAuthorizer(store, apis, ApprovalManager(store))
+    return build_offline_test_session(client, auth, store), store
+
+
+def github_gateway(session, store):
+    catalog = ToolCatalog()
+    names = register_api_tools(catalog, session, providers=["github"])
+    enabled = ["github_search_repositories", "github_get_repository",
+               "github_list_releases", "github_get_readme"]
+    policy = build_policy(global_enabled=enabled,
+                          agent_permissions={"researcher": (True, enabled)})
+    return ToolGateway(catalog, policy, store=store,
+                       approval_manager=ApprovalManager(store)), names
+
+
+def test_github_search_repo_releases_readme(tmp_path, github_server):
+    session, store = make_github_session(tmp_path, github_server, github_apis())
+    gw, names = github_gateway(session, store)
+    assert names == ["github_search_repositories", "github_get_repository",
+                     "github_list_releases", "github_get_readme"]
+
+    r = gw.execute("github_search_repositories", {"query": "geosgan", "per_page": 5},
+                   ctx=ctx())
+    assert r.ok, r.error
+    out = json.loads(r.output)
+    assert out["results"][0]["full_name"] == "GafTel/Geosgan-HIVE"
+    assert out["results"][0]["license"] == "MIT"
+    assert "q=geosgan" in GitHubHandler.hits[-1] and "per_page=5" in GitHubHandler.hits[-1]
+
+    r = gw.execute("github_get_repository", {"owner": "GafTel", "repo": "Geosgan-HIVE"},
+                   ctx=ctx())
+    assert r.ok and json.loads(r.output)["repository"]["stars"] == 42
+    assert GitHubHandler.hits[-1] == "/repos/GafTel/Geosgan-HIVE"
+
+    r = gw.execute("github_list_releases",
+                   {"owner": "GafTel", "repo": "Geosgan-HIVE", "per_page": 3}, ctx=ctx())
+    assert r.ok
+    rel = json.loads(r.output)["results"][0]
+    assert rel["tag_name"] == "v0.7.0" and rel["assets_count"] == 1
+    assert "browser_download_url" not in r.output  # download URLs never surfaced
+
+    r = gw.execute("github_get_readme", {"owner": "GafTel", "repo": "Geosgan-HIVE"},
+                   ctx=ctx())
+    assert r.ok
+    assert json.loads(r.output)["excerpt"] == "# HIVE docs"
+    store.close()
+
+
+def test_github_path_segments_rejected_before_request(tmp_path, github_server):
+    session, store = make_github_session(tmp_path, github_server, github_apis())
+    gw, _ = github_gateway(session, store)
+    hits = len(GitHubHandler.hits)
+    for bad in ({"owner": "../x", "repo": "y"}, {"owner": "a/b", "repo": "y"},
+                {"owner": ".hidden", "repo": "y"}, {"owner": "a", "repo": "b%2fc"}):
+        r = gw.execute("github_get_repository", bad, ctx=ctx())
+        assert not r.ok, bad
+    assert len(GitHubHandler.hits) == hits
+    store.close()
