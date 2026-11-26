@@ -358,7 +358,7 @@ def test_schema_v3_database_migrates_through_v4_to_v6(tmp_path):
         tables = {r[0] for r in store2._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         cols = {r["name"] for r in store2._conn.execute("PRAGMA table_info(runs)").fetchall()}
-    assert v == "8"
+    assert v == "9"
     assert {"tool_executions", "approvals", "quota_reservations", "quota_usage",
             "quota_policies", "quota_policy_audit"} <= tables
     assert {"lease_generation", "tool_reservations"} <= cols

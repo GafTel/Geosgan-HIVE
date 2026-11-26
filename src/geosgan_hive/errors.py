@@ -255,3 +255,42 @@ class CostUnknownError(HiveError):
 
 class CloudOfflineError(HiveError):
     """A strictly-offline (fake) adapter was asked to perform a live dispatch."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (A5): secure public API transport
+# ---------------------------------------------------------------------------
+
+class TransportError(HiveError):
+    """Base class for secure-transport failures (all fail closed)."""
+
+
+class DestinationRejectedError(TransportError):
+    """The resolved destination address is not authorized (private/loopback/
+    link-local/multicast/reserved/non-global, or no valid address at all)."""
+
+
+class EndpointNotAllowedError(TransportError):
+    """The endpoint id / scheme / host / port / path / method is not in the
+    allowlist."""
+
+
+class RedirectRejectedError(TransportError):
+    """The server answered with a 3xx redirect; redirects are disabled."""
+
+
+class ResponseLimitExceededError(TransportError):
+    """Response header/wire/decompressed byte limit exceeded."""
+
+
+class RequestLimitExceededError(TransportError):
+    """Request size limit exceeded before anything was sent."""
+
+
+class TransportDeadlineExceededError(TransportError):
+    """The TOTAL request deadline expired (connect+send+read), incl. slow streams."""
+
+
+class TransportCancelledError(TransportError):
+    """The request was cancelled; capacity is released only after the socket
+    is fully closed."""

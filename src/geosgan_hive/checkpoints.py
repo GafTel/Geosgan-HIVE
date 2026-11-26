@@ -8,7 +8,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -17,7 +17,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -128,6 +128,49 @@ CREATE TABLE IF NOT EXISTS quota_policy_audit (
     new_policy_hash TEXT NOT NULL,
     operator TEXT NOT NULL,
     carried_json TEXT NOT NULL DEFAULT '[]',
+    at TEXT NOT NULL
+);
+"""
+
+#: Phase 5 (A5): durable public-API request reservations, usage and audit (v9).
+#: Reservations bind the exact authorized operation (provider/endpoint/operation
+#: + one-way sanitized request digest); usage is increment-only (never refunded);
+#: audit rows carry BOUNDED metadata only (no credentials, auth headers or private
+#: payloads). Local windows are HIVE-local accounting, never provider resets.
+_API_SCHEMA = """
+CREATE TABLE IF NOT EXISTS api_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    max_wire_bytes INTEGER NOT NULL,
+    run_id TEXT,
+    lease_owner TEXT,
+    lease_generation INTEGER,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_usage (
+    scope TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (scope, kind, window_start)
+);
+CREATE TABLE IF NOT EXISTS api_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    status_code INTEGER,
+    bytes_in INTEGER NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    policy_decision TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT '',
     at TEXT NOT NULL
 );
 """
@@ -540,6 +583,7 @@ class CheckpointStore:
             _exec_schema(self._conn, _SCHEMA)
             _exec_schema(self._conn, _LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _QUOTA_SCHEMA)    # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _API_SCHEMA)      # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -567,6 +611,8 @@ class CheckpointStore:
                         self._migrate_6_to_7()
                     elif v == 7:
                         self._migrate_7_to_8()
+                    elif v == 8:
+                        self._migrate_8_to_9()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -672,6 +718,15 @@ class CheckpointStore:
                 self._conn.execute(
                     f"ALTER TABLE quota_reservations ADD COLUMN {col} {decl}"
                 )
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_8_to_9(self) -> None:
+        """v8 -> v9 (Phase 5 A5): adds the durable public-API tables (api_reservations,
+        api_usage, api_audit). Purely additive (IF NOT EXISTS); all v8 data preserved.
+        Runs inside the caller's open transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _API_SCHEMA)
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -2028,6 +2083,245 @@ class CheckpointStore:
                 "WHERE pool=? ORDER BY window_start, kind, period",
                 (pool,),
             ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    # ------------------------------------------------------------------
+    # Phase 5 (A5): durable public-API request reservations + audit (schema v9)
+    # ------------------------------------------------------------------
+
+    def reserve_api_request(
+        self,
+        reservation_id: str,
+        *,
+        provider: str,
+        endpoint_id: str,
+        operation_id: str,
+        request_sha256: str,
+        max_wire_bytes: int,
+        budgets: Mapping[str, int],   # scope -> limit; scope in run:<id>|provider:<p>|endpoint:<e>
+        window_start_iso: str,
+        now_iso: str | None = None,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> QuotaReservationOutcome:
+        """Atomically reserve ONE durable API request budget unit BEFORE any physical
+        HTTP request. One BEGIN IMMEDIATE transaction: lease fencing (when run-bound),
+        replay check (identical -> REPLAYED reconciliation only; conflicting -> reject),
+        budget check for EVERY scope (requests=1, wire_bytes=max_wire_bytes; conservative:
+        the max is counted up front and NEVER refunded), insert reservation, increment
+        usage. Returns CREATED/REPLAYED. Usage is increment-only; uncertain usage is
+        never refunded."""
+        _validate_quota_binding(run_id, lease_owner, lease_generation)
+        if type(max_wire_bytes) is not int or max_wire_bytes < 1:
+            raise CheckpointError("max_wire_bytes must be a strict positive int")
+        if len(request_sha256) != 64 or any(c not in "0123456789abcdef" for c in request_sha256):
+            raise CheckpointError("request_sha256 must be a sha256 hex digest")
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._reserve_api_tx(
+                    reservation_id, provider=provider, endpoint_id=endpoint_id,
+                    operation_id=operation_id, request_sha256=request_sha256,
+                    max_wire_bytes=max_wire_bytes, budgets=dict(budgets),
+                    window_start_iso=window_start_iso, now_iso=now_iso, run_id=run_id,
+                    lease_owner=lease_owner, lease_generation=lease_generation)
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"reserve_api_request transaction failed (SQLite contention): {exc}"
+                ) from exc
+        raise CheckpointError("reserve_api_request failed after bounded retries")
+
+    def _reserve_api_tx(self, reservation_id, *, provider, endpoint_id, operation_id,
+                        request_sha256, max_wire_bytes, budgets, window_start_iso,
+                        now_iso, run_id, lease_owner, lease_generation) -> QuotaReservationOutcome:
+        now = now_iso or self.now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM api_reservations WHERE reservation_id=?",
+                    (reservation_id,),
+                ).fetchone()
+                if existing is not None:
+                    # replay: only identical bindings reconcile; lease fencing applies too
+                    same = (
+                        existing["provider"] == provider
+                        and existing["endpoint_id"] == endpoint_id
+                        and existing["operation_id"] == operation_id
+                        and existing["request_sha256"] == request_sha256
+                        and int(existing["max_wire_bytes"]) == max_wire_bytes
+                        and existing["run_id"] == run_id
+                        and existing["lease_owner"] == lease_owner
+                        and existing["lease_generation"] == lease_generation
+                    )
+                    if not same:
+                        raise CheckpointError(
+                            f"conflicting replay of api reservation {reservation_id!r} "
+                            "(substitution rejected)")
+                    if run_id is not None and not self._verify_lease_locked(
+                            run_id, lease_owner, lease_generation):
+                        raise CheckpointError(
+                            f"stale worker: lease fencing failed for api reservation "
+                            f"{reservation_id!r} on run {run_id!r}")
+                    self._conn.commit()
+                    return QuotaReservationOutcome.REPLAYED
+                if run_id is not None and not self._verify_lease_locked(
+                        run_id, lease_owner, lease_generation):
+                    raise CheckpointError(
+                        f"stale worker: lease fencing failed for run {run_id!r}")
+                scopes = {
+                    f"run:{run_id}": budgets.get(f"run:{run_id}"),
+                    f"provider:{provider}": budgets.get(f"provider:{provider}"),
+                    f"endpoint:{endpoint_id}": budgets.get(f"endpoint:{endpoint_id}"),
+                }
+                for scope, limit in scopes.items():
+                    if limit is None:
+                        continue
+                    for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):
+                        row = self._conn.execute(
+                            "SELECT used FROM api_usage WHERE scope=? AND kind=? "
+                            "AND window_start=?", (scope, kind, window_start_iso),
+                        ).fetchone()
+                        used = int(row["used"]) if row else 0
+                        if used + amount > int(limit):
+                            raise QuotaExhaustedError(
+                                f"API budget exhausted for {scope} ({kind}): "
+                                f"used={used} +{amount} > limit={limit}")
+                self._conn.execute(
+                    "INSERT INTO api_reservations (reservation_id, provider, endpoint_id, "
+                    "operation_id, request_sha256, max_wire_bytes, run_id, lease_owner, "
+                    "lease_generation, status, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,'reserved',?)",
+                    (reservation_id, provider, endpoint_id, operation_id, request_sha256,
+                     max_wire_bytes, run_id, lease_owner, lease_generation, now))
+                for scope, _limit in scopes.items():
+                    if scope == f"run:{run_id}" and run_id is None:
+                        continue
+                    for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):
+                        self._conn.execute(
+                            "INSERT INTO api_usage (scope, kind, window_start, used) "
+                            "VALUES (?,?,?,?) ON CONFLICT(scope, kind, window_start) "
+                            "DO UPDATE SET used = used + excluded.used",
+                            (scope, kind, window_start_iso, amount))
+                self._conn.commit()
+                return QuotaReservationOutcome.CREATED
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_api_dispatched(
+        self,
+        reservation_id: str,
+        *,
+        run_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+        now_iso: str | None = None,
+        request_sha256: str | None = None,
+    ) -> bool:
+        """Single-winner dispatch authorization for an API reservation, immediately
+        before the physical request. One BEGIN IMMEDIATE tx: exact binding match
+        (incl. all-None), live lease fencing when run-bound, digest match, and the
+        reserved->dispatched transition. Exactly one caller gets True. No refunds."""
+        _validate_quota_binding(run_id, lease_owner, lease_generation)
+        for attempt in range(_QUOTA_TX_ATTEMPTS):
+            try:
+                return self._mark_api_dispatched_tx(
+                    reservation_id, run_id=run_id, lease_owner=lease_owner,
+                    lease_generation=lease_generation, now_iso=now_iso,
+                    request_sha256=request_sha256)
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < _QUOTA_TX_ATTEMPTS - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise CheckpointError(
+                    f"mark_api_dispatched transaction failed: {exc}") from exc
+        raise CheckpointError("mark_api_dispatched failed after bounded retries")
+
+    def _mark_api_dispatched_tx(self, reservation_id, *, run_id, lease_owner,
+                                lease_generation, now_iso, request_sha256) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM api_reservations WHERE reservation_id=?",
+                    (reservation_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return False
+                if (row["run_id"] != run_id or row["lease_owner"] != lease_owner
+                        or row["lease_generation"] != lease_generation):
+                    self._conn.commit()
+                    return False
+                if request_sha256 is not None and row["request_sha256"] != request_sha256:
+                    self._conn.commit()
+                    return False
+                if run_id is not None and not self._verify_lease_locked(
+                        run_id, lease_owner, lease_generation):
+                    self._conn.commit()
+                    return False
+                cur = self._conn.execute(
+                    "UPDATE api_reservations SET status='dispatched' "
+                    "WHERE reservation_id=? AND status='reserved'",
+                    (reservation_id,))
+                self._conn.commit()
+                return cur.rowcount == 1
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def record_api_audit(
+        self,
+        *,
+        reservation_id: str,
+        provider: str,
+        endpoint_id: str,
+        operation_id: str,
+        outcome: str,
+        status_code: int | None,
+        bytes_in: int,
+        bytes_out: int,
+        duration_ms: int,
+        policy_decision: str,
+        provenance: str = "",
+        now_iso: str | None = None,
+    ) -> None:
+        """Bounded audit metadata only: NEVER raw credentials, authorization headers
+        or private query payloads."""
+        now = now_iso or self.now_iso()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO api_audit (reservation_id, provider, endpoint_id, "
+                "operation_id, outcome, status_code, bytes_in, bytes_out, duration_ms, "
+                "policy_decision, provenance, at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (reservation_id, provider, endpoint_id, operation_id, outcome,
+                 status_code, int(bytes_in), int(bytes_out), int(duration_ms),
+                 policy_decision, provenance[:500], now))
+            self._conn.commit()
+
+    def api_usage_status(self, scope: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT scope, kind, window_start, used FROM api_usage WHERE scope=? "
+                "ORDER BY window_start, kind", (scope,),
+            ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    def api_audit_list(self, *, provider: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if provider is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM api_audit ORDER BY id DESC LIMIT 500").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM api_audit WHERE provider=? ORDER BY id DESC LIMIT 500",
+                    (provider,)).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
 
     def close(self) -> None:
