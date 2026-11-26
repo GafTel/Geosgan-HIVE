@@ -32,13 +32,14 @@ provider billing or quotas.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from .checkpoints import CheckpointStore
+from .checkpoints import CheckpointStore, _add_months, quota_window_for
 from .cloud_profiles import (
     BillingModel,
     CloudProfileRegistry,
@@ -51,7 +52,31 @@ from .errors import (
     CloudConfigError,
     CostUnknownError,
 )
+from .providers import PROVIDER_SPECS, parse_model
 from .quota_engine import QuotaEngine
+
+#: request fields that must never be persisted or digested in plaintext
+_SECRET_KEY_MARKERS = ("api_key", "apikey", "authorization", "secret", "credential",
+                       "password", "cookie")
+
+
+def sanitized_request_digest(kwargs: dict[str, Any]) -> str:
+    """One-way sha256 over the request payload with credential fields stripped.
+    Credentials are never persisted — only this digest of the sanitized payload."""
+    clean = {
+        k: v for k, v in kwargs.items()
+        if not any(m in k.lower() for m in _SECRET_KEY_MARKERS)
+    }
+    return hashlib.sha256(
+        json.dumps(clean, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def effective_endpoint(model: str, kwargs: dict[str, Any]) -> str | None:
+    """The endpoint the request will actually use: explicit api_base wins, else
+    the provider's configured default."""
+    provider, _ = parse_model(model)
+    return kwargs.get("api_base") or PROVIDER_SPECS[provider].default_api_base
 
 
 class ZeroCostGate:
@@ -65,7 +90,7 @@ class ZeroCostGate:
         store: CheckpointStore | None,
         *,
         adapter: Any,
-        utcnow: Any = lambda: datetime.now(UTC),
+        utcnow: Any = None,
         default_max_output_tokens: int | None = None,
     ) -> None:
         if registry.zero_cost and (
@@ -80,7 +105,10 @@ class ZeroCostGate:
         self.store = store
         self.engine = QuotaEngine(store, registry, utcnow=utcnow) if store is not None else None
         self.adapter = adapter
-        self._utcnow = utcnow
+        # default the gate clock to the STORE's clock so quota windows and lease
+        # checks always use one consistent time source
+        self._utcnow = utcnow or (store.utcnow if store is not None
+                                  else (lambda: datetime.now(UTC)))
         self.default_max_output_tokens = default_max_output_tokens
         object.__setattr__(self, "_frozen", True)
 
@@ -111,11 +139,18 @@ class ZeroCostGate:
         p = self._registry.profile_for(model)
         ev = p.verification_evidence if p is not None else None
         if ev is not None and ev.endpoint is not None:
-            api_base = kwargs.get("api_base")
-            if api_base is not None and str(api_base).rstrip("/") != ev.endpoint.rstrip("/"):
+            # verify the EFFECTIVE endpoint (explicit api_base or provider default)
+            eff = effective_endpoint(model, kwargs)
+            if eff is None:
                 raise CloudConfigError(
-                    f"zero-cost gate blocked dispatch of {model!r}: endpoint "
-                    f"{api_base!r} does not match the verification evidence endpoint "
+                    f"zero-cost gate blocked dispatch of {model!r}: evidence is bound "
+                    f"to endpoint {ev.endpoint!r} but no effective endpoint can be "
+                    "verified for this request — fail closed"
+                )
+            if str(eff).rstrip("/") != ev.endpoint.rstrip("/"):
+                raise CloudConfigError(
+                    f"zero-cost gate blocked dispatch of {model!r}: effective endpoint "
+                    f"{eff!r} does not match the verification evidence endpoint "
                     f"{ev.endpoint!r}"
                 )
 
@@ -207,6 +242,9 @@ class ZeroCostGate:
         self.engine.reserve_for_model(
             model, dispatch_id, est, run_id=run_id, lease_owner=lease_owner,
             lease_generation=lease_generation, now=n,
+            request_sha256=sanitized_request_digest(kwargs),
+            cost_usd=float(cost),
+            endpoint=effective_endpoint(model, kwargs),
         )
         return dispatch_id
 
@@ -230,6 +268,7 @@ class ZeroCostGate:
         if not self.engine.mark_dispatched(
             dispatch_id, run_id=run_id, lease_owner=lease_owner,
             lease_generation=lease_generation, now=n,
+            request_sha256=sanitized_request_digest(kwargs) if kwargs else None,
         ):
             raise CheckpointError(
                 f"zero-cost gate: dispatch authorization denied for {dispatch_id} "
@@ -248,5 +287,33 @@ class ZeroCostGate:
         if dispatch_id:
             self.finalize_dispatch(
                 model, dispatch_id, run_id=run_id, lease_owner=lease_owner,
-                lease_generation=lease_generation)
+                lease_generation=lease_generation, kwargs=kwargs)
         return dispatch_id
+
+    def quota_retry_at(self, model: str, now: datetime | None = None) -> datetime | None:
+        """Reliable LOCAL retry evidence for a quota-suspended run: the start of the
+        next quota window derived from the PERSISTED policy anchor (own accounting,
+        never an invented provider reset time). None when no policy/pool exists."""
+        if not self.enabled() or self.store is None:
+            return None
+        n = now or self._now()
+        pool = self._registry.quota_pool(model)
+        if pool is None:
+            return None
+        pol = self.store.quota_policy(pool)
+        if pol is None:
+            return None
+        anchor = pol["anchor_iso"]
+        now_iso = n.isoformat(timespec="milliseconds")
+        best: datetime | None = None
+        for period in pol["periods"]:
+            w = datetime.fromisoformat(quota_window_for(anchor, period, now_iso))
+            if period == "day":
+                nxt = w + timedelta(days=1)
+            elif period == "week":
+                nxt = w + timedelta(days=7)
+            else:
+                nxt = _add_months(w, 1)
+            if best is None or nxt < best:
+                best = nxt
+        return best

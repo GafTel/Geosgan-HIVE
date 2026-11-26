@@ -164,8 +164,8 @@ def _make_v5_db(path):
     conn.close()
 
 
-def test_schema_version_is_7_and_fresh_store_has_quota_tables(tmp_path):
-    assert SCHEMA_VERSION == 7
+def test_schema_version_is_8_and_fresh_store_has_quota_tables(tmp_path):
+    assert SCHEMA_VERSION == 8
     store = CheckpointStore(str(tmp_path / "fresh.db"))
     with store._lock:
         names = {r[0] for r in store._conn.execute(
@@ -184,7 +184,7 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         names = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "7"
+    assert v == "8"
     assert {"quota_reservations", "quota_usage", "quota_policies",
             "quota_policy_audit"} <= names
     cp = store.get("r5")
@@ -200,11 +200,11 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
     store.close()
 
 
-def test_schema_above_v7_rejected(tmp_path):
+def test_schema_above_v8_rejected(tmp_path):
     path = str(tmp_path / "bad.db")
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '8')")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '9')")
     conn.commit()
     conn.close()
     with pytest.raises(CheckpointError, match="schema_version"):
@@ -972,7 +972,7 @@ def test_interrupted_migration_rolls_back_and_recovers(tmp_path, monkeypatch):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "7" and {"quota_reservations", "quota_usage", "quota_policies",
+    assert v == "8" and {"quota_reservations", "quota_usage", "quota_policies",
                          "quota_policy_audit"} <= tables
     assert store.get("r5") is not None
     store.close()
@@ -1195,7 +1195,7 @@ def test_dev_v6_database_migrates_to_v7_explicitly(tmp_path):
             "PRAGMA table_info(quota_policies)").fetchall()}
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "7"
+    assert v == "8"
     assert {"constraints_json", "reset_semantics"} <= cols
     assert "quota_policy_audit" in tables
     # stored rows preserved and hashes recomputed consistently

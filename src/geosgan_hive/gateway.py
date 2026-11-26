@@ -19,6 +19,7 @@ from .errors import (
 from .errors import (
     BudgetExceededError,
     CheckpointError,
+    CloudConfigError,
     ConfigError,
     ErrorClass,
     FallbackExhaustedError,
@@ -172,33 +173,56 @@ class ModelGateway:
                 "zero-cost mode requires the durable store; set_durable_store(None) "
                 "is rejected while a zero-cost cloud registry is wired"
             )
+        if (store is not None and self._cloud_gate is not None
+                and self._cloud_gate.enabled() and store is not self._cloud_gate.store):
+            # swapping the quota store would weaken enforcement
+            raise ConfigError(
+                "refusing to swap the durable quota store while a zero-cost gate is "
+                "active — zero-cost enforcement cannot be silently weakened"
+            )
         self._durable_store = store
         self._cloud_gate = None  # rebuild lazily with the new store
 
     def set_cloud_registry(self, registry: CloudProfileRegistry) -> None:
-        """Wire the cloud profile registry (factory path). While a zero-cost
-        registry is active it can never be replaced by an inactive one."""
-        if (self._cloud_registry is not None and self._cloud_registry.zero_cost
-                and not registry.zero_cost):
+        """Wire the cloud profile registry (factory path). While a registry is
+        wired, it can never be replaced by a different one (that would silently
+        change enforcement)."""
+        if (self._cloud_registry is not None and registry is not self._cloud_registry):
             raise ConfigError(
-                "cannot weaken a wired zero-cost registry to non-zero-cost — "
-                "zero-cost enforcement cannot be silently disabled"
+                "refusing to replace the wired cloud registry — replacing it could "
+                "silently weaken zero-cost enforcement"
             )
         self._cloud_registry = registry
         self._cloud_gate = None
 
     def set_cloud_gate(self, gate: ZeroCostGate) -> None:
-        """Wire an explicit ZeroCostGate (tests / custom wiring). An inactive gate
-        can never replace an active zero-cost gate."""
+        """Wire an explicit ZeroCostGate (tests / custom wiring). An active
+        zero-cost gate can only be replaced by the SAME gate object; a different
+        gate/registry/adapter/store that could weaken enforcement is rejected."""
+        if self._cloud_gate is not None and self._cloud_gate.enabled() \
+                and gate is not self._cloud_gate:
+            raise ConfigError(
+                "refusing to replace an active zero-cost gate with a different gate "
+                "— zero-cost enforcement cannot be silently disabled or weakened"
+            )
         if (self._cloud_registry is not None and self._cloud_registry.zero_cost
                 and not gate.enabled()):
             raise ConfigError(
                 "refusing to replace an active zero-cost gate with an inactive one — "
                 "zero-cost enforcement cannot be silently disabled"
             )
+        if (self._cloud_registry is not None
+                and gate.registry is not self._cloud_registry):
+            raise ConfigError(
+                "gate registry differs from the wired cloud registry — rejected"
+            )
         if self._cloud_registry is None:
             self._cloud_registry = gate.registry
         self._cloud_gate = gate
+
+    def cloud_gate(self) -> ZeroCostGate | None:
+        """The active zero-cost gate (built lazily from registry + durable store)."""
+        return self._get_cloud_gate()
 
     def _get_cloud_gate(self) -> ZeroCostGate | None:
         """Lazily build the zero-cost gate from the registry + durable store.
@@ -240,9 +264,10 @@ class ModelGateway:
 
     def _reserve_physical(self, ctx: Any, run_id: str | None) -> None:
         """Reserve one physical attempt: in-memory cap check first, then the durable
-        SQLite commit BEFORE the request is sent. If the durable commit fails (run
-        no longer RUNNING: lease lost/recovered), the in-memory reservation is
-        rolled back (nothing was persisted or dispatched) and dispatch is blocked."""
+        SQLite commit BEFORE the request is sent. The lease identity is the
+        WORKER-OWNED binding from the execution context — never adopted by reading
+        SQLite. If the durable commit fails (run no longer RUNNING / stale worker),
+        the in-memory reservation is rolled back and dispatch is blocked."""
         if not ctx.reserve_physical_request():
             raise BudgetExceededError(
                 f"Physical provider-request limit "
@@ -250,9 +275,15 @@ class ModelGateway:
             )
         store = self._durable_store
         if store is not None and run_id is not None:
-            row = store.get(run_id)
-            owner = row.lease_owner if row is not None else None
-            gen = row.lease_generation if row is not None else None
+            owner = getattr(ctx, "lease_owner", None)
+            gen = getattr(ctx, "lease_generation", None)
+            if owner is None or gen is None:
+                ctx.release_physical_reservation()
+                raise CheckpointError(
+                    f"run {run_id!r}: worker-owned lease identity missing from the "
+                    "execution context — physical dispatch fails closed (identity "
+                    "is never adopted from SQLite)"
+                )
             if not store.reserve_physical_durable(
                 run_id, lease_owner=owner, lease_generation=gen
             ):
@@ -507,6 +538,14 @@ class ModelGateway:
             if gate is not None and gate.enabled():
                 billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
                 if not billing_ok:
+                    if candidate == primary:
+                        # the PRIMARY failing the zero-cost billing/evidence gate is
+                        # a permanent configuration/billing condition — it must
+                        # fail the run, never be suspended and retried
+                        raise CloudConfigError(
+                            f"zero-cost gate rejected the primary model {primary!r}: "
+                            f"{billing_reason}"
+                        )
                     # no automatic paid/unknown-cost fallback in zero-cost mode
                     self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                                metadata={"model": candidate,
@@ -789,6 +828,13 @@ class ModelGateway:
             if gate is not None and gate.enabled():
                 billing_ok, billing_reason = gate.candidate_billing_ok(candidate)
                 if not billing_ok:
+                    if candidate == primary:
+                        # permanent billing/config condition on the primary: fail,
+                        # never suspend-and-retry unknown billing conditions
+                        raise CloudConfigError(
+                            f"zero-cost gate rejected the primary model {primary!r}: "
+                            f"{billing_reason}"
+                        )
                     # no automatic paid/unknown-cost fallback in zero-cost mode
                     self._emit(ctx, EventType.FALLBACK_REJECTED, agent=agent,
                                metadata={"model": candidate,

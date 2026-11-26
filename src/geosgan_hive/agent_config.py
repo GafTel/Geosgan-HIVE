@@ -156,6 +156,11 @@ class CloudConfig(BaseModel):
     max_spend_usd: float | None = Field(default=None, ge=0)  # None = no cap
     profiles: list[CloudProfile] = Field(default_factory=list)
     allowed_providers: list[str] | None = None  # None = all registered providers
+    #: explicit operator switch for trusted evidence/credential-account binding.
+    #: Default False: production live dispatch stays BLOCKED until trusted
+    #: billing verification is actually implemented (attestation alone is a
+    #: claim, not evidence).
+    trusted_evidence_binding: bool = False
 
     @model_validator(mode="after")
     def _zero_cost_spend_rule(self) -> CloudConfig:

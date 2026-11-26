@@ -95,7 +95,7 @@ class VerificationEvidence(BaseModel):
     #: the endpoint (api_base host) it applies to. When set, they must match the
     #: profile's provider / the request's endpoint at dispatch time.
     provider: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
-    endpoint: str | None = Field(default=None, pattern=r"^https://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
+    endpoint: str | None = Field(default=None, pattern=r"^https?://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
 
     @field_validator("collected_at")
     @classmethod
@@ -400,6 +400,7 @@ class CloudProfileRegistry:
             zero_cost=cloud.zero_cost,
             allowed_providers=cloud.allowed_providers,
             max_spend_usd=cloud.max_spend_usd,
+            trusted_evidence_binding=getattr(cloud, "trusted_evidence_binding", False),
         )
 
     def profile_for(self, model: str) -> CloudProfile | None:

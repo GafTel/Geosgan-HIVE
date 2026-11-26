@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -102,7 +103,15 @@ CREATE TABLE IF NOT EXISTS quota_reservations (
     lease_owner TEXT,
     lease_generation INTEGER,
     status TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- v8: exact authorized-request binding (credentials are NEVER persisted,
+    -- request_sha256 is a one-way digest of the SANITIZED payload)
+    model TEXT,
+    request_sha256 TEXT,
+    prompt_tokens INTEGER,
+    max_output_tokens INTEGER,
+    cost_usd REAL,
+    endpoint TEXT
 );
 CREATE TABLE IF NOT EXISTS quota_usage (
     pool TEXT NOT NULL,
@@ -361,6 +370,11 @@ def _exec_schema(conn: sqlite3.Connection, script: str) -> None:
     migrations atomic: an interrupted migration rolls back completely and is
     retried (recoverable) on the next open."""
     for stmt in script.split(";"):
+        # strip SQL comment lines first so a ';' inside a comment cannot
+        # truncate a statement
+        stmt = "\n".join(
+            line for line in stmt.splitlines() if not line.strip().startswith("--")
+        )
         if stmt.strip():
             conn.execute(stmt)
 
@@ -411,6 +425,34 @@ def _normalize_constraints(constraints: Any) -> list[dict[str, Any]]:
         out.append({"kind": kind, "period": period, "limit": limit})
     out.sort(key=lambda c: (c["kind"], c["period"]))
     return out
+
+
+def _validate_binding(model: Any, request_sha256: Any, prompt_tokens: Any,
+                      max_output_tokens: Any, cost_usd: Any, endpoint: Any) -> tuple:
+    """Validate the optional exact-request binding of a reservation. Credentials
+    are never persisted: request_sha256 must be a 64-hex digest of a SANITIZED
+    payload (computed by the caller with secrets stripped)."""
+    if model is not None and (not isinstance(model, str) or not model):
+        raise CheckpointError("model binding must be a non-empty string when given")
+    if request_sha256 is not None:
+        if not isinstance(request_sha256, str) or len(request_sha256) != 64 \
+                or any(c not in "0123456789abcdef" for c in request_sha256):
+            raise CheckpointError("request_sha256 must be a 64-char hex digest")
+    if prompt_tokens is not None and (type(prompt_tokens) is not int or prompt_tokens < 0
+                                      or prompt_tokens > SQLITE_INT_MAX):
+        raise CheckpointError("prompt_tokens binding must be a strict int >= 0")
+    if max_output_tokens is not None and (type(max_output_tokens) is not int
+                                          or max_output_tokens < 1
+                                          or max_output_tokens > SQLITE_INT_MAX):
+        raise CheckpointError("max_output_tokens binding must be a strict int >= 1")
+    if cost_usd is not None:
+        if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)) \
+                or not math.isfinite(cost_usd) or cost_usd < 0:
+            raise CheckpointError("cost_usd binding must be a finite number >= 0")
+    if endpoint is not None and (not isinstance(endpoint, str) or not endpoint
+                                 or len(endpoint) > 512):
+        raise CheckpointError("endpoint binding must be a non-empty string <= 512 chars")
+    return model, request_sha256, prompt_tokens, max_output_tokens, cost_usd, endpoint
 
 
 def _validate_reset_semantics(reset_semantics: Any) -> str:
@@ -523,6 +565,8 @@ class CheckpointStore:
                         self._migrate_5_to_6()
                     elif v == 6:
                         self._migrate_6_to_7()
+                    elif v == 7:
+                        self._migrate_7_to_8()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -607,6 +651,27 @@ class CheckpointStore:
                 "UPDATE quota_reservations SET policy_hash=? WHERE pool=? AND anchor_iso=?",
                 (new_hash, row["pool"], row["anchor_iso"]),
             )
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+        )
+
+    def _migrate_7_to_8(self) -> None:
+        """v7 -> v8 (Phase 4 C4 hardening): quota_reservations gain the exact
+        authorized-request binding columns (model, request_sha256, prompt_tokens,
+        max_output_tokens, cost_usd, endpoint). Additive ALTERs; existing rows are
+        preserved (NULL bindings). Credentials are never stored — only the
+        one-way sanitized digest. Runs inside the caller's open transaction."""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(quota_reservations)").fetchall()}
+        for col, decl in (
+            ("model", "TEXT"), ("request_sha256", "TEXT"),
+            ("prompt_tokens", "INTEGER"), ("max_output_tokens", "INTEGER"),
+            ("cost_usd", "REAL"), ("endpoint", "TEXT"),
+        ):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE quota_reservations ADD COLUMN {col} {decl}"
+                )
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -908,6 +973,30 @@ class CheckpointStore:
         cp = self.get(run_id)
         assert cp is not None
         return cp
+
+    def mark_running_gen(self, run_id: str, *, owner: str) -> int | None:
+        """Like mark_running, but RETURNS the effective lease generation to the
+        resuming worker (worker-owned identity; never re-read from SQLite later)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET state=?, updated_at=?, lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1 "
+                "WHERE run_id=? AND state IN (?, ?) AND lease_owner=?",
+                (
+                    ExecutionState.RUNNING.value, now, owner, self._lease_expiry(),
+                    run_id,
+                    ExecutionState.WAITING_FOR_PROVIDER.value,
+                    ExecutionState.READY_TO_RESUME.value,
+                    owner,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = self._conn.execute(
+                "SELECT lease_generation FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            return int(row["lease_generation"])
 
     def mark_running(self, run_id: str, *, owner: str) -> None:
         """Flip a claimed suspended run back to RUNNING (resume in progress)."""
@@ -1443,6 +1532,12 @@ class CheckpointStore:
         lease_generation: int | None = None,
         constraints: list[dict[str, Any]] | None = None,
         reset_semantics: str = "unknown",
+        model: str | None = None,
+        request_sha256: str | None = None,
+        prompt_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        cost_usd: float | None = None,
+        endpoint: str | None = None,
     ) -> QuotaReservationOutcome:
         """Atomically reserve a batch of quota items for ONE unique dispatch_id,
         BEFORE dispatch. Everything happens in ONE BEGIN IMMEDIATE transaction, so
@@ -1492,6 +1587,8 @@ class CheckpointStore:
             constraints if constraints is not None else []
         )
         semantics = _validate_reset_semantics(reset_semantics)
+        binding = _validate_binding(model, request_sha256, prompt_tokens,
+                                    max_output_tokens, cost_usd, endpoint)
         for attempt in range(_QUOTA_TX_ATTEMPTS):
             try:
                 return self._reserve_quota_batch_tx(
@@ -1500,6 +1597,7 @@ class CheckpointStore:
                     run_id=run_id, lease_owner=lease_owner,
                     lease_generation=lease_generation,
                     constraints=norm_constraints, reset_semantics=semantics,
+                    binding=binding,
                 )
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
@@ -1516,7 +1614,7 @@ class CheckpointStore:
         anchor_canon: str, limits: dict[tuple[str, str], int], limits_str: str,
         now_iso: str | None, run_id: str | None, lease_owner: str | None,
         lease_generation: int | None, constraints: list[dict[str, Any]],
-        reset_semantics: str,
+        reset_semantics: str, binding: tuple,
     ) -> QuotaReservationOutcome:
         now = now_iso or self.now_iso()
         with self._lock:
@@ -1553,6 +1651,12 @@ class CheckpointStore:
                         and (row["lease_generation"] is None) == (lease_generation is None)
                         and (lease_generation is None
                              or int(row["lease_generation"]) == int(lease_generation))
+                        and row["model"] == binding[0]
+                        and row["request_sha256"] == binding[1]
+                        and row["prompt_tokens"] == binding[2]
+                        and row["max_output_tokens"] == binding[3]
+                        and row["cost_usd"] == binding[4]
+                        and row["endpoint"] == binding[5]
                     )
                     if same:
                         self._conn.commit()
@@ -1601,13 +1705,14 @@ class CheckpointStore:
                 self._conn.execute(
                     "INSERT INTO quota_reservations (dispatch_id, pool, anchor_iso, "
                     "items_json, limits_json, policy_hash, run_id, lease_owner, "
-                    "lease_generation, status, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "lease_generation, status, created_at, model, request_sha256, "
+                    "prompt_tokens, max_output_tokens, cost_usd, endpoint) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         dispatch_id, pool, anchor_canon,
                         json.dumps([c[0] for c in checks]), limits_str, policy_hash,
                         run_id, lease_owner, lease_generation,
-                        ReservationStatus.RESERVED.value, now,
+                        ReservationStatus.RESERVED.value, now, *binding,
                     ),
                 )
                 for it, window in checks:
@@ -1643,6 +1748,7 @@ class CheckpointStore:
         lease_owner: str | None = None,
         lease_generation: int | None = None,
         now_iso: str | None = None,
+        request_sha256: str | None = None,
     ) -> bool:
         """Atomically grant DISPATCH AUTHORIZATION for a reservation — exactly once.
         One BEGIN IMMEDIATE transaction covers: (a) lease-binding match — the
@@ -1662,6 +1768,7 @@ class CheckpointStore:
                 return self._mark_dispatched_tx(
                     dispatch_id, run_id=run_id, lease_owner=lease_owner,
                     lease_generation=lease_generation, now_iso=now_iso,
+                    request_sha256=request_sha256,
                 )
             except sqlite3.OperationalError as exc:
                 msg = str(exc).lower()
@@ -1676,6 +1783,7 @@ class CheckpointStore:
     def _mark_dispatched_tx(
         self, dispatch_id: str, *, run_id: str | None, lease_owner: str | None,
         lease_generation: int | None, now_iso: str | None,
+        request_sha256: str | None = None,
     ) -> bool:
         now = now_iso or self.now_iso()
         with self._lock:
@@ -1699,6 +1807,13 @@ class CheckpointStore:
                 # (b) live run lease must be valid (present expiry + owner + gen)
                 if run_id is not None and not self._verify_lease_locked(
                         run_id, lease_owner, lease_generation):
+                    self._conn.commit()
+                    return False
+                # payload-change rejection: if the reservation is bound to a
+                # sanitized request digest, the digest supplied at finalization
+                # must match exactly — a changed payload is never authorized
+                if request_sha256 is not None and row["request_sha256"] is not None \
+                        and row["request_sha256"] != request_sha256:
                     self._conn.commit()
                     return False
                 # (d) atomic window + current-policy revalidation at authorization

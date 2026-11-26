@@ -135,7 +135,14 @@ def build_team(
         gateway.set_durable_store(store)
     # Phase 4 C4: wire the cloud registry + zero-cost gate through the factory so a
     # YAML zero_cost=true can never silently run in legacy mode
-    if config.cloud is not None and hasattr(gateway, "set_cloud_registry"):
+    if config.cloud is not None:
+        if not hasattr(gateway, "set_cloud_registry"):
+            # an unsupported gateway must fail closed, never silently skip the gate
+            raise ConfigError(
+                "cloud configuration requires a gateway with zero-cost support "
+                "(set_cloud_registry/set_cloud_gate) — failing closed instead of "
+                "running without the zero-cost gate"
+            )
         reg = CloudProfileRegistry.from_config(config.cloud)
         gateway.set_cloud_registry(reg)
         if reg.zero_cost:

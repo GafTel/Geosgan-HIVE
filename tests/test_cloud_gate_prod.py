@@ -17,8 +17,10 @@ import json
 import socket
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
+import litellm
 import pytest
 import yaml
 from pydantic import ValidationError
@@ -145,7 +147,6 @@ def litellm_spy(monkeypatch):
         calls.append(kwargs)
         return fake_response(model=kwargs.get("model", M1))
 
-    import litellm
     monkeypatch.setattr(litellm, "completion", fake)
     monkeypatch.setattr(litellm, "acompletion", fake_a)
     return calls
@@ -174,7 +175,7 @@ def make_gateway(store, gate, ctx_lookup=None):
 
 # ---- point 1/2: zero_cost never silently legacy; :memory: rejected ----
 
-REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _with(cfg: HiveConfig, **updates) -> HiveConfig:
@@ -484,7 +485,6 @@ def test_gate_has_no_disable_switch(tmp_path):
 # ---- point 10: budgets/retries/cancellation preserved under the gate ----
 
 def test_retry_and_quota_guarantees_preserved(tmp_path, litellm_spy, no_network, monkeypatch):
-    import litellm
     gate, store = make_gate(tmp_path, [free_profile()])
     sleeps = []
     gw = ModelGateway(tracker=UsageTracker(),
@@ -535,4 +535,129 @@ def test_async_two_phase_gate(tmp_path, litellm_spy, no_network):
     # the gateway call itself succeeds in-window; direct rollover was denied above
     assert asyncio.run(run2()) == "ok"
     assert len(litellm_spy) == 2
+    store.close()
+
+
+# ---- C4 residual: exact reservation binding (audit point 1) ----
+
+def test_reservation_bound_to_model_digest_tokens_cost_endpoint(tmp_path, litellm_spy, no_network):
+    from geosgan_hive.cloud_gate import sanitized_request_digest
+
+    gate, store = make_gate(tmp_path, [free_profile()])
+    gw = make_gateway(store, gate)
+    gw.complete([Message("user", "bind me")], model=M1, max_tokens=48)
+    with store._lock:
+        row = store._conn.execute("SELECT * FROM quota_reservations").fetchone()
+    assert row["model"] == M1
+    assert row["request_sha256"] == sanitized_request_digest(litellm_spy[0])
+    assert row["max_output_tokens"] == 48 and row["prompt_tokens"] > 0
+    assert row["cost_usd"] == 0.0 and row["endpoint"] is None  # gemini has no default base
+    # credentials are never persisted anywhere in the database file
+    raw = Path(store.path).read_bytes()
+    assert b"sk-test" not in raw
+    store.close()
+
+
+def test_payload_change_before_finalization_rejected(tmp_path, litellm_spy, no_network):
+
+    gate, store = make_gate(tmp_path, [free_profile()])
+    kw = dict(model=M1, messages=[Message("user", "original").to_openai()],
+              max_tokens=16, temperature=0.2, timeout=60.0, num_retries=0)
+    did = gate.prepare_dispatch(M1, dict(kw))
+    tampered = dict(kw, messages=[Message("user", "TAMPERED").to_openai()])
+    with pytest.raises(CheckpointError, match="authorization denied"):
+        gate.finalize_dispatch(M1, did, kwargs=tampered)
+    with store._lock:
+        row = store._conn.execute("SELECT status FROM quota_reservations").fetchone()
+    assert row["status"] == "reserved"  # not dispatched, not authorized
+    # the original payload still finalizes fine
+    gate.finalize_dispatch(M1, did, kwargs=kw)
+    store.close()
+
+
+# ---- C4 residual: _reserve_physical uses worker-owned identity (point 2) ----
+
+def test_reserve_physical_uses_context_identity_not_sqlite(tmp_path, litellm_spy):
+    gate, store = make_gate(tmp_path, [free_profile()])
+    store.create_run(run_id="r", owner="w1", task="t", agent="s", model=M1, root_task_id="x")
+    ctx = RunContext("r", CollaborationPolicy())
+    ctx.lease_owner = "w1"
+    ctx.lease_generation = 0
+    gw = make_gateway(store, gate, ctx_lookup=lambda rid: ctx if rid == "r" else None)
+    gw.complete([Message("user", "x")], model=M1, run_id="r", max_tokens=16)
+    assert store.get("r").physical_reserved == 1
+    # takeover in SQLite: the stale context identity must be fenced
+    conn = sqlite3.connect(store.path)
+    conn.execute("UPDATE runs SET lease_owner='w2', lease_generation=9, "
+                 "lease_expires_at='2999-01-01T00:00:00.000+00:00' WHERE run_id='r'")
+    conn.commit()
+    conn.close()
+    with pytest.raises(CheckpointError):
+        gw.complete([Message("user", "y")], model=M1, run_id="r", max_tokens=16)
+    assert store.get("r").physical_reserved == 1  # no dispatch, no reservation
+    assert len(litellm_spy) == 1
+    store.close()
+
+
+# ---- C4 residual: replacement prevention (point 3) ----
+
+def test_gate_registry_store_replacement_rejected(tmp_path):
+    gate, store = make_gate(tmp_path, [free_profile()])
+    other_store = CheckpointStore(str(tmp_path / "other.db"))
+    other_gate = ZeroCostGate(registry([free_profile()]), other_store,
+                              adapter=ExactAdapter())
+    gw = ModelGateway(tracker=UsageTracker(), environ={"GEMINI_API_KEY": "sk-test"})
+    gw.set_durable_store(store)
+    gw.set_cloud_gate(gate)
+    with pytest.raises(ConfigError, match="replace"):
+        gw.set_cloud_gate(other_gate)          # different gate object
+    with pytest.raises(ConfigError, match="registry"):
+        gw.set_cloud_registry(registry([free_profile()]))  # different registry
+    with pytest.raises(ConfigError, match="swap|store"):
+        gw.set_durable_store(other_store)      # different quota store
+    assert gw.cloud_gate() is gate  # unchanged
+    store.close()
+    other_store.close()
+
+
+def test_factory_fails_closed_on_unsupported_gateway(tmp_path):
+    from types import SimpleNamespace
+
+    cfg = _config_with_cloud(tmp_path)
+    bogus = SimpleNamespace(tracker=UsageTracker())  # no set_cloud_registry
+    with pytest.raises(ConfigError, match="zero-cost|failing closed"):
+        build_team(cfg, bogus)
+
+
+# ---- C4 residual: effective endpoint incl. provider default (point 4) ----
+
+def test_effective_default_endpoint_verified(tmp_path, litellm_spy):
+    ollama_model = "ollama/llama3.2"
+    prof = dict(provider="ollama", models=[ollama_model], billing="free_tier_verified",
+                verified_free=True, overage_billing_disabled=True, billing_verified=True,
+                verified_at=(NOW - timedelta(days=1)).isoformat(), account_label="loc",
+                account_fingerprint=FP_A, quota_window_start=ANCHOR.isoformat(),
+                quota_reset_semantics="provider_documented",
+                verification_evidence=evidence(endpoint="http://localhost:11434"),
+                quotas=[{"pool": "ollama:acct:" + FP_A, "max_requests": 10,
+                         "max_tokens": 10**6, "period": "day"}])
+    gate, store = make_gate(tmp_path, [prof])
+    # no api_base in kwargs -> provider DEFAULT endpoint must match the evidence
+    kw = dict(model=ollama_model, messages=[Message("user", "x").to_openai()], max_tokens=8)
+    assert gate.prepare_dispatch(ollama_model, dict(kw))  # default matches
+    bad = dict(kw, api_base="https://evil.example")
+    with pytest.raises(CloudConfigError, match="endpoint"):
+        gate.prepare_dispatch(ollama_model, bad)
+    store.close()
+
+
+def test_zero_cost_cross_provider_fallback_needs_profile(tmp_path, litellm_spy, no_network):
+    # fallback candidate on another provider without a zero-cost profile is rejected
+    gate, store = make_gate(tmp_path, [free_profile()])
+    ok, reason = gate.candidate_billing_ok("mistral/mistral-large-latest")
+    assert not ok and "no cloud profile" in reason
+    # legacy (gate inactive): legacy cost policy decides, unchanged
+    reg_legacy = registry([free_profile()], zero_cost=False)
+    gate_legacy = ZeroCostGate(reg_legacy, store, adapter=ExactAdapter())
+    assert gate_legacy.candidate_billing_ok("mistral/mistral-large-latest")[0] is True
     store.close()

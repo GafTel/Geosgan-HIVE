@@ -130,6 +130,9 @@ class QuotaEngine:
         lease_owner: str | None = None,
         lease_generation: int | None = None,
         now: datetime | None = None,
+        request_sha256: str | None = None,
+        cost_usd: float | None = None,
+        endpoint: str | None = None,
     ) -> QuotaReservation:
         """Reserve quota for ONE physical dispatch of `model`, before it is sent.
 
@@ -185,6 +188,12 @@ class QuotaEngine:
             lease_generation=lease_generation,
             constraints=constraints,
             reset_semantics=_profile.quota_reset_semantics.value,
+            model=model,
+            request_sha256=request_sha256,
+            prompt_tokens=pt,
+            max_output_tokens=mo,
+            cost_usd=cost_usd,
+            endpoint=endpoint,
         )
         if outcome == QuotaReservationOutcome.REPLAYED:
             raise CheckpointError(
@@ -205,17 +214,19 @@ class QuotaEngine:
         lease_owner: str | None = None,
         lease_generation: int | None = None,
         now: datetime | None = None,
+        request_sha256: str | None = None,
     ) -> bool:
         """Grant dispatch authorization for a reservation — True for exactly ONE
-        caller (atomic BEGIN IMMEDIATE, with window + policy revalidation);
-        replays, stale workers, unbound callers on run-bound reservations and
-        window-rolled reservations get False and must not send another physical
-        request. Never refunds usage."""
+        caller (atomic BEGIN IMMEDIATE, with window + policy revalidation and
+        payload-digest match when bound); replays, stale workers, unbound callers
+        on run-bound reservations, window-rolled and payload-changed requests get
+        False and must not send another physical request. Never refunds usage."""
         n = self._now(now) if now is not None else None
         return self._store.mark_dispatched(
             dispatch_id, run_id=run_id, lease_owner=lease_owner,
             lease_generation=lease_generation,
             now_iso=n.isoformat(timespec="milliseconds") if n is not None else None,
+            request_sha256=request_sha256,
         )
 
     def migrate_quota_policy(
