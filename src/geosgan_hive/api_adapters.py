@@ -39,7 +39,7 @@ import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .errors import ToolPermissionError
 from .outbound import ApiSession
@@ -663,3 +663,146 @@ def github_tools(session, lease_lookup=None):
 
 
 ADAPTER_BUILDERS["github"] = github_tools
+
+
+# ---- A6.4 World Bank Indicators API ----------------------------------------------
+
+class WorldBankIndicatorsInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    per_page: int = Field(default=50, ge=1, le=200)
+    page: int = Field(default=1, ge=1, le=10)
+
+
+class WorldBankDataInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    country: str = Field(min_length=2, max_length=3)
+    indicator: str = Field(min_length=1, max_length=64)
+    start_year: int = Field(ge=1960, le=2100)
+    end_year: int = Field(ge=1960, le=2100)
+    per_page: int = Field(default=100, ge=1, le=500)
+    page: int = Field(default=1, ge=1, le=10)
+
+    @field_validator("country")
+    @classmethod
+    def _country(cls, v: str) -> str:
+        if not _WB_COUNTRY_RE.match(v):
+            raise ValueError("country must be a 2-3 letter code (e.g. 'ES', 'USA')")
+        return v
+
+    @field_validator("indicator")
+    @classmethod
+    def _indicator(cls, v: str) -> str:
+        if not _WB_INDICATOR_RE.match(v):
+            raise ValueError("invalid indicator id")
+        return v
+
+    @model_validator(mode="after")
+    def _range(self):
+        if self.end_year < self.start_year:
+            raise ValueError("end_year must be >= start_year")
+        if self.end_year - self.start_year > 62:
+            raise ValueError("date range too large (max 63 years)")
+        return self
+
+
+class WorldBankIndicatorsAdapter(ApiToolAdapter):
+    provider = "worldbank"
+    endpoint_id = "worldbank-v2"
+    operation_id = "list_indicators"
+
+    def build_request(self, args):
+        return ("/v2/indicator",
+                {"format": "json", "per_page": args["per_page"], "page": args["page"]})
+
+    def normalize(self, payload, args):
+        rows = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
+        results = []
+        if isinstance(rows, list):
+            for r in rows[:200]:
+                if not isinstance(r, dict):
+                    continue
+                results.append({
+                    "id": _bounded_str(r.get("id"), 100),
+                    "name": _bounded_str(r.get("name"), 300),
+                    "unit": _bounded_str(r.get("unit"), 100),
+                    "source": _bounded_str(r.get("source", {}).get("value"), 200)
+                    if isinstance(r.get("source"), dict) else "",
+                })
+        return {
+            "kind": "indicators",
+            "total": len(results),
+            "results": results,
+            "attribution": ("World Bank Open Data, https://data.worldbank.org, "
+                            "CC BY 4.0. Indicator metadata is untrusted."),
+            "docs": "https://datahelpdesk.worldbank.org/knowledgebase/articles/889392",
+        }
+
+
+class WorldBankDataAdapter(ApiToolAdapter):
+    provider = "worldbank"
+    endpoint_id = "worldbank-v2"
+    operation_id = "indicator_data"
+
+    def build_request(self, args):
+        return (f"/v2/country/{args['country']}/indicator/{args['indicator']}",
+                {"format": "json",
+                 "date": f"{args['start_year']}:{args['end_year']}",
+                 "per_page": args["per_page"], "page": args["page"]})
+
+    def normalize(self, payload, args):
+        rows = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
+        results = []
+        unit = ""
+        if isinstance(rows, list):
+            for r in rows[:500]:
+                if not isinstance(r, dict):
+                    continue
+                if not unit:
+                    unit = _bounded_str(r.get("unit"), 100)
+                value = r.get("value")
+                # missing values stay None — NEVER converted to zero
+                if value is not None and not isinstance(value, (int, float)):
+                    value = None
+                results.append({
+                    "date": _bounded_str(r.get("date"), 10),
+                    "value": value,
+                    "country": _bounded_str(r.get("country", {}).get("value"), 100)
+                    if isinstance(r.get("country"), dict) else "",
+                    "indicator": _bounded_str(r.get("indicator", {}).get("value"), 300)
+                    if isinstance(r.get("indicator"), dict) else "",
+                })
+        return {
+            "kind": "indicator_series",
+            "country": args["country"],
+            "indicator": args["indicator"],
+            "unit": unit,
+            "missing_value_semantics": "null means missing — never reported as 0",
+            "total": len(results),
+            "results": results,
+            "attribution": ("World Bank Open Data (CC BY 4.0), "
+                            "https://data.worldbank.org. Untrusted data."),
+            "docs": "https://datahelpdesk.worldbank.org/knowledgebase/articles/889392",
+        }
+
+
+def worldbank_tools(session, lease_lookup=None):
+    specs = [
+        ToolSpec(name="worldbank_list_indicators", category="api",
+                 side_effect=SideEffect.READ_ONLY, idempotent=True,
+                 input_model=WorldBankIndicatorsInput,
+                 description=("Discover World Bank indicators (bounded pagination)."),
+                 max_output_bytes=60_000),
+        ToolSpec(name="worldbank_indicator_data", category="api",
+                 side_effect=SideEffect.READ_ONLY, idempotent=True,
+                 input_model=WorldBankDataInput,
+                 description=("Historical indicator time series for a country "
+                             "(bounded date range; null = missing, never 0)."),
+                 max_output_bytes=100_000),
+    ]
+    return [
+        (specs[0], WorldBankIndicatorsAdapter(session, specs[0], lease_lookup=lease_lookup)),
+        (specs[1], WorldBankDataAdapter(session, specs[1], lease_lookup=lease_lookup)),
+    ]
+
+
+ADAPTER_BUILDERS["worldbank"] = worldbank_tools
