@@ -2098,7 +2098,7 @@ class CheckpointStore:
         operation_id: str,
         request_sha256: str,
         max_wire_bytes: int,
-        budgets: Mapping[str, int],   # scope -> limit; scope in run:<id>|provider:<p>|endpoint:<e>
+        budgets: Mapping[str, Mapping[str, int]],  # scope -> kind(requests|wire_bytes) -> limit
         window_start_iso: str,
         now_iso: str | None = None,
         run_id: str | None = None,
@@ -2178,10 +2178,13 @@ class CheckpointStore:
                     f"provider:{provider}": budgets.get(f"provider:{provider}"),
                     f"endpoint:{endpoint_id}": budgets.get(f"endpoint:{endpoint_id}"),
                 }
-                for scope, limit in scopes.items():
-                    if limit is None:
+                for scope, kind_limits in scopes.items():
+                    if kind_limits is None:
                         continue
                     for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):
+                        limit = kind_limits.get(kind)
+                        if limit is None:
+                            continue
                         row = self._conn.execute(
                             "SELECT used FROM api_usage WHERE scope=? AND kind=? "
                             "AND window_start=?", (scope, kind, window_start_iso),
@@ -2198,7 +2201,7 @@ class CheckpointStore:
                     "VALUES (?,?,?,?,?,?,?,?,?,'reserved',?)",
                     (reservation_id, provider, endpoint_id, operation_id, request_sha256,
                      max_wire_bytes, run_id, lease_owner, lease_generation, now))
-                for scope, _limit in scopes.items():
+                for scope, _kind_limits in scopes.items():
                     if scope == f"run:{run_id}" and run_id is None:
                         continue
                     for kind, amount in (("requests", 1), ("wire_bytes", max_wire_bytes)):

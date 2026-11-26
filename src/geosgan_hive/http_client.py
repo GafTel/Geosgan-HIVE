@@ -62,6 +62,7 @@ from .errors import (
     ResponseLimitExceededError,
     TransportCancelledError,
     TransportDeadlineExceededError,
+    TransportError,
 )
 
 _LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -227,8 +228,8 @@ class _LimitedRaw(io.RawIOBase):
         if len(view) > remaining_wire:
             view = view[:remaining_wire]
         timeout = min(self._limits.read_timeout_seconds, max(0.05, self._deadline - now))
-        self._sock.settimeout(timeout)
         try:
+            self._sock.settimeout(timeout)
             n = self._sock.recv_into(view)
         except TimeoutError as exc:
             if self._clock() >= self._deadline:
@@ -236,15 +237,49 @@ class _LimitedRaw(io.RawIOBase):
                     "total request deadline exceeded") from exc
             raise TransportDeadlineExceededError(
                 f"read timeout within total deadline: {exc}") from exc
+        except OSError as exc:
+            # e.g. the peer vanished mid-response; surface a typed transport error
+            raise TransportError(f"connection error during bounded read: {exc}") from exc
         self._state["wire"] += n
         if self._state["wire"] > self._limits.max_wire_bytes:
             raise ResponseLimitExceededError("wire response byte limit exceeded")
         return n
 
 
+class _LimitedFile:
+    """BufferedReader wrapper that releases the socket's io-reference on close,
+    mirroring socket.makefile() semantics (see _LimitedSocket.makefile)."""
+
+    def __init__(self, br: io.BufferedReader, sock: socket.socket):
+        self._br = br
+        self._sock = sock
+
+    def close(self):
+        try:
+            self._br.close()
+        finally:
+            sock = self._sock
+            if hasattr(sock, "_io_refs"):
+                sock._io_refs -= 1
+                if getattr(sock, "_closed", False) and sock._io_refs <= 0:
+                    try:
+                        sock._real_close()
+                    except OSError:
+                        pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._br, name)
+
+
 class _LimitedSocket:
     """Socket wrapper whose makefile() returns a BOUNDED reader, so http.client's
-    header parsing (unbounded readline internally) is also capped."""
+    header parsing (unbounded readline internally) is also capped.
+
+    makefile() also takes an io-reference on the underlying socket exactly like
+    socket.makefile() does: http.client's getresponse() calls sock.close() when
+    the response says the connection will close, but the body still has to be
+    read from the response's file object afterwards. Without the io-ref the fd
+    would be released too early and resp.read() would fail with EBADF."""
 
     def __init__(self, sock: socket.socket, raw: _LimitedRaw):
         self._sock = sock
@@ -252,6 +287,10 @@ class _LimitedSocket:
 
     def makefile(self, mode: str = "rb", *a: Any, **k: Any):
         assert "r" in mode
+        sock = self._sock
+        if hasattr(sock, "_io_refs"):  # CPython socket io-ref semantics
+            sock._io_refs += 1
+            return _LimitedFile(io.BufferedReader(self._raw), sock)
         return io.BufferedReader(self._raw)
 
     def __getattr__(self, name: str):
@@ -298,6 +337,10 @@ class SecureHttpClient:
         self._clock = clock
         self._rules = {e.endpoint_id: e for e in config.endpoints}
         self._sem = threading.Semaphore(config.limits.max_concurrent_requests)
+
+    @property
+    def config(self) -> TransportConfig:
+        return self._config
 
     # -- allowlist validation -------------------------------------------------
 

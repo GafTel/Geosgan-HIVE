@@ -173,6 +173,154 @@ class CloudConfig(BaseModel):
         return self
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 (A5/A6): public API transport + outbound authorization config
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+
+
+def _host_is_loopback_or_literal_private(host: str) -> bool:
+    import ipaddress
+    h = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    if h.lower() in _LOOPBACK_NAMES:
+        return True
+    try:
+        return not ipaddress.ip_address(h).is_global
+    except ValueError:
+        return False
+
+
+class ApiEndpointConfig(BaseModel):
+    """One allowlisted public API endpoint. Production rules: HTTPS only, no
+    loopback/private literal hosts (test fixtures bypass this at the transport
+    layer, never through this config)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+    scheme: str = "https"
+    host: str = Field(min_length=1, max_length=253)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    path_prefixes: list[str] = Field(min_length=1)
+    methods: list[str] = Field(min_length=1)
+    headers: dict[str, str] = Field(default_factory=dict)
+    extra_header_keys: list[str] = Field(default_factory=list)
+    auth_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,63}$")
+
+    @field_validator("scheme")
+    @classmethod
+    def _https_only(cls, v: str) -> str:
+        if v != "https":
+            raise ValueError("public API endpoints require https (no plain http in config)")
+        return v
+
+    @field_validator("host")
+    @classmethod
+    def _no_loopback(cls, v: str) -> str:
+        if _host_is_loopback_or_literal_private(v):
+            raise ValueError(
+                f"host {v!r} is loopback/private: rejected in production API config "
+                "(offline test servers are configured at the transport layer only)"
+            )
+        return v
+
+    @field_validator("methods")
+    @classmethod
+    def _methods_ok(cls, v: list[str]) -> list[str]:
+        out = [m.upper() for m in v]
+        for m in out:
+            if m not in ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"):
+                raise ValueError(f"method {m!r} not allowed")
+        return out
+
+
+class ApiProviderConfig(BaseModel):
+    """One public API provider. Billing must be a verified no-charge class;
+    unknown billing exposure is rejected (fail closed). External access is
+    DISABLED unless listed in ApiConfig.enabled AND its outbound policy allows."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
+    billing: str = "unknown"  # must be public_api_no_charge | local_inference
+    outbound_policy: str = "disabled"  # disabled | approval_required | authorized
+    allowed_operations: list[str] = Field(default_factory=list)  # for authorized
+    non_commercial_attestation: bool = False  # required for open-meteo
+    endpoints: list[ApiEndpointConfig] = Field(min_length=1)
+
+    @field_validator("billing")
+    @classmethod
+    def _billing_known_no_charge(cls, v: str) -> str:
+        if v not in ("public_api_no_charge", "local_inference"):
+            raise ValueError(
+                f"billing {v!r} is not a verified no-charge class — unknown billing "
+                "exposure is rejected (fail closed)"
+            )
+        return v
+
+    @field_validator("outbound_policy")
+    @classmethod
+    def _policy_ok(cls, v: str) -> str:
+        if v not in ("disabled", "approval_required", "authorized"):
+            raise ValueError(f"unknown outbound_policy {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _attestation(self) -> ApiProviderConfig:
+        if self.provider == "openmeteo" and not self.non_commercial_attestation:
+            raise ValueError(
+                "open-meteo free tier is NON-COMMERCIAL only: non_commercial_attestation "
+                "must be explicitly set true by the authorized operator (default false)"
+            )
+        if self.outbound_policy == "authorized" and not self.allowed_operations:
+            raise ValueError("authorized policy requires an explicit allowed_operations list")
+        return self
+
+
+class ApiBudgets(BaseModel):
+    """Durable per-run / per-provider / per-endpoint request+byte budgets,
+    enforced via atomic v9 reservations before every physical HTTP request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    per_run_requests: int = Field(default=50, ge=1)
+    per_run_bytes: int = Field(default=5 * 1024 * 1024, ge=1)
+    per_provider_requests: int = Field(default=200, ge=1)
+    per_provider_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
+    per_endpoint_requests: int = Field(default=100, ge=1)
+    per_endpoint_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
+
+
+class ApiConfig(BaseModel):
+    """Phase 5 public-API configuration. Default state: everything DISABLED."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: list[str] = Field(default_factory=list)  # provider ids; empty = all disabled
+    providers: list[ApiProviderConfig] = Field(default_factory=list)
+    budgets: ApiBudgets = Field(default_factory=ApiBudgets)
+    user_agent: str = Field(
+        default="GEOSGAN-HIVE/0.7.0 (https://github.com/GafTel/Geosgan-HIVE)",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9 ./()_+-]{3,127}$",
+    )
+    max_wire_bytes_per_request: int = Field(default=10 * 1024 * 1024, ge=1)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ApiConfig:
+        ids = [p.provider for p in self.providers]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"duplicate API provider ids: {sorted(ids)}")
+        known = set(ids)
+        unknown = [p for p in self.enabled if p not in known]
+        if unknown:
+            raise ValueError(f"enabled providers not defined: {unknown}")
+        ep_ids = [e.endpoint_id for p in self.providers for e in p.endpoints]
+        if len(set(ep_ids)) != len(ep_ids):
+            raise ValueError(f"duplicate endpoint ids: {sorted(ep_ids)}")
+        return self
+
+
 class HiveConfig(BaseModel):
     """Whole team configuration: one supervisor plus the specialist agents."""
 
@@ -183,6 +331,7 @@ class HiveConfig(BaseModel):
     checkpoint: CheckpointConfig | None = None  # required for WAIT/HYBRID modes
     tools: ToolsConfig | None = None  # None = legacy built-in tools only; block = explicit
     cloud: CloudConfig | None = None  # Phase 4: None = legacy cost_tier semantics
+    apis: ApiConfig | None = None  # Phase 5 (A5/A6): None = all external APIs DISABLED
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:

@@ -113,9 +113,26 @@ from .fallback import (
 )
 from .gateway import GatewayLLMClient, LLMResponse, ModelGateway
 from .health import CircuitBreaker, CircuitState, HealthRegistry
+from .http_client import (
+    EndpointRule,
+    HttpLimits,
+    HttpResult,
+    SecureHttpClient,
+    TransportConfig,
+    parse_retry_after,
+    validate_destination,
+)
 from .llm import AsyncLLMClient, FakeLLM, LLMClient
 from .messages import Message
 from .orchestrator import FINISH, OrchestratorResult, Supervisor
+from .outbound import (
+    ApiSession,
+    OutboundAuthorizer,
+    OutboundDecision,
+    OutboundPolicy,
+    build_api_session,
+    canonical_request_digest,
+)
 from .providers import (
     Credentials,
     ModelCapabilities,
@@ -169,6 +186,19 @@ __all__ = [
     "QuotaDimension",
     "catalog_from_dict",
     "load_catalog",
+    "ApiSession",
+    "EndpointRule",
+    "HttpLimits",
+    "HttpResult",
+    "OutboundAuthorizer",
+    "OutboundDecision",
+    "OutboundPolicy",
+    "SecureHttpClient",
+    "TransportConfig",
+    "build_api_session",
+    "canonical_request_digest",
+    "parse_retry_after",
+    "validate_destination",
     "TokenEstimationMode",
     "VerificationEvidence",
     "ZeroCostGate",
