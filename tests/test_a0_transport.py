@@ -229,3 +229,146 @@ def test_concurrent_gated_dispatches_reserve_exactly(tmp_path, local_server, mon
     status = gate.engine.quota_status(MODEL, now=NOW)
     assert status[("requests", "day")]["used"] == 8  # exactly one durable unit each
     store.close()
+
+
+# ---- A0 residual verification ----
+
+def test_env_restored_after_success_failure_and_cancellation(tmp_path, local_server,
+                                                             monkeypatch, no_network):
+    import os
+    port, _h = local_server
+    endpoint = f"http://localhost:{port}"
+    gw, _gate, store, _c = _make(tmp_path, endpoint, monkeypatch)
+    sentinel = "http://sentinel.invalid:1"
+    monkeypatch.setenv("OLLAMA_API_BASE", sentinel)
+
+    import litellm
+    real = litellm.completion
+
+    # success path
+    assert gw.complete([Message(role="user", content="hi")], model=MODEL,
+                       agent="supervisor", max_tokens=32) == "ok-local"
+    assert os.environ["OLLAMA_API_BASE"] == sentinel
+
+    # failure path
+    def boom(**kwargs):
+        raise RuntimeError("dispatch failed")
+    monkeypatch.setattr("litellm.completion", boom)
+    from geosgan_hive.errors import HiveError
+    with pytest.raises(HiveError):
+        gw.complete([Message(role="user", content="hi")], model=MODEL,
+                    agent="supervisor", max_tokens=32)
+    assert os.environ["OLLAMA_API_BASE"] == sentinel
+
+    # cancellation-like path (exception inside the call)
+    def cancelled(**kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr("litellm.completion", cancelled)
+    with pytest.raises(KeyboardInterrupt):
+        gw.complete([Message(role="user", content="hi")], model=MODEL,
+                    agent="supervisor", max_tokens=32)
+    assert os.environ["OLLAMA_API_BASE"] == sentinel
+    monkeypatch.setattr("litellm.completion", real)
+    store.close()
+
+
+def test_concurrent_gateways_do_not_leak_env(tmp_path, local_server, monkeypatch, no_network):
+    import os
+    port, _h = local_server
+    endpoint = f"http://127.0.0.1:{port}"
+    gw1, _g1, s1, _ = _make(tmp_path / "a", endpoint, monkeypatch)
+    gw2, _g2, s2, _ = _make(tmp_path / "b", endpoint, monkeypatch)
+    before = os.environ.get("OLLAMA_API_BASE")
+    errs = []
+
+    def one(gw):
+        try:
+            gw.complete([Message(role="user", content="hi")], model=MODEL,
+                        agent="supervisor", max_tokens=32)
+        except Exception as exc:  # noqa: BLE001
+            errs.append(exc)
+
+    ts = [threading.Thread(target=one, args=(g,)) for g in (gw1, gw2) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=30)
+    assert not errs
+    assert os.environ.get("OLLAMA_API_BASE") == before  # no leaked pinned value
+    s1.close()
+    s2.close()
+
+
+def test_non_gated_dispatch_never_touches_env(tmp_path, monkeypatch):
+    import os
+    captured = []
+
+    def recorder(**kwargs):
+        captured.append(kwargs)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr("litellm.completion", recorder)
+    monkeypatch.setattr("litellm.completion_cost", lambda *a, **k: None)
+    before = os.environ.get("OLLAMA_API_BASE")
+    gw = ModelGateway(tracker=UsageTracker(),
+                      retry_policy=RetryPolicy(max_attempts=1, base_delay_seconds=0,
+                                               max_delay_seconds=0, jitter_ratio=0),
+                      environ={"OLLAMA_API_BASE": "http://localhost:11434"})
+    from geosgan_hive.errors import HiveError
+    with pytest.raises(HiveError):
+        gw.complete([Message(role="user", content="hi")], model=MODEL,
+                    agent="supervisor", max_tokens=32)
+    assert os.environ.get("OLLAMA_API_BASE") == before  # untouched
+    assert captured and captured[0]["api_base"] == "http://localhost:11434"  # unpinned
+
+
+def test_ipv6_loopback_literal_pinning(tmp_path, monkeypatch, no_network):
+    import socket as _s
+    from http.server import ThreadingHTTPServer
+
+    class H6(_OllamaHandler):
+        pass
+
+    class Srv6(ThreadingHTTPServer):
+        address_family = _s.AF_INET6
+
+    Srv6.seen = []
+    try:
+        srv = Srv6(("::1", 0), H6)
+    except OSError:
+        pytest.skip("IPv6 loopback not available on this host")
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    endpoint = f"http://[::1]:{port}"
+    gw, gate, store, _c = _make(tmp_path, endpoint, monkeypatch)
+    kwargs = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
+              "max_tokens": 32, "api_base": endpoint}
+    gate.prepare_dispatch(MODEL, kwargs)
+    assert kwargs["api_base"] == f"http://[::1]:{port}"  # pinned IPv6 literal, bracketed
+    answer = gw.complete([Message(role="user", content="hi")], model=MODEL,
+                         agent="supervisor", max_tokens=32)
+    assert answer == "ok-local"
+    assert H6.seen and H6.seen[0]["host"].startswith("[::1]:")
+    srv.shutdown()
+    store.close()
+
+
+def test_async_dispatch_uses_same_endpoint_protection(tmp_path, local_server, monkeypatch,
+                                                       no_network):
+    import asyncio
+    port, _h = local_server
+    endpoint = f"http://localhost:{port}"
+    gw, _gate, store, _c = _make(tmp_path, endpoint, monkeypatch)
+    captured = []
+
+    async def arecorder(**kwargs):
+        captured.append(kwargs)
+        import litellm
+        return litellm.completion(**kwargs)
+
+    monkeypatch.setattr("litellm.acompletion", arecorder)
+    answer = asyncio.run(gw.acomplete([Message(role="user", content="hi")], model=MODEL,
+                                       agent="supervisor", max_tokens=32))
+    assert answer == "ok-local"
+    assert captured and captured[0]["api_base"] == f"http://127.0.0.1:{port}"  # pinned
+    store.close()
