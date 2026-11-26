@@ -1,0 +1,118 @@
+# GEOSGAN HIVE - v0.7.0 example public-API configuration (A5/A6).
+#
+# Attach to a team config as its `apis:` block. DEFAULT STATE: everything
+# DISABLED (`enabled: []` -> build_api_session returns None, no API tools are
+# registered, all outbound requests fail closed).
+#
+# Security model (unchanged by this example):
+# - `billing` is an OPERATOR ATTESTATION, not verified evidence; unknown values
+#   are rejected. Local budgets cannot guarantee zero provider-side charges.
+# - Production endpoints must be https with global hosts (loopback/private
+#   literals are rejected here; offline test servers live at the transport
+#   layer only).
+# - Per-provider `outbound_policy`: disabled | approval_required | authorized
+#   (authorized additionally requires a non-empty allowed_operations list).
+# - Tools still need to be listed in the team's `tools.enabled` and in each
+#   agent's `permissions.allowed_tools` (deny-by-default ToolPolicy).
+# - Every physical request consumes a durable v9 reservation (per-run /
+#   per-provider / per-endpoint request+byte budgets) and is audited with
+#   metadata only (no payloads, no credentials).
+#
+# Verify the official docs/terms at enablement time; do not treat historical
+# quota values as permanent guarantees. No secrets ever belong in this file.
+
+apis:
+  enabled: []  # e.g. ["wikimedia", "crossref"] to enable; empty = all disabled
+  # conservative shared limits; tighten per deployment
+  budgets:
+    per_run_requests: 20
+    per_run_bytes: 2097152
+    per_provider_requests: 60
+    per_provider_bytes: 10485760
+    per_endpoint_requests: 40
+    per_endpoint_bytes: 5242880
+  max_wire_bytes_per_request: 2097152
+  user_agent: "GEOSGAN-HIVE/0.7.0 (https://github.com/GafTel/Geosgan-HIVE; contact: operator@example.org)"
+  providers:
+    - provider: wikimedia
+      billing: public_api_no_charge   # operator attestation, not verified evidence
+      outbound_policy: approval_required
+      allowed_operations: [search, get_page]
+      endpoints:
+        - endpoint_id: wikimedia-core
+          scheme: https
+          host: api.wikimedia.org
+          path_prefixes: ["/core/v1/wikipedia"]
+          methods: ["GET"]
+      # docs: https://api.wikimedia.org/wiki/Core_REST_API (verified 2026-11-26)
+      # licensing: articles typically CC BY-SA 4.0; attribution preserved by adapter
+    - provider: crossref
+      billing: public_api_no_charge
+      outbound_policy: approval_required
+      allowed_operations: [search_works, get_doi]
+      polite_mailto: operator@example.org   # polite pool; optional, not a credential
+      endpoints:
+        - endpoint_id: crossref-works
+          scheme: https
+          host: api.crossref.org
+          path_prefixes: ["/works"]
+          methods: ["GET"]
+      # docs: https://api.crossref.org/swagger-ui/index.html (verified 2026-11-26)
+      # metadata only; does NOT grant full-text access
+    - provider: github
+      billing: public_api_no_charge
+      outbound_policy: approval_required
+      allowed_operations: [search_repositories, get_repository, list_releases, get_readme]
+      endpoints:
+        - endpoint_id: github-rest
+          scheme: https
+          host: api.github.com
+          path_prefixes: ["/search", "/repos"]
+          methods: ["GET"]
+      # docs: https://docs.github.com/en/rest (verified 2026-11-26)
+      # unauthenticated-first (60 req/h shared limit); no mutations, no private
+      # repos, no following download URLs returned by responses
+    - provider: worldbank
+      billing: public_api_no_charge
+      outbound_policy: approval_required
+      allowed_operations: [list_indicators, indicator_data]
+      endpoints:
+        - endpoint_id: worldbank-v2
+          scheme: https
+          host: api.worldbank.org
+          path_prefixes: ["/v2"]
+          methods: ["GET"]
+      # docs: https://datahelpdesk.worldbank.org/knowledgebase/articles/889392 (verified 2026-11-26)
+      # license CC BY 4.0; missing values stay null, never zero
+    - provider: openmeteo
+      billing: public_api_no_charge
+      outbound_policy: approval_required
+      allowed_operations: [forecast, historical]
+      non_commercial_attestation: false   # MUST be set true by the operator (free tier is non-commercial only)
+      endpoints:
+        - endpoint_id: openmeteo-forecast
+          scheme: https
+          host: api.open-meteo.com
+          path_prefixes: ["/v1/forecast"]
+          methods: ["GET"]
+        - endpoint_id: openmeteo-archive
+          scheme: https
+          host: api.open-meteo.com
+          path_prefixes: ["/v1/archive"]
+          methods: ["GET"]
+      # docs: https://open-meteo.com/en/docs (verified 2026-11-26); free for
+      # non-commercial use; no paid endpoints used
+    - provider: searxng
+      billing: public_api_no_charge
+      outbound_policy: disabled
+      searxng_instance_authorized: false  # no instance authorized; no tool registered in v0.7.0
+      allowed_operations: []
+      endpoints:
+        - endpoint_id: searxng-instance
+          scheme: https
+          host: search.example.org   # placeholder; must be the ONE authorized instance
+          path_prefixes: ["/search"]
+          methods: ["GET"]
+      # PREREQUISITE NOT MET in v0.7.0: self-hosted/private instances need a
+      # separately scoped secure transport policy (the public transport rejects
+      # private/loopback destinations). See api_adapters.SEARNXNG_PREREQUISITE.

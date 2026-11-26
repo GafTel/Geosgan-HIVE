@@ -257,6 +257,13 @@ class ApiProviderConfig(BaseModel):
     outbound_policy: str = "disabled"  # disabled | approval_required | authorized
     allowed_operations: list[str] = Field(default_factory=list)  # for authorized
     non_commercial_attestation: bool = False  # required for open-meteo
+    #: Crossref polite pool (optional contact address, never a credential)
+    polite_mailto: str | None = Field(
+        default=None,
+        pattern=r"^[^@\s]{1,100}@[^@\s]{1,100}\.[^@\s]{1,20}$")
+    #: SearXNG: must be explicitly authorized by the operator (default false);
+    #: even then no SearXNG tool is registered in v0.7.0 (see api_adapters)
+    searxng_instance_authorized: bool = False
     endpoints: list[ApiEndpointConfig] = Field(min_length=1)
 
     @field_validator("billing")
@@ -286,6 +293,12 @@ class ApiProviderConfig(BaseModel):
             )
         if self.outbound_policy == "authorized" and not self.allowed_operations:
             raise ValueError("authorized policy requires an explicit allowed_operations list")
+        if self.provider == "searxng" and not self.searxng_instance_authorized:
+            raise ValueError(
+                "searxng requires searxng_instance_authorized=true set explicitly by the "
+                "operator (self-hosted or operator-authorized instance only); in v0.7.0 "
+                "no SearXNG tool is registered anyway — see api_adapters.SEARNXNG_PREREQUISITE"
+            )
         return self
 
 
@@ -313,7 +326,8 @@ class ApiConfig(BaseModel):
     budgets: ApiBudgets = Field(default_factory=ApiBudgets)
     user_agent: str = Field(
         default="GEOSGAN-HIVE/0.7.0 (https://github.com/GafTel/Geosgan-HIVE)",
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9 ./()_+-]{3,127}$",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9 ./()_+:-]{3,127}$",
+        validate_default=True,
     )
     max_wire_bytes_per_request: int = Field(default=10 * 1024 * 1024, ge=1)
 

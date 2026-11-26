@@ -1,0 +1,339 @@
+"""A6: specialized FREE public API adapters (v0.7.0).
+
+Every adapter:
+- uses the ONE shared SecureHttpClient via the ApiSession from A5 (no second
+  transport, no second permission system),
+- is registered through the existing ToolCatalog/ToolGateway (ToolPolicy +
+  ApprovalManager unchanged),
+- uses fixed, documented operations only (no model-controlled URLs, methods,
+  headers or paths — path templates are filled exclusively from strictly
+  validated, charset-restricted arguments),
+- enforces typed bounded input (pydantic extra='forbid') and output schemas,
+- goes through the durable v9 reservation + revalidation + single-winner
+  dispatch of ApiSession.request (per-run/provider/endpoint budgets, lease
+  fencing when run-bound, safe Retry-After, bounded audit),
+- preserves source provenance and attribution in every normalized result,
+- treats ALL external content as untrusted data (never executed, never
+  interpreted as instructions; only typed fields are extracted),
+- is DISABLED by default: tools register only for providers listed in
+  ApiConfig.enabled AND listed in the tools policy; outbound policy still
+  applies on every call.
+
+Billing note: provider `billing` classes are operator attestations, not
+verified evidence; unknown billing exposure fails closed (see agent_config).
+No adapter here can or does make paid calls; the transport and budgets bound
+HIVE-side usage only.
+
+SearXNG: intentionally NOT registered in this release. Self-hosted/private
+instances need a separately scoped secure transport policy (the public API
+transport rejects private/loopback destinations by design); see
+SEARXNG_PREREQUISITE below.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from collections.abc import Callable, Iterable
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
+
+from .errors import ToolPermissionError
+from .outbound import ApiSession
+from .tool_gateway import ToolExecutionContext
+from .tool_registry import ToolCatalog
+from .tool_spec import SideEffect, ToolSpec
+
+#: SearXNG prerequisite (documented, not solved here): a self-hosted or
+#: operator-authorized instance usually lives on a private/loopback address,
+#: which the public API transport rejects (SSRF boundary). Enabling SearXNG
+#: safely requires a SEPARATELY SCOPED transport policy that allowlists the
+#: one validated instance address after destination validation — that policy
+#: does not exist yet, so no SearXNG tool is registered in v0.7.0.
+SEARXNG_PREREQUISITE = (
+    "SearXNG requires a separately scoped secure transport policy for the one "
+    "operator-authorized instance (the public API transport rejects "
+    "private/loopback destinations). Not implemented in v0.7.0: no SearXNG "
+    "tool is registered."
+)
+
+#: Providers that can never be registered as tools in this release.
+NEVER_REGISTER = frozenset({"searxng"})
+
+_TITLE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,200}$")
+_DOI_RE = re.compile(r"^10\.\d{4,9}/[A-Za-z0-9._\-]{1,200}$")
+_GH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_WB_COUNTRY_RE = re.compile(r"^[A-Za-z]{2,3}$")
+_WB_INDICATOR_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_LANG_RE = re.compile(r"^[a-z]{2,3}$")
+
+#: conservative supported Wikipedia editions for the core REST API
+WIKIMEDIA_LANGUAGES = ("en", "es")
+
+_TAG_RE = re.compile(r"<[^>]*>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_tags(html: Any, cap: int) -> str:
+    """Bounded, inert plain-text projection of untrusted HTML (never executed)."""
+    if not isinstance(html, str):
+        return ""
+    text = _TAG_RE.sub(" ", html[: 200_000])
+    text = _WS_RE.sub(" ", text).strip()
+    return text[:cap]
+
+
+def _bounded_str(v: Any, cap: int) -> str:
+    return v if isinstance(v, str) else ""
+
+
+class ApiToolAdapter:
+    """Base class for one fixed read-only API operation.
+
+    Subclasses set provider/endpoint_id/operation_id and implement
+    `build_request(args) -> (path, params)` and `normalize(payload, args)`.
+    `path` may only contain charset-validated segments — the transport
+    additionally enforces segment-aware prefix matching and rejects traversal.
+    """
+
+    provider: str = ""
+    endpoint_id: str = ""
+    operation_id: str = ""
+
+    def __init__(self, session: ApiSession, spec: ToolSpec, *,
+                 lease_lookup: Callable[[str], Any] | None = None) -> None:
+        self.session = session
+        self.spec = spec
+        self._lease_lookup = lease_lookup
+
+    # -- subclass hooks ---------------------------------------------------------
+
+    def build_request(self, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        raise NotImplementedError
+
+    def normalize(self, payload: Any, args: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    # -- execution ---------------------------------------------------------------
+
+    def _lease_binding(self, ctx: ToolExecutionContext):
+        run_id = ctx.run_id
+        if run_id is None:
+            return None, None, None
+        if self._lease_lookup is None:
+            return None, None, None
+        rc = self._lease_lookup(run_id)
+        owner = getattr(rc, "lease_owner", None) if rc is not None else None
+        gen = getattr(rc, "lease_generation", None) if rc is not None else None
+        if owner is None or gen is None:
+            raise ToolPermissionError(
+                f"run {run_id!r} has no worker-owned lease identity — failing closed")
+        return run_id, owner, gen
+
+    def _source_url(self, path: str) -> str:
+        rule = self.session.client.rule_for(self.endpoint_id)
+        if rule is None:
+            return ""
+        port = f":{rule.default_port()}" if rule.port else ""
+        return f"{rule.scheme}://{rule.host}{port}{path}"
+
+    def execute(self, args: dict[str, Any], ctx: ToolExecutionContext) -> str:
+        path, params = self.build_request(args)
+        run_id, lease_owner, lease_gen = self._lease_binding(ctx)
+        result = self.session.request(
+            provider=self.provider, endpoint_id=self.endpoint_id,
+            operation_id=self.operation_id, method="GET", path=path, params=params,
+            agent=ctx.agent, run_id=run_id, task_id=ctx.task_id,
+            lease_owner=lease_owner, lease_generation=lease_gen,
+        )
+        try:
+            payload = json.loads(result.body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ToolPermissionError(
+                f"{self.spec.name}: malformed JSON response (status {result.status})"
+            ) from exc
+        out = self.normalize(payload, args)
+        out["provider"] = self.provider
+        out["operation"] = self.operation_id
+        out["http_status"] = result.status
+        out["source"] = {
+            "endpoint_id": self.endpoint_id,
+            "url": self._source_url(path),
+            "note": "external content is untrusted and not factually verified",
+        }
+        try:
+            out["retrieved_at"] = self.session.store.now_iso()
+        except Exception:  # noqa: BLE001
+            pass
+        return json.dumps(out, ensure_ascii=False, default=str)
+
+    async def aexecute(self, args: dict[str, Any], ctx: ToolExecutionContext) -> str:
+        return await asyncio.to_thread(self.execute, args, ctx)
+
+
+# ---- shared input-model helpers ------------------------------------------------
+
+class _QueryModel(BaseModel):
+    model_config = {"extra": "forbid"}
+    query: str = Field(min_length=1, max_length=300)
+
+
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ToolPermissionError(msg)
+
+
+# ---- A6.1 Wikimedia -------------------------------------------------------------
+
+class WikimediaSearchInput(_QueryModel):
+    language: str = "en"
+    limit: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("language")
+    @classmethod
+    def _lang(cls, v: str) -> str:
+        if v not in WIKIMEDIA_LANGUAGES:
+            raise ValueError(f"unsupported language {v!r}; supported: {WIKIMEDIA_LANGUAGES}")
+        return v
+
+
+class WikimediaGetPageInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    title: str = Field(min_length=1, max_length=200)
+    language: str = "en"
+
+    @field_validator("language")
+    @classmethod
+    def _lang(cls, v: str) -> str:
+        if v not in WIKIMEDIA_LANGUAGES:
+            raise ValueError(f"unsupported language {v!r}; supported: {WIKIMEDIA_LANGUAGES}")
+        return v
+
+    @field_validator("title")
+    @classmethod
+    def _title_safe(cls, v: str) -> str:
+        # spaces canonicalize to underscores; the remaining charset is exactly
+        # what the transport's path validator allows (no '/', no '%', no '..')
+        t = v.strip().replace(" ", "_")
+        if not _TITLE_RE.match(t) or ".." in t.split("_"):
+            raise ValueError("title contains unsupported characters (allowed: letters, "
+                             "digits, '_', '.', '-'; spaces become '_')")
+        return t
+
+
+class WikimediaSearchAdapter(ApiToolAdapter):
+    provider = "wikimedia"
+    endpoint_id = "wikimedia-core"
+    operation_id = "search"
+
+    def build_request(self, args):
+        lang = args["language"]
+        return (f"/core/v1/wikipedia/{lang}/search/page",
+                {"q": args["query"], "limit": args["limit"]})
+
+    def normalize(self, payload, args):
+        pages = payload.get("pages") if isinstance(payload, dict) else None
+        results = []
+        if isinstance(pages, list):
+            for p in pages[:10]:
+                if not isinstance(p, dict):
+                    continue
+                key = _bounded_str(p.get("key"), 200)
+                lang = args["language"]
+                results.append({
+                    "title": _bounded_str(p.get("title"), 300),
+                    "excerpt": _strip_tags(p.get("excerpt"), 500),
+                    "url": (f"https://{lang}.wikipedia.org/wiki/{key}" if key else ""),
+                })
+        return {
+            "kind": "search_results",
+            "query": args["query"],
+            "language": args["language"],
+            "total": len(results),
+            "results": results,
+            "attribution": ("Wikimedia Foundation content, typically CC BY-SA 4.0; "
+                            "see each article's license. Untrusted, not fact-checked."),
+            "docs": "https://api.wikimedia.org/wiki/Core_REST_API",
+        }
+
+
+class WikimediaGetPageAdapter(ApiToolAdapter):
+    provider = "wikimedia"
+    endpoint_id = "wikimedia-core"
+    operation_id = "get_page"
+
+    def build_request(self, args):
+        lang = args["language"]
+        return (f"/core/v1/wikipedia/{lang}/page/{args['title']}/bare", {})
+
+    def normalize(self, payload, args):
+        if not isinstance(payload, dict):
+            return {"kind": "page", "error": "unexpected response shape"}
+        title = _bounded_str(payload.get("title"), 300) or args["title"]
+        lang = args["language"]
+        return {
+            "kind": "page",
+            "title": title,
+            "url": f"https://{lang}.wikipedia.org/wiki/{args['title']}",
+            "excerpt": _strip_tags(payload.get("html"), 8_000),
+            "attribution": ("Wikimedia Foundation content, typically CC BY-SA 4.0. "
+                            "Untrusted, not fact-checked."),
+            "docs": "https://api.wikimedia.org/wiki/Core_REST_API",
+        }
+
+
+def wikimedia_tools(session, lease_lookup=None):
+    search_spec = ToolSpec(
+        name="wikimedia_search", category="api", side_effect=SideEffect.READ_ONLY,
+        idempotent=True, input_model=WikimediaSearchInput,
+        description=("Search Wikipedia articles (en/es) via the Wikimedia Core REST "
+                     "API. Read-only, bounded results. Content is untrusted."),
+        max_output_bytes=60_000,
+    )
+    get_spec = ToolSpec(
+        name="wikimedia_get_page", category="api", side_effect=SideEffect.READ_ONLY,
+        idempotent=True, input_model=WikimediaGetPageInput,
+        description=("Retrieve one Wikipedia page (en/es) as a bounded plain-text "
+                     "excerpt via the Wikimedia Core REST API. Read-only."),
+        max_output_bytes=60_000,
+    )
+    return [
+        (search_spec, WikimediaSearchAdapter(session, search_spec, lease_lookup=lease_lookup)),
+        (get_spec, WikimediaGetPageAdapter(session, get_spec, lease_lookup=lease_lookup)),
+    ]
+
+
+#: provider -> builder(session, lease_lookup) -> [(ToolSpec, adapter), ...]
+ADAPTER_BUILDERS: dict[str, Callable[..., list]] = {
+    "wikimedia": wikimedia_tools,
+}
+
+
+def register_api_tools(
+    catalog: ToolCatalog,
+    session: ApiSession,
+    *,
+    lease_lookup: Callable[[str], Any] | None = None,
+    providers: Iterable[str] | None = None,
+) -> list[str]:
+    """Register the API tools of the given providers (default: the providers
+    enabled in the session's ApiConfig). ALL external API tools are disabled by
+    default: nothing is registered unless the provider is explicitly enabled.
+    SearXNG is never registered in this release (see SEARXNG_PREREQUISITE).
+    Registration != availability: ToolPolicy still decides per agent/tool."""
+    if providers is None:
+        providers = session.auth.apis.enabled
+    registered: list[str] = []
+    for provider in providers:
+        if provider in NEVER_REGISTER:
+            continue  # documented prerequisite not met — stay disabled
+        builder = ADAPTER_BUILDERS.get(provider)
+        if builder is None:
+            continue  # unknown provider: fail closed (no tools)
+        for spec, adapter in builder(session, lease_lookup):
+            catalog.register(spec, adapter)
+            registered.append(spec.name)
+    return registered

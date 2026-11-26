@@ -161,7 +161,7 @@ def build_team(
     # Phase 3: the ToolGateway is ALWAYS wired in production; every tool call goes
     # through it (policy + budgets + validation). Legacy registry path remains only
     # for standalone fixtures that build agents without a gateway.
-    tool_gw = build_tool_gateway(config, store)
+    tool_gw = build_tool_gateway(config, store, lease_lookup=engine.context_for)
     if config.tools is not None:
         engine.tool_budgets = config.tools.budgets
     agents = {
