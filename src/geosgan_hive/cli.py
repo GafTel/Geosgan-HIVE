@@ -172,6 +172,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Required context tokens for --route")
     parser.add_argument("--routing-decisions", action="store_true",
                         help="List durable routing decisions (bounded provenance)")
+    parser.add_argument("--cloud-evidence", action="store_true",
+                        help="List durable cloud evidence records (metadata only; "
+                             "read-only inspection, never authorizes anything)")
+    parser.add_argument("--cloud-evidence-all", action="store_true",
+                        help="Include revoked/expired cloud evidence records")
     parser.add_argument("--routing-run", default=None,
                         help="Filter --routing-decisions by run id")
     args = parser.parse_args(argv)
@@ -182,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.show_approval or args.approve or args.deny or args.cancel_approval
         or args.tool_executions or args.resolve_execution
         or args.benchmark_simulate or args.benchmark_report or args.benchmark_list
-        or args.route or args.routing_decisions
+        or args.route or args.routing_decisions or args.cloud_evidence
     )
     if args.task is None and not management:
         parser.error("task is required unless a management command is used "
@@ -434,6 +439,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {r['decision_id'][:12]} run={r['run_id']} agent={r['agent']} "
                       f"mode={r['selection_mode']} selected={r['selected_model']} "
                       f"method={r['scoring_method']} at={r['created_at']}")
+            return 0
+        if args.cloud_evidence:
+            reg = getattr(gateway, "_cloud_registry", None)
+            vault = getattr(reg, "evidence_vault", None) if reg is not None else None
+            if vault is None:
+                print("Cloud evidence vault: not wired "
+                      "(set cloud.evidence_vault: true in the config)")
+                return 0
+            rows = vault.list_evidence(include_revoked=args.cloud_evidence_all,
+                                       include_expired=args.cloud_evidence_all)
+            print(f"Cloud evidence: {len(rows)} record(s) (metadata only; "
+                  "listing never authorizes dispatch)")
+            for r in rows:
+                print(f"  {r['evidence_id'][:12]} provider={r['provider_id']} "
+                      f"class={r['evidence_class']} model={r['model_id']} "
+                      f"restriction={r['spending_restriction']} "
+                      f"overage={r['overage_behavior']} revoked={bool(r['revoked'])} "
+                      f"expires={r['expires_at']}")
             return 0
         if args.resume:
             if args.async_:

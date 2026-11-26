@@ -18,7 +18,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -235,6 +235,48 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_routing_run ON routing_decisions (run_id);
+"""
+
+#: Phase 5 A4: durable cloud billing/eligibility evidence (v12). Metadata only:
+#: NEVER raw credentials (only sha256 fingerprints), never account secrets.
+#: evidence_class distinguishes informational classes (public_docs,
+#: operator_declaration, account_authenticated) from provider_enforced, the
+#: only class that can ever support live-dispatch eligibility. revoked +
+#: audit rows implement revocation; expiry is enforced at read/eligibility time.
+_CLOUD_EVIDENCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cloud_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    evidence_class TEXT NOT NULL CHECK (evidence_class IN (
+        'public_docs', 'operator_declaration', 'account_authenticated',
+        'provider_enforced')),
+    account_org_label TEXT NOT NULL DEFAULT '',
+    credential_fingerprint TEXT,          -- sha256 hex only, never a raw secret
+    model_id TEXT,                        -- exact model binding (NULL = provider-wide)
+    endpoint TEXT,                        -- exact endpoint binding (NULL = provider-wide)
+    billing_plan TEXT NOT NULL DEFAULT '',
+    quota_pool TEXT NOT NULL DEFAULT '',
+    spending_restriction TEXT NOT NULL DEFAULT 'none',
+    overage_behavior TEXT NOT NULL DEFAULT 'unknown',
+    source TEXT NOT NULL,
+    collection_method TEXT NOT NULL DEFAULT '',
+    docs_url TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    collected_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    revocation_reason TEXT NOT NULL DEFAULT '',
+    limitations TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_evidence_provider ON cloud_evidence (provider_id);
+CREATE TABLE IF NOT EXISTS cloud_evidence_audit (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id TEXT NOT NULL,
+    event TEXT NOT NULL,                  -- 'recorded' | 'revoked'
+    detail TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
 """
 
 _QUOTA_KINDS = ("requests", "tokens")
@@ -648,6 +690,7 @@ class CheckpointStore:
             _exec_schema(self._conn, _API_SCHEMA)      # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _BENCHMARK_SCHEMA)  # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _ROUTING_SCHEMA)    # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)  # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -681,6 +724,8 @@ class CheckpointStore:
                         self._migrate_9_to_10()
                     elif v == 10:
                         self._migrate_10_to_11()
+                    elif v == 11:
+                        self._migrate_11_to_12()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -827,6 +872,16 @@ class CheckpointStore:
                 "DEFAULT ''")
         self._conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(11),)
+        )
+
+    def _migrate_11_to_12(self) -> None:
+        """v11 -> v12 (Phase 5 A4): adds cloud_evidence + cloud_evidence_audit
+        (durable, metadata-only cloud billing/eligibility evidence). Purely
+        additive (IF NOT EXISTS); all v11 data preserved. Runs inside the
+        caller's open transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _CLOUD_EVIDENCE_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(12),)
         )
 
     def _harden_permissions(self) -> None:

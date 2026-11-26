@@ -150,7 +150,18 @@ def build_team(
                 "(set_cloud_registry/set_cloud_gate) — failing closed instead of "
                 "running without the zero-cost gate"
             )
-        reg = CloudProfileRegistry.from_config(config.cloud)
+        evidence_vault = None
+        if getattr(config.cloud, "evidence_vault", False):
+            if store is None:
+                raise ConfigError(
+                    "cloud.evidence_vault=true requires a durable checkpoint store "
+                    "(the vault lives in schema v12) — refusing to run without it")
+            from .cloud_evidence import CloudEvidenceVault
+
+            # accept_provider_enforced stays False: config can never mint the
+            # authorizing evidence class; ingestion is a separate future gate
+            evidence_vault = CloudEvidenceVault(store)
+        reg = CloudProfileRegistry.from_config(config.cloud, evidence_vault=evidence_vault)
         gateway.set_cloud_registry(reg)
         if reg.zero_cost:
             if store is None or getattr(store, "path", None) == ":memory:":

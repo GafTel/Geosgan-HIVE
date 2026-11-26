@@ -289,7 +289,7 @@ def test_v8_to_v9_migration_preserves_data_and_rolls_back(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "11"
+    assert v == "12"
     assert {"api_reservations", "api_usage", "api_audit", "benchmark_evidence",
             "routing_decisions"} <= tables
     assert store.get_reservation("d-old")["dispatch_id"] == "d-old"  # v8 data preserved
@@ -325,7 +325,7 @@ def test_v8_to_v9_migration_preserves_data_and_rolls_back(tmp_path):
     with store._lock:
         v = store._conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert v == "11"
+    assert v == "12"
     store.close()
 
 

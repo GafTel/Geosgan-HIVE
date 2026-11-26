@@ -50,6 +50,13 @@ from .checkpoints import (
     QuotaReservationOutcome,
     RunCheckpoint,
 )
+from .cloud_evidence import (
+    CloudEvidenceRecord,
+    CloudEvidenceVault,
+    EvidenceClass,
+    OverageBehavior,
+    SpendingRestriction,
+)
 from .cloud_gate import ZeroCostGate
 from .cloud_profiles import (
     AdapterCapabilities,
@@ -203,6 +210,11 @@ __all__ = [
     "run_benchmark",
     "format_report",
     "CandidateEvaluation",
+    "CloudEvidenceRecord",
+    "CloudEvidenceVault",
+    "EvidenceClass",
+    "OverageBehavior",
+    "SpendingRestriction",
     "ModelRouter",
     "PrivacyLevel",
     "RoutingDecision",

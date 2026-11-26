@@ -162,6 +162,11 @@ class CloudConfig(BaseModel):
     #: billing verification is actually implemented (attestation alone is a
     #: claim, not evidence).
     trusted_evidence_binding: bool = False
+    #: Phase 5 A4: wire the durable cloud-evidence vault (schema v12) so cloud
+    #: live dispatch additionally requires provider_enforced vault evidence.
+    #: Default False (vault not consulted). Evidence import never activates
+    #: anything by itself; Groq/OpenRouter stay blocked in v0.7.0.
+    evidence_vault: bool = False
 
     @model_validator(mode="after")
     def _zero_cost_spend_rule(self) -> CloudConfig:

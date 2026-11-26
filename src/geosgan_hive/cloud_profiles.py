@@ -325,6 +325,7 @@ class CloudProfileRegistry:
         allowed_providers: list[str] | None = None,
         max_spend_usd: float | None = None,
         trusted_evidence_binding: bool = False,
+        evidence_vault: Any = None,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         if zero_cost and max_spend_usd != 0.0:
@@ -417,6 +418,10 @@ class CloudProfileRegistry:
         )
         object.__setattr__(self, "_fp_of_model", MappingProxyType(fp_of_model))
         object.__setattr__(self, "trusted_evidence_binding", bool(trusted_evidence_binding))
+        # Phase 5 A4: optional durable evidence vault. When wired, cloud (non
+        # local-inference) live dispatch additionally requires provider_enforced
+        # vault evidence matching the exact binding. Opt-in via config flag.
+        object.__setattr__(self, "evidence_vault", evidence_vault)
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -427,15 +432,17 @@ class CloudProfileRegistry:
         object.__setattr__(self, name, value)
 
     @classmethod
-    def from_config(cls, cloud: CloudConfig | None) -> CloudProfileRegistry:
+    def from_config(cls, cloud: CloudConfig | None, *,
+                    evidence_vault: Any = None) -> CloudProfileRegistry:
         if cloud is None:
-            return cls(profiles=(), zero_cost=False)
+            return cls(profiles=(), zero_cost=False, evidence_vault=evidence_vault)
         return cls(
             profiles=tuple(cloud.profiles),
             zero_cost=cloud.zero_cost,
             allowed_providers=cloud.allowed_providers,
             max_spend_usd=cloud.max_spend_usd,
             trusted_evidence_binding=getattr(cloud, "trusted_evidence_binding", False),
+            evidence_vault=evidence_vault,
         )
 
     def profile_for(self, model: str) -> CloudProfile | None:
@@ -541,6 +548,19 @@ class CloudProfileRegistry:
             return False, (
                 f"free-allowance evidence for {model!r} is not credential-bound"
             )
+        # Phase 5 A4: when a durable evidence vault is wired, cloud (non-local)
+        # live dispatch additionally requires provider_enforced vault evidence
+        # bound to the exact provider/model/endpoint/account fingerprint.
+        vault = getattr(self, "evidence_vault", None)
+        if vault is not None and enf != BillingEnforcement.LOCAL_INFERENCE:
+            ok_v, why_v = vault.eligible_for_live_dispatch(
+                provider_id=p.provider, model_id=model,
+                endpoint=ev.endpoint, account_fingerprint=ev.account_fingerprint,
+                now=now)
+            if not ok_v:
+                return False, (
+                    f"cloud evidence vault: {why_v} — no provider-enforced "
+                    f"zero-cost evidence for {model!r}; live dispatch stays blocked")
         return True, (
             "free_tier_verified + evidence bound to account/provider/endpoint + "
             f"billing enforcement={enf.value} + attestation current"
