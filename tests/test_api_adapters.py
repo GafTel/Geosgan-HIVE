@@ -222,12 +222,27 @@ def test_wikimedia_invalid_args_and_traversal_rejected(tmp_path, wiki_server):
                 {"query": "x", "extra": 1}):
         r = gw.execute("wikimedia_search", bad, ctx=ctx())
         assert not r.ok
-    # traversal-ish titles rejected before any request
+    # traversal-ish / pre-encoded / control-char titles rejected before any request
     hits = len(WikiHandler.hits)
-    for bad_title in ("../secret", "a/b", "a%2fb", "..", "x y z!@#"):
+    for bad_title in ("../secret", "a/b", "a%2fb", "..", "a\\b", "x\x01y"):
         r = gw.execute("wikimedia_get_page", {"title": bad_title}, ctx=ctx())
         assert not r.ok, bad_title
     assert len(WikiHandler.hits) == hits  # nothing was sent
+    store.close()
+
+
+def test_wikimedia_unicode_title_sent_canonically_encoded(tmp_path, wiki_server):
+    """A Unicode title goes on the wire as canonical ASCII percent-escapes."""
+    session, store = make_session(tmp_path, wiki_server, wikimedia_apis())
+    gw, _ = make_gateway(session, store)
+    r = gw.execute("wikimedia_get_page", {"title": "H\u00edve bee", "language": "en"},
+                   ctx=ctx())
+    assert r.ok, r.error
+    hit = WikiHandler.hits[-1]
+    assert hit.isascii()
+    assert hit == "/core/v1/wikipedia/en/page/H%C3%ADve_bee/bare"
+    out = json.loads(r.output)
+    assert out["url"] == "https://en.wikipedia.org/wiki/H%C3%ADve_bee"
     store.close()
 
 
@@ -485,10 +500,25 @@ def test_crossref_get_doi_and_invalid_doi_rejected(tmp_path, crossref_server):
     assert CrossrefHandler.hits[0] == "/works/10.1234/abc"
     hits = len(CrossrefHandler.hits)
     for bad in ("10.1234/../etc", "not-a-doi", "10.1234/a b", "10.1234/a%2fb",
-                "10.1234/x()y"):
+                "10.1234/.", "11.1234/abc"):
         r = gw.execute("crossref_get_doi", {"doi": bad}, ctx=ctx())
         assert not r.ok, bad
     assert len(CrossrefHandler.hits) == hits  # rejected before any request
+    store.close()
+
+
+def test_crossref_doi_with_legal_special_chars_encoded(tmp_path, crossref_server):
+    """Legal DOI characters (parentheses, colons, angle brackets) are supported
+    via canonical per-segment percent-encoding; the request line stays ASCII."""
+    session, store = make_crossref_session(tmp_path, crossref_server, crossref_apis())
+    gw, _ = crossref_gateway(session, store)
+    doi = "10.1002/(SICI)1097-4628(19980101)63:1<69::AID-APP4>3.0.CO;2-Z"
+    r = gw.execute("crossref_get_doi", {"doi": doi}, ctx=ctx())
+    assert r.ok, r.error
+    hit = CrossrefHandler.hits[-1]
+    assert hit.isascii()
+    assert hit.startswith("/works/10.1002/%28SICI%291097-4628%2819980101%2963%3A1")
+    assert "%3C69%3A%3AAID-APP4%3E3.0.CO%3B2-Z" in hit
     store.close()
 
 

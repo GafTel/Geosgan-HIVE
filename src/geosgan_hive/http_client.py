@@ -52,7 +52,7 @@ import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,7 +69,15 @@ from .errors import (
 
 _LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 _PARAM_KEY = re.compile(r"^[a-z_][a-z0-9_]{0,63}$")
-_PATH_SAFE = re.compile(r"^[a-zA-Z0-9_./-]*$")
+#: request-line path charset: unreserved + sub-delims we admit raw, plus '%'
+#: for CANONICAL percent-escapes (validated segment-by-segment in
+#: _validate_path_encoding: valid triplets, canonical uppercase hex, no double
+#: encoding, no encoded separators, no control chars, no traversal).
+_PATH_SAFE = re.compile(r"^[a-zA-Z0-9_./%~-]*$")
+#: allowlist prefixes must be plain (no percent-escapes at all)
+_PATH_SAFE_PREFIX = re.compile(r"^[a-zA-Z0-9_./~-]*$")
+#: a '%' not followed by exactly two hex digits
+_PCT_MALFORMED = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class HttpLimits(BaseModel):
@@ -128,7 +136,7 @@ class EndpointRule(BaseModel):
     @classmethod
     def _prefixes_safe(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         for p in v:
-            if (not p.startswith("/") or not _PATH_SAFE.match(p) or "//" in p
+            if (not p.startswith("/") or not _PATH_SAFE_PREFIX.match(p) or "//" in p
                     or ".." in p.split("/") or "." in p.split("/")):
                 raise ValueError(f"unsafe path prefix {p!r}")
         return v
@@ -139,6 +147,42 @@ class EndpointRule(BaseModel):
 
 def _normalize_prefix(prefix: str) -> str:
     return prefix.rstrip("/") or "/"
+
+
+def _validate_path_encoding(path: str) -> None:
+    """Strict validation of percent-escapes in a request path (fail closed):
+    - every '%' must be followed by exactly two hex digits (no malformed escapes);
+    - each segment, once decoded as UTF-8, must re-encode EXACTLY to the raw
+      segment (canonical uppercase-hex UTF-8 encoding \u2014 rejects non-canonical
+      forms such as lowercase hex);
+    - the decoded segment must not contain '%' (double encoding), '/', '\\',
+      control characters, and must not be '.' or '..' (encoded traversal /
+      encoded separators are rejected even though the raw text looks harmless).
+    Raises EndpointNotAllowedError on any violation."""
+    if _PCT_MALFORMED.search(path):
+        raise EndpointNotAllowedError(f"malformed percent-escape in path {path!r}")
+    for seg in path.split("/"):
+        if "%" not in seg:
+            continue
+        try:
+            dec = unquote(seg, encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise EndpointNotAllowedError(
+                f"invalid UTF-8 percent-escape in path {path!r}") from exc
+        if "%" in dec:
+            raise EndpointNotAllowedError(
+                f"double-encoded percent-escape in path {path!r}")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in dec):
+            raise EndpointNotAllowedError(
+                f"control character via percent-escape in path {path!r}")
+        if "/" in dec or "\\" in dec:
+            raise EndpointNotAllowedError(
+                f"encoded path separator in {path!r}")
+        if dec in (".", ".."):
+            raise EndpointNotAllowedError(f"encoded traversal segment in {path!r}")
+        if quote(dec, safe="") != seg:
+            raise EndpointNotAllowedError(
+                f"non-canonical percent-encoding in path {path!r}")
 
 
 def _path_allowed(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -566,6 +610,7 @@ class SecureHttpClient:
                 f"method {method!r} not allowed on endpoint {rule.endpoint_id!r}")
         if not _PATH_SAFE.match(path) or not path.startswith("/"):
             raise EndpointNotAllowedError(f"unsafe path {path!r}")
+        _validate_path_encoding(path)  # canonical escapes only; fail closed
         if any(seg in ("..", ".") for seg in path.split("/")):
             raise EndpointNotAllowedError(f"path traversal segment in {path!r}")
         if not _path_allowed(path, rule.path_prefixes):

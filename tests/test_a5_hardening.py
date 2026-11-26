@@ -299,6 +299,39 @@ def test_root_prefix_allows_any_absolute_path():
         c._validate_request_line(rule, "GET", "/../etc/passwd", None)
 
 
+def test_path_percent_encoding_canonical_and_fail_closed():
+    """Canonical UTF-8 percent-escapes are allowed on request paths; every
+    hostile encoding (malformed, double-encoded, encoded separator/traversal/
+    control, non-canonical hex) is rejected fail-closed."""
+    c = make_client(80, prefixes=("/",))
+    rule = c.rule_for("test-api")
+    ok = [
+        "/core/v1/wikipedia/es/page/H%C3%ADve/bare",
+        "/works/10.1002/%28SICI%291097-4628/x",
+        "/plain/path-._~ok",
+        "/a%F0%9F%90%9D",  # emoji
+    ]
+    for path in ok:
+        c._validate_request_line(rule, "GET", path, None)  # must not raise
+    bad = [
+        "/x%2f..%2fetc",     # encoded separator + traversal
+        "/x%252f",           # double encoding
+        "/x%2e%2e",          # encoded '..'
+        "/x%2E%2E",          # encoded '..' (uppercase hex still traversal)
+        "/x%00", "/x%0a",    # control chars
+        "/x%", "/x%2", "/x%zz",  # malformed escapes
+        "/x%c3%28",          # lowercase hex = non-canonical
+        "/x%7E",             # '~' must be raw, not escaped
+        "/a%2Fb",
+    ]
+    for path in bad:
+        with pytest.raises(EndpointNotAllowedError):
+            c._validate_request_line(rule, "GET", path, None)
+    # prefix rules themselves still reject percent-escapes at construction
+    with pytest.raises(ValidationError):
+        _rule(("/w/api%2f",))
+
+
 def test_rule_rejects_unsafe_prefixes_at_construction():
     for bad in ("w/api", "/w/../x", "/w/api%2f", "//"):
         with pytest.raises(ValidationError):

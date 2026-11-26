@@ -38,6 +38,7 @@ import json
 import re
 from collections.abc import Callable, Iterable
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -63,8 +64,14 @@ SEARXNG_PREREQUISITE = (
 #: Providers that can never be registered as tools in this release.
 NEVER_REGISTER = frozenset({"searxng"})
 
-_TITLE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,200}$")
-_DOI_RE = re.compile(r"^10\.\d{4,9}/[A-Za-z0-9._\-]{1,200}$")
+#: titles may contain any printable Unicode; the path builder applies canonical
+#: UTF-8 percent-encoding and the transport validates every escape fail-closed.
+#: Raw '/', '\\' and '%' are rejected here (separators / pre-encoded input).
+_TITLE_FORBIDDEN = re.compile(r"[/\\%]|[\x00-\x1f\x7f]")
+#: DOI shape: '10.<registrant>/<suffix>'; the suffix segments may contain any
+#: non-space character except '/', '\\', '%' (parentheses, colons, etc. are
+#: legal DOI characters and are percent-encoded by the path builder).
+_DOI_RE = re.compile(r"^10\.\d{4,9}(/[^\s/%\\\x00-\x1f\x7f]{1,200})+$")
 _GH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 _WB_COUNTRY_RE = re.compile(r"^[A-Za-z]{2,3}$")
 _WB_INDICATOR_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -88,7 +95,11 @@ def _strip_tags(html: Any, cap: int) -> str:
 
 
 def _bounded_str(v: Any, cap: int) -> str:
-    return v if isinstance(v, str) else ""
+    """Coerce to str and HARD-BOUND the length (untrusted external content is
+    never trusted to be small); non-strings become empty."""
+    if not isinstance(v, str):
+        return ""
+    return v[:cap] if len(v) > cap else v
 
 
 class ApiToolAdapter:
@@ -216,12 +227,15 @@ class WikimediaGetPageInput(BaseModel):
     @field_validator("title")
     @classmethod
     def _title_safe(cls, v: str) -> str:
-        # spaces canonicalize to underscores; the remaining charset is exactly
-        # what the transport's path validator allows (no '/', no '%', no '..')
+        # spaces canonicalize to underscores; any other printable Unicode is
+        # allowed and canonically percent-encoded by the path builder. Raw '/',
+        # backslash, '%', control chars and '.'/'..' are rejected fail-closed
+        # (the transport re-validates every escape).
         t = v.strip().replace(" ", "_")
-        if not _TITLE_RE.match(t) or ".." in t.split("_"):
-            raise ValueError("title contains unsupported characters (allowed: letters, "
-                             "digits, '_', '.', '-'; spaces become '_')")
+        if not t or len(t) > 200 or t in (".", "..") or _TITLE_FORBIDDEN.search(t):
+            raise ValueError(
+                "unsafe title (no '/', backslash, '%', control characters, '.' or "
+                "'..'; spaces become '_'; Unicode is percent-encoded on the wire)")
         return t
 
 
@@ -268,7 +282,11 @@ class WikimediaGetPageAdapter(ApiToolAdapter):
 
     def build_request(self, args):
         lang = args["language"]
-        return (f"/core/v1/wikipedia/{lang}/page/{args['title']}/bare", {})
+        # canonical UTF-8 percent-encoding keeps the request line pure ASCII;
+        # the transport validates every escape (no traversal / separators /
+        # double encoding can survive)
+        title_enc = quote(args["title"], safe="")
+        return (f"/core/v1/wikipedia/{lang}/page/{title_enc}/bare", {})
 
     def normalize(self, payload, args):
         if not isinstance(payload, dict):
@@ -278,7 +296,7 @@ class WikimediaGetPageAdapter(ApiToolAdapter):
         return {
             "kind": "page",
             "title": title,
-            "url": f"https://{lang}.wikipedia.org/wiki/{args['title']}",
+            "url": f"https://{lang}.wikipedia.org/wiki/{quote(args['title'], safe='')}",
             "excerpt": _strip_tags(payload.get("html"), 8_000),
             "attribution": ("Wikimedia Foundation content, typically CC BY-SA 4.0. "
                             "Untrusted, not fact-checked."),
@@ -354,17 +372,20 @@ class CrossrefGetDoiInput(BaseModel):
     @classmethod
     def _doi_safe(cls, v: str) -> str:
         d = v.strip()
-        # charset restricted to what the transport path validator allows
-        # (no '/', '%', control chars; the leading '10.' prefix is a slash-free
-        # segment boundary handled by the path builder below)
+        # the DOI's '/' characters are kept as real path-segment boundaries; each
+        # suffix segment is canonically percent-encoded by the path builder, so
+        # legal DOI characters (parentheses, colons, ...) are supported safely.
+        # Raw '%' is rejected here (no pre-encoded input / no double encoding).
         if not _DOI_RE.match(d):
-            raise ValueError("doi must look like 10.1234/abc-def (allowed chars: "
-                             "letters, digits, '.', '_', '-'; no parentheses)")
+            raise ValueError("doi must look like 10.1234/abc-def (suffix: any "
+                             "non-space chars except '/', backslash, '%', controls)")
+        if any(seg in (".", "..") for seg in d.split("/")[1:]):
+            raise ValueError("doi suffix must not contain '.' or '..' segments")
         return d
 
 
 _CROSSREF_SELECT = ("DOI,title,author,published,container-title,URL,license,type,"
-                    "publisher,volume,page")
+                    "publisher,volume,page,reference,reference-count")
 
 
 def _crossref_item(msg: Any) -> dict[str, Any]:
@@ -395,6 +416,24 @@ def _crossref_item(msg: Any) -> dict[str, Any]:
     lic = msg.get("license")
     if isinstance(lic, list) and lic and isinstance(lic[0], dict):
         license_url = _bounded_str(lic[0].get("URL"), 300)
+    # bibliographic REFERENCES are the publication's own 'reference' records —
+    # extracted from those records only, never confused with the publication's
+    # own metadata; bounded count + bounded fields
+    references = []
+    raw_refs = msg.get("reference")
+    if isinstance(raw_refs, list):
+        for ref in raw_refs[:25]:
+            if not isinstance(ref, dict):
+                continue
+            references.append({
+                "doi": _bounded_str(ref.get("DOI") or ref.get("doi"), 300),
+                "article_title": _bounded_str(ref.get("article-title"), 500),
+                "author": _bounded_str(ref.get("author"), 300),
+                "year": _bounded_str(ref.get("year"), 20),
+                "journal_title": _bounded_str(ref.get("journal-title"), 300),
+                "unstructured": _bounded_str(ref.get("unstructured"), 500),
+            })
+    ref_count = msg.get("reference-count")
     return {
         "doi": _bounded_str(msg.get("DOI"), 300),
         "title": title_s,
@@ -405,6 +444,9 @@ def _crossref_item(msg: Any) -> dict[str, Any]:
         "license": license_url,
         "type": _bounded_str(msg.get("type"), 60),
         "publisher": _bounded_str(msg.get("publisher"), 200),
+        "reference_count": (int(ref_count) if isinstance(ref_count, int)
+                            and 0 <= ref_count <= 100_000 else None),
+        "references": references,
     }
 
 
@@ -444,8 +486,11 @@ class CrossrefGetDoiAdapter(ApiToolAdapter):
     operation_id = "get_doi"
 
     def build_request(self, args):
-        # the DOI's '/' is a path-segment boundary; charset already restricted
-        return f"/works/{args['doi']}", {}
+        # the DOI's '/' stays a real path-segment boundary; each segment is
+        # canonically percent-encoded (parentheses etc. become %28/%29) and the
+        # transport re-validates every escape fail-closed
+        segs = "/".join(quote(s, safe="") for s in args["doi"].split("/"))
+        return f"/works/{segs}", {}
 
     def normalize(self, payload, args):
         msg = payload.get("message") if isinstance(payload, dict) else None
