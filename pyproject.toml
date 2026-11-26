@@ -20,6 +20,17 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+# W-stage (v0.8.0 Web & Document Engine) optional document libraries, approved by
+# the owner: all permissively licensed, $0, executed locally, no network. They
+# are LAZY-LOADED only by the document stages (W4/W5); without this extra the
+# package imports and runs fully offline (document tools stay unregistered).
+docs = [
+    "pypdf>=5",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "reportlab>=4",
+    "defusedxml>=0.7",
+]
 
 [project.scripts]
 geosgan-hive = "geosgan_hive.cli:main"

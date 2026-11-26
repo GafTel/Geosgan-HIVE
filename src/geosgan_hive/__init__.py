@@ -142,6 +142,15 @@ from .outbound import (
     build_api_session,
     canonical_request_digest,
 )
+from .parser_isolation import (
+    ParserIsolationError,
+    ParserJobRejected,
+    ParserJobResult,
+    ParserJobTimeout,
+    ParserResourceLimits,
+    ParserWorkerPool,
+    ParserWorkerUnavailable,
+)
 from .providers import (
     Credentials,
     ModelCapabilities,
@@ -227,6 +236,13 @@ __all__ = [
     "OutboundAuthorizer",
     "OutboundDecision",
     "OutboundPolicy",
+    "ParserIsolationError",
+    "ParserJobRejected",
+    "ParserJobResult",
+    "ParserJobTimeout",
+    "ParserResourceLimits",
+    "ParserWorkerPool",
+    "ParserWorkerUnavailable",
     "SecureHttpClient",
     "TransportConfig",
     "build_api_session",
