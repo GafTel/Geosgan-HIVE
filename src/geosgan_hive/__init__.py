@@ -29,6 +29,18 @@ from .agents import (
     parse_delegation_call,
     parse_tool_call,
 )
+from .catalog import (
+    BillingClassification,
+    CatalogModel,
+    CatalogProvider,
+    EvidenceRecord,
+    OperationalStatus,
+    ProviderCatalog,
+    ProviderCategory,
+    QuotaDimension,
+    catalog_from_dict,
+    load_catalog,
+)
 from .checkpoints import (
     CheckpointStore,
     ExecutionState,
@@ -145,8 +157,18 @@ __version__ = "0.6.0"
 
 __all__ = [
     "AdapterCapabilities",
+    "BillingClassification",
     "BillingEnforcement",
     "BillingModel",
+    "CatalogModel",
+    "CatalogProvider",
+    "EvidenceRecord",
+    "OperationalStatus",
+    "ProviderCatalog",
+    "ProviderCategory",
+    "QuotaDimension",
+    "catalog_from_dict",
+    "load_catalog",
     "TokenEstimationMode",
     "VerificationEvidence",
     "ZeroCostGate",
