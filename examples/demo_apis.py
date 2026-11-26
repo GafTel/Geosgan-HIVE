@@ -23,7 +23,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from geosgan_hive.agent_config import ApiConfig
-from geosgan_hive.api_adapters import register_api_tools
+from geosgan_hive.api_adapters import _CROSSREF_SELECT, register_api_tools
 from geosgan_hive.approvals import ApprovalManager
 from geosgan_hive.checkpoints import CheckpointStore
 from geosgan_hive.http_client import EndpointRule, HttpLimits, SecureHttpClient, TransportConfig
@@ -141,9 +141,7 @@ def main():
                                     "method": "GET", "path": "/works",
                                     "params": {"mailto": "operator@example.org",
                                                "query": "swarm", "rows": 10,
-                                               "select": ("DOI,title,author,published,"
-                                                          "container-title,URL,license,type,"
-                                                          "publisher,volume,page")},
+                                               "select": _CROSSREF_SELECT},
                                     "body_sha256": hashlib.sha256(b"").hexdigest()},
                                 agent="researcher", run_id=None, task_id=None)
     store.decide_approval(req.approval_id, decision="approved", operator="operator-1")

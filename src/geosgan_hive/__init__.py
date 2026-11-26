@@ -151,6 +151,15 @@ from .quota_engine import (
 )
 from .recovery import RecoveryWorker
 from .retry import RetryPolicy, is_retryable
+from .routing import (
+    CandidateEvaluation,
+    ModelRouter,
+    PrivacyLevel,
+    RoutingDecision,
+    RoutingMode,
+    RoutingPolicy,
+    RoutingWeights,
+)
 from .run_context import (
     CollaborationEvent,
     CollaborationPolicy,
@@ -193,6 +202,13 @@ __all__ = [
     "SimulatedCaller",
     "run_benchmark",
     "format_report",
+    "CandidateEvaluation",
+    "ModelRouter",
+    "PrivacyLevel",
+    "RoutingDecision",
+    "RoutingMode",
+    "RoutingPolicy",
+    "RoutingWeights",
     "EndpointRule",
     "HttpLimits",
     "HttpResult",

@@ -130,7 +130,7 @@ class CatalogModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    model_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:/-]{0,127}$")
+    model_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.:/@-]{0,127}$")  # @ pins a version
     capabilities: tuple[str, ...] = Field(default_factory=tuple)
     context_window: int | None = Field(default=None, ge=1)
     tool_support: bool = False

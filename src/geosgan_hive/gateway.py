@@ -548,11 +548,14 @@ class ModelGateway:
         timeout_seconds: float | None = None,
         fallback: FallbackPolicy | None = None,
         needs_tools: bool = False,
+        router: Any = None,
     ) -> GatewayLLMClient:
         """Create an LLMClient bound to one agent's model, backed by this gateway.
 
         `fallback` is the agent-level fallback policy (None = gateway default);
         `needs_tools` feeds the capability gate (model must support tool calling).
+        `router` (Phase 5 A3) optionally selects the dispatch model via the
+        policy-first router; without it the fixed `model` is used.
         """
         parse_model(model)  # fail fast on an invalid model string
         return GatewayLLMClient(
@@ -564,6 +567,7 @@ class ModelGateway:
             timeout_seconds=timeout_seconds,
             fallback=fallback,
             needs_tools=needs_tools,
+            router=router,
         )
 
     def complete(
@@ -1170,6 +1174,7 @@ class GatewayLLMClient:
         timeout_seconds: float | None = None,
         fallback: FallbackPolicy | None = None,
         needs_tools: bool = False,
+        router: Any = None,
     ) -> None:
         self.gateway = gateway
         self.model = model
@@ -1179,6 +1184,32 @@ class GatewayLLMClient:
         self.timeout_seconds = timeout_seconds
         self.fallback = fallback
         self.needs_tools = needs_tools
+        # Phase 5 A3: optional policy-first router. It only SELECTS an eligible
+        # model (never authorizes dispatch); the zero-cost gate still
+        # revalidates everything immediately before the physical call.
+        self.router = router
+
+    def _resolve_model(self, run_id: str | None) -> str:
+        """Resolve the dispatch model through the router when wired (filters +
+        mode + immediate revalidation). Returns the configured model when no
+        router is wired (legacy fixed behavior). Fails closed when the router
+        selects nothing."""
+        if self.router is None:
+            return self.model
+        decision = self.router.select(
+            agent=self.agent or "agent", run_id=run_id,
+            configured_model=self.model, needs_tools=self.needs_tools)
+        if decision.selected_model is None:
+            raise ConfigError(
+                f"routing: no eligible model for agent {self.agent!r} "
+                f"(mode={decision.selection_mode}, reason={decision.reason})")
+        ok, reason = self.router.revalidate(decision, configured_model=self.model,
+                                            needs_tools=self.needs_tools)
+        if not ok:
+            raise ConfigError(
+                f"routing: selected model {decision.selected_model!r} no longer "
+                f"eligible at dispatch time (reason={reason})")
+        return decision.selected_model
 
     def complete(
         self,
@@ -1189,7 +1220,7 @@ class GatewayLLMClient:
     ) -> str:
         return self.gateway.complete(
             messages,
-            model=self.model,
+            model=self._resolve_model(run_id),
             agent=self.agent,
             run_id=run_id,
             temperature=self.temperature if temperature is None else temperature,
@@ -1208,7 +1239,7 @@ class GatewayLLMClient:
     ) -> str:
         return await self.gateway.acomplete(
             messages,
-            model=self.model,
+            model=self._resolve_model(run_id),
             agent=self.agent,
             run_id=run_id,
             temperature=self.temperature if temperature is None else temperature,

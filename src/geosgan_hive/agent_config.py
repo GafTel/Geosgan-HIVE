@@ -15,6 +15,7 @@ from .cloud_profiles import CloudProfile
 from .errors import ConfigError, HiveError
 from .fallback import FallbackMode, FallbackPolicy
 from .providers import parse_model
+from .routing import RoutingPolicy
 from .run_context import CollaborationPolicy
 from .tool_spec import ToolBudgets
 
@@ -357,6 +358,12 @@ class HiveConfig(BaseModel):
     tools: ToolsConfig | None = None  # None = legacy built-in tools only; block = explicit
     cloud: CloudConfig | None = None  # Phase 4: None = legacy cost_tier semantics
     apis: ApiConfig | None = None  # Phase 5 (A5/A6): None = all external APIs DISABLED
+    #: Phase 5 A3: informational provider catalog path (None = router works without
+    #: catalog and then fails closed on catalog-dependent checks)
+    catalog_path: str | None = None
+    #: Phase 5 A3: intelligent routing policy (None = fixed configured models only;
+    #: automatic routing is OFF unless explicitly configured here)
+    routing: RoutingPolicy | None = None
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:

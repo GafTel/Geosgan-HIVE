@@ -25,10 +25,13 @@ def build_agent(
     collaboration: CollaborationEngine | None = None,
     global_fallback: FallbackPolicy | None = None,
     tool_gateway: Any = None,
+    router: Any = None,
 ) -> Agent:
     """Build one specialist agent from its spec: own model, permissions, limits."""
     registry = tools if tools is not None else default_registry()
     policy = effective_policy(spec.fallback, global_fallback or FallbackPolicy())
+    # router is only passed when explicitly configured AND the gateway supports it
+    bind_extra = {"router": router} if router is not None else {}
     llm = gateway.bind(
         spec.model,
         agent=spec.name,
@@ -37,6 +40,7 @@ def build_agent(
         timeout_seconds=spec.limits.timeout_seconds,
         fallback=policy,
         needs_tools=spec.permissions.allow_tools and bool(spec.permissions.allowed_tools),
+        **bind_extra,
     )
     return Agent(
         spec.name,
@@ -62,8 +66,10 @@ def build_supervisor(
     global_fallback: FallbackPolicy | None = None,
     checkpoint_store: CheckpointStore | None = None,
     checkpoint_config_json: str | None = None,
+    router: Any = None,
 ) -> Supervisor:
     policy = effective_policy(spec.fallback, global_fallback or FallbackPolicy())
+    bind_extra = {"router": router} if router is not None else {}
     llm = gateway.bind(
         spec.model,
         agent=spec.name,
@@ -72,6 +78,7 @@ def build_supervisor(
         timeout_seconds=spec.limits.timeout_seconds,
         fallback=policy,
         needs_tools=False,
+        **bind_extra,
     )
     return Supervisor(
         agents,
@@ -164,15 +171,43 @@ def build_team(
     tool_gw = build_tool_gateway(config, store, lease_lookup=engine.context_for)
     if config.tools is not None:
         engine.tool_budgets = config.tools.budgets
+    # Phase 5 A3: policy-first router (only when explicitly configured; automatic
+    # routing is OFF by default). The router selects eligible models but never
+    # authorizes dispatch - the zero-cost gate still enforces at dispatch time.
+    router = None
+    if config.routing is not None:
+        from .catalog import load_catalog
+        from .quota_engine import QuotaEngine
+        from .routing import ModelRouter
+
+        catalog = None
+        if config.catalog_path:
+            catalog = load_catalog(config.catalog_path)
+        gate = gateway.cloud_gate() if hasattr(gateway, "cloud_gate") else None
+        quota_engine = None
+        if gate is not None and getattr(gate, "engine", None) is not None:
+            quota_engine = gate.engine
+        elif config.cloud is not None and store is not None:
+            reg = getattr(gateway, "_cloud_registry", None)
+            if reg is not None:
+                quota_engine = QuotaEngine(store, reg)
+        router = ModelRouter(
+            config.routing,
+            catalog=catalog,
+            cloud_registry=getattr(gateway, "_cloud_registry", None),
+            quota_engine=quota_engine,
+            health=getattr(gateway, "health", None),
+            store=store,
+        )
     agents = {
         spec.name: build_agent(spec, gateway, tracker, tools, engine, config.fallback,
-                               tool_gateway=tool_gw)
+                               tool_gateway=tool_gw, router=router)
         for spec in config.agents
     }
     engine.register(agents)
     supervisor = build_supervisor(
         config.supervisor, agents, gateway, tracker, engine, config.fallback,
-        checkpoint_store=store,
+        checkpoint_store=store, router=router,
         checkpoint_config_json=config.model_dump_json(),
     )
     return supervisor, agents
