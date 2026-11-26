@@ -19,7 +19,14 @@ from .checkpoints import (
     counters_to_json,
     steps_to_json,
 )
-from .errors import CheckpointError, GatewayError, ProviderUnavailableError, QuotaExhaustedError
+from .errors import (
+    CheckpointError,
+    CloudConfigError,
+    CostUnknownError,
+    GatewayError,
+    ProviderUnavailableError,
+    QuotaExhaustedError,
+)
 from .llm import LLMClient
 from .messages import Message
 from .providers import parse_model
@@ -608,6 +615,20 @@ class Supervisor:
                     ),
                     ctx, transcript, failed=True,
                 )
+            except (CloudConfigError, CostUnknownError) as exc:
+                # permanent billing/evidence/configuration failure (e.g. expired
+                # verification evidence, unknown billing exposure): the run must
+                # NOT stay RUNNING indefinitely — fail it, releasing the lease
+                return self._finalize(
+                    run_id, resume_owner,
+                    OrchestratorResult(
+                        task=task,
+                        final_answer=f"Permanent cloud/billing configuration error: {exc}",
+                        route=route, transcript=transcript, steps=step, run_id=run_id,
+                        failed=True,
+                    ),
+                    ctx, transcript, failed=True,
+                )
             calls += 1
             transcript.append(Message(role="assistant", content=raw, agent="supervisor"))
             decision = parse_decision(raw)
@@ -870,6 +891,20 @@ class Supervisor:
                     OrchestratorResult(
                         task=task, final_answer=f"Model gateway error: {exc}", route=route,
                         transcript=transcript, steps=step, run_id=run_id, failed=True,
+                    ),
+                    ctx, transcript, failed=True,
+                )
+            except (CloudConfigError, CostUnknownError) as exc:
+                # permanent billing/evidence/configuration failure (e.g. expired
+                # verification evidence, unknown billing exposure): the run must
+                # NOT stay RUNNING indefinitely — fail it, releasing the lease
+                return self._finalize(
+                    run_id, resume_owner,
+                    OrchestratorResult(
+                        task=task,
+                        final_answer=f"Permanent cloud/billing configuration error: {exc}",
+                        route=route, transcript=transcript, steps=step, run_id=run_id,
+                        failed=True,
                     ),
                     ctx, transcript, failed=True,
                 )

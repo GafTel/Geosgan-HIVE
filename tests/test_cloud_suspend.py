@@ -21,7 +21,7 @@ import pytest
 from geosgan_hive.agent_config import HiveConfig, load_hive_config
 from geosgan_hive.checkpoints import CheckpointStore, ExecutionState, PersistMode, quota_window_for
 from geosgan_hive.cloud_profiles import CloudProfile, TokenEstimate
-from geosgan_hive.errors import CheckpointError, CloudConfigError
+from geosgan_hive.errors import CheckpointError
 from geosgan_hive.factory import build_team
 from geosgan_hive.gateway import ModelGateway
 from geosgan_hive.recovery import RecoveryWorker
@@ -51,6 +51,7 @@ def free_profile(now, anchor, *, max_requests=1, billing="free_tier_verified", f
             "source": "provider_billing_console_export", "evidence_ref": "ev-1",
             "collected_at": (now - timedelta(days=evidence_age_days)).isoformat(),
             "collected_by": "operator-1", "credential_bound": True,
+            "billing_enforcement": "provider_hard_limit",
             "account_fingerprint": fp,
         },
         "quotas": [{"pool": pool, "max_requests": max_requests,
@@ -184,10 +185,14 @@ def test_unknown_billing_is_permanent_never_suspended(tmp_path, monkeypatch, no_
     clock = {"now": t0}
     profile = free_profile(t0, t0 - timedelta(hours=1), billing="unknown")
     sup, store, gw = make_team(tmp_path, clock, profile, monkeypatch)
-    # unknown billing is a permanent condition: the run fails, never suspends
-    with pytest.raises(CloudConfigError, match="billing=unknown"):
-        sup.run("task")
-    assert store.list_suspended() == []
+    # unknown billing is a permanent condition: the run FAILS (never suspends,
+    # never retried by the recovery worker)
+    result = sup.run("task")
+    assert result.failed
+    cp = store.get(result.run_id)
+    assert cp.state == ExecutionState.FAILED
+    assert cp.lease_owner is None  # lease released atomically with the terminal state
+    assert store.list_suspended() == []  # no recovery-worker busy loop
     store.close()
 
 
@@ -206,11 +211,13 @@ def test_expired_evidence_blocks_resume(tmp_path, monkeypatch, no_network):
     expired = free_profile(clock["now"], anchor, max_requests=1,
                            evidence_age_days=100, ttl_days=30)
     sup2, store2, gw2 = make_team(tmp_path, clock, expired, monkeypatch)
-    with pytest.raises(CloudConfigError, match="expired"):
-        sup2.resume(result.run_id)
+    resumed = sup2.resume(result.run_id)
     cp = store2.get(result.run_id)
-    # not silently resumed: the run is never completed under expired evidence
-    assert cp.state != ExecutionState.COMPLETED
+    # expired evidence is permanent: run FAILED (not left RUNNING), lease released
+    assert cp.state == ExecutionState.FAILED
+    assert cp.lease_owner is None
+    assert not resumed.suspended and resumed.failed
+    assert store2.list_eligible() == []  # FAILED runs are never picked up again
     store.close()
     store2.close()
 

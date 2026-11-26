@@ -73,9 +73,12 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None  # malformed Retry-After is ignored, never guessed
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None  # nonfinite/negative hints are not evidence
+    return min(parsed, 86400.0)  # cap excessively large hints (<= 24h) safely
 
 
 def _map_litellm_error(exc: BaseException) -> GatewayError:

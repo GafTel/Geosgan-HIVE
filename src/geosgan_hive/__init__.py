@@ -1,5 +1,14 @@
 """GEOSGAN HIVE: hybrid multi-agent AI system with a collaboration engine."""
 
+import os as _os
+
+# Offline startup: LiteLLM otherwise fetches its remote model-cost map from
+# raw.githubusercontent.com at import time. Use the bundled local cost map so
+# importing/using HIVE performs no outbound network requests unless a live
+# provider call is explicitly made. Supported LiteLLM mechanism (env var must be
+# set before `import litellm`, which happens lazily inside the gateway).
+_os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 from .agent_config import (
     CORE_ROLES,
     AgentSpec,
@@ -30,6 +39,7 @@ from .checkpoints import (
 from .cloud_gate import ZeroCostGate
 from .cloud_profiles import (
     AdapterCapabilities,
+    BillingEnforcement,
     BillingModel,
     CloudProfile,
     CloudProfileRegistry,
@@ -134,6 +144,7 @@ __version__ = "0.5.0"
 
 __all__ = [
     "AdapterCapabilities",
+    "BillingEnforcement",
     "BillingModel",
     "TokenEstimationMode",
     "VerificationEvidence",

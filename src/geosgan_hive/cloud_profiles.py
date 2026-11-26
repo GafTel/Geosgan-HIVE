@@ -52,6 +52,23 @@ class QuotaPeriod(StrEnum):
     MONTH = "month"
 
 
+class BillingEnforcement(StrEnum):
+    """How zero billing exposure is ESTABLISHED provider-side (not inferred from
+    model names or local accounting):
+
+    - PROVIDER_HARD_LIMIT: the provider enforces a hard free cap server-side.
+    - FREE_ALLOWANCE_NO_OVERAGE: free allowance with overage billing verifiably
+      disabled (requires credential binding + overage attestation).
+    - LOCAL_INFERENCE: local model (ollama) — no per-request provider billing.
+    - UNKNOWN: no evidence — FREE_ONLY denies dispatch (fail closed).
+    """
+
+    PROVIDER_HARD_LIMIT = "provider_hard_limit"
+    FREE_ALLOWANCE_NO_OVERAGE = "free_allowance_no_overage"
+    LOCAL_INFERENCE = "local_inference"
+    UNKNOWN = "unknown"
+
+
 class QuotaResetSemantics(StrEnum):
     """Evidence level for provider quota-RESET behavior. UNKNOWN fails closed in
     the QuotaEngine: an arbitrary window anchor alone is NOT evidence that the
@@ -96,6 +113,8 @@ class VerificationEvidence(BaseModel):
     #: profile's provider / the request's endpoint at dispatch time.
     provider: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
     endpoint: str | None = Field(default=None, pattern=r"^https?://[a-zA-Z0-9.-]{1,253}(:[0-9]{1,5})?(/[a-zA-Z0-9_./-]*)?$")
+    #: how zero billing exposure is established; UNKNOWN (default) fails closed
+    billing_enforcement: BillingEnforcement = BillingEnforcement.UNKNOWN
 
     @field_validator("collected_at")
     @classmethod
@@ -479,10 +498,37 @@ class CloudProfileRegistry:
         if not self.trusted_evidence_binding:
             return False, (
                 "trusted evidence/credential-account binding is not implemented yet "
-                "(VerificationEvidence is a data contract, not proof of authenticity) "
-                "— production live dispatch stays blocked"
+                "(VerificationEvidence is a data contract, not proof of authenticity; "
+                "the manual trusted_evidence_binding flag alone is NOT sufficient "
+                "proof of provider-side billing safety) — production live dispatch "
+                "stays blocked"
             )
-        return True, "free_tier_verified + evidence bound to account + attestation current"
+        # strict zero-cost (FREE_ONLY): zero billing exposure must be ESTABLISHED,
+        # not inferred. Local accounting cannot observe out-of-HIVE consumption.
+        enf = ev.billing_enforcement
+        if enf == BillingEnforcement.UNKNOWN:
+            return False, (
+                f"billing enforcement UNKNOWN for {model!r} — zero billing exposure "
+                "cannot be established; FREE_ONLY denies dispatch"
+            )
+        if enf == BillingEnforcement.LOCAL_INFERENCE and p.provider != "ollama":
+            return False, (
+                f"local-inference claim is only valid for local providers, not "
+                f"{p.provider!r}"
+            )
+        if enf == BillingEnforcement.FREE_ALLOWANCE_NO_OVERAGE and not p.overage_billing_disabled:
+            return False, (
+                f"free allowance with automatic paid overage for {model!r} — not "
+                "zero exposure; overage billing must be verifiably disabled"
+            )
+        if enf == BillingEnforcement.FREE_ALLOWANCE_NO_OVERAGE and not ev.credential_bound:
+            return False, (
+                f"free-allowance evidence for {model!r} is not credential-bound"
+            )
+        return True, (
+            "free_tier_verified + evidence bound to account/provider/endpoint + "
+            f"billing enforcement={enf.value} + attestation current"
+        )
 
 
 @dataclass(frozen=True)

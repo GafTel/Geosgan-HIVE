@@ -62,6 +62,7 @@ def free_profile(**overrides) -> dict:
             "collected_at": (NOW - timedelta(days=1)).isoformat(),
             "collected_by": "operator-1",
             "credential_bound": True,
+            "billing_enforcement": "provider_hard_limit",
             "account_fingerprint": "a" * 64,
         },
         quotas=[{"pool": "gemini:acct:" + "a" * 64, "max_requests": 1500,
@@ -672,6 +673,7 @@ def test_verification_evidence_model_valid():
         "collected_at": NOW.isoformat(),
         "collected_by": "operator-1",
         "credential_bound": True,
+            "billing_enforcement": "provider_hard_limit",
         "account_fingerprint": "a" * 64,
     })
     assert ev.credential_bound is True

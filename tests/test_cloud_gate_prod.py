@@ -60,7 +60,8 @@ M1 = "gemini/gemini-2.0-flash"
 def evidence(fp=FP_A, **kw):
     base = dict(source="provider_billing_console_export", evidence_ref="ev-1",
                 collected_at=(NOW - timedelta(days=1)).isoformat(),
-                collected_by="operator-1", credential_bound=True, account_fingerprint=fp)
+                collected_by="operator-1", credential_bound=True, account_fingerprint=fp,
+                billing_enforcement="provider_hard_limit")
     base.update(kw)
     return base
 
