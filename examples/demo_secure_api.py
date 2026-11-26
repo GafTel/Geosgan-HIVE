@@ -30,10 +30,10 @@ from geosgan_hive.checkpoints import CheckpointStore, PersistMode
 from geosgan_hive.errors import QuotaExhaustedError
 from geosgan_hive.http_client import EndpointRule, HttpLimits, SecureHttpClient, TransportConfig
 from geosgan_hive.outbound import (
-    ApiSession,
     OutboundAuthorizer,
     OutboundNotAuthorizedError,
     build_api_session,
+    build_offline_test_session,
 )
 
 
@@ -97,9 +97,9 @@ def main():
     client = SecureHttpClient(TransportConfig(endpoints=(rule,),
                                               limits=HttpLimits(max_retries=1),
                                               allow_loopback=True))  # TEST-ONLY flag
-    # test_endpoint_override: offline demo only — the loopback rule replaces the
-    # https rule of the same endpoint id; production (build_api_session) is strict
-    session = ApiSession(client, auth, store, test_endpoint_override=True)
+    # TEST-ONLY factory: offline demo — the loopback rule replaces the https rule
+    # of the same endpoint id; the public constructor/build_api_session are strict
+    session = build_offline_test_session(client, auth, store)
 
     call = dict(provider="wikimedia", endpoint_id="wiki", operation_id="search",
                 method="GET", path="/w/api/search", params={"q": "geospatial hive"},

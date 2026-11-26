@@ -395,9 +395,10 @@ def _session(tmp_path, port, *, policy="authorized", approvals=None, persist=Non
                                               limits=HttpLimits(max_retries=2),
                                               allow_loopback=True))
     auth = OutboundAuthorizer(store, apis, approvals)
-    from geosgan_hive.outbound import ApiSession
-    # test-only: the loopback rule replaces the https rule of the same endpoint id
-    return ApiSession(client, auth, store, test_endpoint_override=True), store, apis
+    from geosgan_hive.outbound import build_offline_test_session
+    # TEST-ONLY factory: the loopback rule replaces the https rule of the same
+    # endpoint id; the normal public constructor always enforces binding
+    return build_offline_test_session(client, auth, store), store, apis
 
 
 def test_authorized_end_to_end_with_retry_and_audit(tmp_path, ok_server):

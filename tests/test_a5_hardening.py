@@ -26,6 +26,7 @@ from geosgan_hive.approvals import ApprovalManager
 from geosgan_hive.checkpoints import CheckpointStore, PersistMode
 from geosgan_hive.errors import (
     ConfigError,
+    DestinationRejectedError,
     EndpointNotAllowedError,
     ResponseLimitExceededError,
     TransportDeadlineExceededError,
@@ -363,8 +364,8 @@ def test_retry_crossing_midnight_charged_to_correct_windows(tmp_path):
     def sleep_advance(_seconds):
         clock["now"] += timedelta(days=1)  # retry happens after midnight
 
-    session = ApiSession(client, auth, store, sleep=sleep_advance,
-                         test_endpoint_override=True)
+    from geosgan_hive.outbound import build_offline_test_session
+    session = build_offline_test_session(client, auth, store, sleep=sleep_advance)
     r = session.request(provider="wikimedia", endpoint_id="test-ep",
                         operation_id="search", method="GET", path="/api/search",
                         params={"q": "x"}, agent="researcher")
@@ -383,9 +384,24 @@ def test_retry_crossing_midnight_charged_to_correct_windows(tmp_path):
 
 # ---- 5. authorization bound to the exact transport endpoint --------------------
 
-def _client_with_rule(**rule_overrides):
+def _matching_client(**rule_overrides):
+    """A production-like client whose rule MATCHES the _apis() config on every
+    field except the ones overridden (for substitution tests)."""
+    apis = _apis()
+    base = dict(endpoint_id="test-ep", scheme="https", host="api.wikimedia.org",
+                port=443, path_prefixes=("/api",), methods=("GET",),
+                headers={"User-Agent": apis.user_agent}, extra_header_keys=(),
+                auth_env=None)
+    base.update(rule_overrides)
+    rule = EndpointRule(**base)
+    return SecureHttpClient(TransportConfig(endpoints=(rule,)))
+
+
+def _loopback_client(**rule_overrides):
+    """A test-only loopback client (same endpoint id, different destination)."""
     base = dict(endpoint_id="test-ep", scheme="http", host="127.0.0.1", port=8080,
-                path_prefixes=("/api",), methods=("GET",), headers={})
+                path_prefixes=("/api",), methods=("GET",),
+                headers={"User-Agent": _apis().user_agent})
     base.update(rule_overrides)
     rule = EndpointRule(**base)
     return SecureHttpClient(TransportConfig(endpoints=(rule,), allow_loopback=True))
@@ -398,46 +414,66 @@ def _session_for(client, store):
 
 def test_matching_endpoint_binding_constructs(tmp_path):
     store = CheckpointStore(str(tmp_path / "cp.db"))
-    # config says https://api.wikimedia.org:443; build the rule to match exactly
-    rule = EndpointRule(endpoint_id="test-ep", scheme="https", host="api.wikimedia.org",
-                        port=443, path_prefixes=("/api",), methods=("GET",),
-                        headers={})
-    client = SecureHttpClient(TransportConfig(endpoints=(rule,)))  # production-like
-    sess = _session_for(client, store)  # must NOT raise
+    sess = _session_for(_matching_client(), store)  # must NOT raise
     assert sess.client.rule_for("test-ep").host == "api.wikimedia.org"
     store.close()
 
 
+def test_public_constructor_has_no_bypass_option():
+    """The normal public API must not expose any option that disables endpoint
+    binding verification."""
+    import inspect
+
+    sig = inspect.signature(ApiSession.__init__)
+    for name in sig.parameters:
+        assert "override" not in name and "bypass" not in name and "skip" not in name
+    assert "test_endpoint_override" not in sig.parameters
+
+
 @pytest.mark.parametrize("override", [
-    {"host": "evil.example.com"},
-    {"scheme": "https"},
-    {"port": 8443},
-    {"path_prefixes": ("/",)},
-    {"methods": ("GET", "POST")},
+    {"host": "evil.example.com"},                       # destination substitution
+    {"port": 8443},                                     # port substitution
+    {"path_prefixes": ("/",)},                          # broader prefixes
+    {"methods": ("GET", "POST", "DELETE")},             # broader methods
+    {"auth_env": "OTHER_TOKEN"},                        # credential substitution
+    {"extra_header_keys": ("X-Custom",)},               # extra header allowance
+    {"headers": {"User-Agent": "evil/1.0"}},            # fixed header substitution
+    {"headers": {"User-Agent": _apis().user_agent, "X-Extra": "1"}},  # added header
 ])
 def test_mismatched_transport_rule_rejected_at_construction(tmp_path, override):
     store = CheckpointStore(str(tmp_path / "cp.db"))
-    client = _client_with_rule(**override)  # endpoint_id matches, destination differs
-    with pytest.raises(ConfigError, match="binding mismatch|does not match"):
+    client = _matching_client(**override)  # matches config except `override`
+    with pytest.raises(ConfigError, match="does not match its transport rule"):
         _session_for(client, store)
     store.close()
 
 
 def test_authorized_endpoint_without_transport_rule_rejected(tmp_path):
     store = CheckpointStore(str(tmp_path / "cp.db"))
-    rule = EndpointRule(endpoint_id="other-ep", scheme="http", host="127.0.0.1",
-                        port=8080, path_prefixes=("/api",), methods=("GET",), headers={})
-    client = SecureHttpClient(TransportConfig(endpoints=(rule,), allow_loopback=True))
+    rule = EndpointRule(endpoint_id="other-ep", scheme="https", host="api.wikimedia.org",
+                        port=443, path_prefixes=("/api",), methods=("GET",),
+                        headers={"User-Agent": _apis().user_agent})
+    client = SecureHttpClient(TransportConfig(endpoints=(rule,)))
     with pytest.raises(ConfigError, match="no transport rule"):
         _session_for(client, store)
     store.close()
 
 
-def test_test_only_override_allows_loopback_fixture(tmp_path):
+def test_loopback_rule_rejected_through_normal_public_api(tmp_path):
+    """Even the offline loopback rule cannot be constructed through the normal
+    public constructor — only via build_offline_test_session."""
     store = CheckpointStore(str(tmp_path / "cp.db"))
-    client = _client_with_rule()  # loopback, same endpoint_id, different destination
-    sess = ApiSession(client, OutboundAuthorizer(store, _apis(), ApprovalManager(store)),
-                      store, test_endpoint_override=True)  # explicit test-only path
+    with pytest.raises(ConfigError, match="does not match its transport rule"):
+        _session_for(_loopback_client(), store)
+    store.close()
+
+
+def test_test_only_factory_allows_loopback_fixture(tmp_path):
+    store = CheckpointStore(str(tmp_path / "cp.db"))
+    client = _loopback_client()  # loopback, same endpoint_id, different destination
+    from geosgan_hive.outbound import build_offline_test_session
+    sess = build_offline_test_session(
+        client, OutboundAuthorizer(store, _apis(), ApprovalManager(store)), store)
     assert sess.client.rule_for("test-ep").host == "127.0.0.1"
     store.close()
 
@@ -465,3 +501,225 @@ def test_billing_attestation_values_accepted_and_documented():
     doc = ApiProviderConfig.__doc__ or ""
     assert "OPERATOR ATTESTATION" in doc and "not independently verified" in doc
     assert "guarantee zero provider-side charges" in doc.lower()
+
+
+# ---- 1. deadline-aware semaphore acquisition ---------------------------------
+
+def _shared_slot_holder(server):
+    """A holder client (long deadline) that blocks inside DNS on a gate while
+    holding the only concurrency slot, plus a waiter client (short deadline)
+    sharing the SAME semaphore."""
+    gate = threading.Event()
+    resolved = []
+
+    def resolver(host, port, *a, **k):
+        resolved.append(host)
+        gate.wait(10)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    holder = make_client(server, limits=HttpLimits(max_concurrent_requests=1,
+                                                   total_deadline_seconds=30,
+                                                   dns_timeout_seconds=30),
+                         resolver=resolver)
+    waiter = make_client(server, limits=HttpLimits(max_concurrent_requests=1,
+                                                   total_deadline_seconds=0.3,
+                                                   dns_timeout_seconds=5))
+    waiter._sem = holder._sem  # test-only: share the concurrency slot
+    return holder, waiter, gate, resolved
+
+
+def test_slot_wait_times_out_with_deadline_and_no_dns(server):
+    """All slots occupied: a waiting request must fail with the typed deadline
+    error at the deadline, and must NOT start DNS resolution."""
+    H.mode = "ok"
+    holder, waiter, gate, resolved = _shared_slot_holder(server)
+
+    def run_holder():
+        try:
+            holder.request("test-api", "GET", "/api/x")
+        except Exception:  # noqa: BLE001
+            pass
+
+    t = threading.Thread(target=run_holder)
+    t.start()
+    for _ in range(200):  # holder acquired the slot and entered DNS
+        if resolved:
+            break
+        time.sleep(0.01)
+    assert resolved == ["127.0.0.1"] and holder.free_slots == 0
+    t0 = time.monotonic()
+    with pytest.raises(TransportDeadlineExceededError, match="concurrency slot"):
+        waiter.request("test-api", "GET", "/api/x")
+    assert time.monotonic() - t0 < 2.0
+    assert resolved == ["127.0.0.1"]  # waiter never started its own DNS
+    gate.set()
+    t.join(timeout=15)
+    assert holder.free_slots == 1  # holder released its slot exactly once
+
+
+def test_cancel_while_waiting_for_slot(server):
+    from geosgan_hive.errors import TransportCancelledError
+
+    H.mode = "ok"
+    holder, waiter, gate, resolved = _shared_slot_holder(server)
+    waiter_limits = waiter.config.limits
+    assert waiter_limits.total_deadline_seconds == 0.3
+
+    def run_holder():
+        try:
+            holder.request("test-api", "GET", "/api/x")
+        except Exception:  # noqa: BLE001
+            pass
+
+    t = threading.Thread(target=run_holder)
+    t.start()
+    while holder.free_slots != 0:
+        time.sleep(0.01)
+    # give the waiter a long deadline so only CANCELLATION can stop it
+    waiter._config = waiter.config.model_copy(update={"limits": waiter_limits.model_copy(
+        update={"total_deadline_seconds": 30})})
+    cancel = threading.Event()
+    threading.Timer(0.15, cancel.set).start()
+    with pytest.raises(TransportCancelledError, match="concurrency slot"):
+        waiter.request("test-api", "GET", "/api/x", cancel=cancel)
+    assert resolved == ["127.0.0.1"]
+    gate.set()
+    t.join(timeout=15)
+    assert holder.free_slots == 1  # no slot leaked by the cancelled waiter
+
+
+def test_slot_released_after_success_and_failure_paths(server):
+    """Correct accounting after every failure path: validation error before
+    acquisition, DNS failure, deadline during request — the slot count must
+    return to the maximum each time."""
+    H.mode = "ok"
+    c = make_client(server, limits=HttpLimits(max_concurrent_requests=2,
+                                              total_deadline_seconds=5))
+    cap = c.free_slots
+    # 1. request-line validation fails BEFORE acquisition
+    with pytest.raises(EndpointNotAllowedError):
+        c.request("test-api", "GET", "/nope")
+    assert c.free_slots == cap
+    # 2. unknown endpoint fails before acquisition
+    with pytest.raises(EndpointNotAllowedError):
+        c.request("unknown", "GET", "/api/x")
+    assert c.free_slots == cap
+    # 3. DNS rejects all addresses -> fails after acquisition, slot released
+    def resolver(host, port, *a, **k):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", port))]
+
+    c2 = make_client(server, limits=HttpLimits(max_concurrent_requests=2), resolver=resolver)
+    with pytest.raises(DestinationRejectedError):
+        c2.request("test-api", "GET", "/api/x")
+    assert c2.free_slots == 2
+    # 4. successful request releases its slot
+    r = c.request("test-api", "GET", "/api/x")
+    assert r.status == 200
+    assert c.free_slots == cap
+    # 5. deadline during the request releases the slot
+    H.mode = "stall_body"
+    c3 = make_client(server, limits=HttpLimits(max_concurrent_requests=1,
+                                               total_deadline_seconds=0.3,
+                                               read_timeout_seconds=5))
+    with pytest.raises(TransportDeadlineExceededError):
+        c3.request("test-api", "GET", "/api/x")
+    assert c3.free_slots == 1
+    H.mode = "ok"
+
+
+# ---- 2. bounded DNS resolver pool ---------------------------------------------
+
+def test_slow_dns_storm_never_exceeds_pool_limits(server):
+    """Repeated slow-DNS requests: outstanding executing workers and queued
+    items never exceed the configured maxima; excess requests fail closed;
+    normal requests remain usable afterwards."""
+    def slow_resolver(host, port, *a, **k):
+        time.sleep(1.0)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    limits = HttpLimits(max_concurrent_requests=16, dns_timeout_seconds=0.2,
+                        max_dns_workers=2, max_dns_pending=3,
+                        total_deadline_seconds=30)
+    c = make_client(server, limits=limits, resolver=slow_resolver)
+    outcomes = []
+    max_busy = [0]
+    max_queued = [0]
+    stop = threading.Event()
+
+    def sampler():
+        while not stop.is_set():
+            st = c.dns_stats
+            max_busy[0] = max(max_busy[0], st["busy"])
+            max_queued[0] = max(max_queued[0], st["queued"])
+            time.sleep(0.005)
+
+    def one():
+        try:
+            c.request("test-api", "GET", "/api/x")
+            outcomes.append("ok")
+        except TransportDeadlineExceededError:
+            outcomes.append("dns-timeout")
+        except TransportError as exc:
+            outcomes.append("capacity:" + str("capacity exhausted" in str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            outcomes.append(type(exc).__name__)
+
+    st = threading.Thread(target=sampler, daemon=True)
+    st.start()
+    threads = [threading.Thread(target=one) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    stop.set()
+    st.join(timeout=2)
+    assert max_busy[0] <= 2, f"busy workers exceeded limit: {max_busy[0]}"
+    assert max_queued[0] <= 3, f"queued items exceeded limit: {max_queued[0]}"
+    # 2 workers execute, 3 queue, 5 must fail closed at submit
+    assert outcomes.count("dns-timeout") == 5
+    assert outcomes.count("capacity:True") == 5
+    assert "ok" not in outcomes
+    # after all slow resolver work drains, the pool is idle (poll, don't guess)
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        st = c.dns_stats
+        if st["busy"] == 0 and st["queued"] == 0:
+            break
+        time.sleep(0.05)
+    assert c.dns_stats["busy"] == 0 and c.dns_stats["queued"] == 0
+
+    def fast_resolver(host, port, *a, **k):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    c2 = make_client(server, resolver=fast_resolver)
+    r = c2.request("test-api", "GET", "/api/x")
+    assert r.status == 200  # normal requests remain usable after DNS timeouts
+
+
+def test_dns_pool_submit_fails_closed_when_queue_full():
+    from geosgan_hive.http_client import _ResolverPool
+
+    pool = _ResolverPool(max_workers=1, max_pending=2)
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(5)
+        return "done"
+
+    f1 = pool.submit(slow)          # occupies the only worker
+    # wait until the worker actually picked it up (deterministic accounting)
+    for _ in range(200):
+        if pool.stats()["busy"] == 1:
+            break
+        time.sleep(0.01)
+    assert pool.stats()["busy"] == 1 and pool.stats()["queued"] == 0
+    f2 = pool.submit(slow)          # queued (1/2)
+    f3 = pool.submit(slow)          # queued (2/2)
+    with pytest.raises(TransportError, match="capacity exhausted"):
+        pool.submit(slow)           # queue full -> fail closed, no slot consumed
+    assert pool.stats()["busy"] == 1 and pool.stats()["queued"] == 2
+    gate.set()
+    assert f1.result(timeout=3) == "done"
+    assert f2.result(timeout=3) == "done"
+    assert f3.result(timeout=3) == "done"
+    pool.close()

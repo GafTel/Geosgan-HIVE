@@ -20,9 +20,11 @@ request/byte budgets cannot guarantee zero provider-side charges.
 
 Authorization and transport are bound at construction: every authorized
 endpoint id must map to a transport rule with the identical scheme/host/port/
-path prefixes/methods (see ApiSession._verify_endpoint_binding). The
-`test_endpoint_override` constructor flag exists ONLY for offline loopback
-fixtures; production construction (build_api_session) never sets it.
+path prefixes/methods/credential env/extra headers/fixed headers (see
+ApiSession._verify_endpoint_binding). ApiSession.__init__ ALWAYS enforces this;
+there is no public bypass. Offline loopback fixtures use the explicitly
+test-only build_offline_test_session() factory; production construction
+(build_api_session) never uses it.
 """
 
 from __future__ import annotations
@@ -274,19 +276,21 @@ class ApiSession:
 
     def __init__(self, client: SecureHttpClient, authorizer: OutboundAuthorizer,
                  store: CheckpointStore, *, clock=time.monotonic,
-                 sleep=time.sleep, test_endpoint_override: bool = False) -> None:
+                 sleep=time.sleep) -> None:
         self.client = client
         self.auth = authorizer
         self.store = store
         self._clock = clock
         self._sleep = sleep
-        if not test_endpoint_override:
-            # Authorization config and physical transport config must not be
-            # independently substituted: every enabled provider endpoint must
-            # map to a transport rule with the EXACT same scheme/host/port/
-            # path prefixes/methods. Production construction (build_api_session)
-            # derives both from one config and always passes this check.
-            self._verify_endpoint_binding()
+        # ALWAYS enforced — there is deliberately NO public option to skip this.
+        # Authorization config and physical transport config must not be
+        # independently substituted: every enabled provider endpoint must map to
+        # a transport rule with the EXACT same scheme/host/port/path prefixes/
+        # methods/credential env/extra header keys/fixed headers (incl. the
+        # User-Agent that build_api_session prepends). Production construction
+        # (build_api_session) derives both from one config and always passes.
+        # Offline loopback fixtures use build_offline_test_session() instead.
+        self._verify_endpoint_binding()
 
     def _verify_endpoint_binding(self) -> None:
         apis = self.auth.apis
@@ -301,16 +305,25 @@ class ApiSession:
                         "has no transport rule in the client — authorization/transport "
                         "binding mismatch")
                 expected_port = e.port or (443 if e.scheme == "https" else 80)
+                # fixed headers as build_api_session would set them: the shared
+                # User-Agent first, then the endpoint's own headers
+                expected_headers = {"User-Agent": apis.user_agent, **e.headers}
                 if (rule.scheme != e.scheme or rule.host != e.host
                         or rule.default_port() != expected_port
                         or tuple(rule.path_prefixes) != tuple(e.path_prefixes)
-                        or tuple(rule.methods) != tuple(m.upper() for m in e.methods)):
+                        or tuple(rule.methods) != tuple(m.upper() for m in e.methods)
+                        or rule.auth_env != e.auth_env
+                        or tuple(rule.extra_header_keys) != tuple(e.extra_header_keys)
+                        or dict(rule.headers) != expected_headers):
                     raise ConfigError(
                         f"authorized endpoint {e.endpoint_id!r} does not match its transport "
                         f"rule: config={e.scheme}://{e.host}:{expected_port} "
-                        f"{e.path_prefixes} {e.methods} vs rule={rule.scheme}://"
-                        f"{rule.host}:{rule.default_port()} {rule.path_prefixes} "
-                        f"{rule.methods} — substitution rejected")
+                        f"{e.path_prefixes} {e.methods} auth_env={e.auth_env} "
+                        f"extra={e.extra_header_keys} headers={expected_headers} vs "
+                        f"rule={rule.scheme}://{rule.host}:{rule.default_port()} "
+                        f"{rule.path_prefixes} {rule.methods} auth_env={rule.auth_env} "
+                        f"extra={rule.extra_header_keys} headers={dict(rule.headers)} "
+                        "— substitution rejected")
 
     def request(self, *, provider: str, endpoint_id: str, operation_id: str,
                 method: str, path: str, params: Mapping[str, Any] | None = None,
@@ -421,6 +434,24 @@ class ApiSession:
             status_code=status, bytes_in=bytes_in, bytes_out=bytes_out,
             duration_ms=duration_ms, policy_decision=decision,
             provenance=digest[:16])
+
+
+def build_offline_test_session(client: SecureHttpClient, authorizer: OutboundAuthorizer,
+                               store: CheckpointStore, **kwargs) -> ApiSession:
+    """TEST-ONLY construction for offline loopback fixtures: builds an ApiSession
+    WITHOUT the endpoint-binding verification, because the test transport rule
+    (loopback http) intentionally differs from the validated https config
+    endpoint. This is the ONLY way to bypass _verify_endpoint_binding, it is
+    explicitly named as test-only, and no production code path (in particular
+    build_api_session) can reach it: ApiSession.__init__ always verifies.
+    Never use in production configuration or adapters."""
+    sess = ApiSession.__new__(ApiSession)
+    sess.client = client
+    sess.auth = authorizer
+    sess.store = store
+    sess._clock = kwargs.get("clock", time.monotonic)
+    sess._sleep = kwargs.get("sleep", time.sleep)
+    return sess
 
 
 def build_api_session(hive_config, store: CheckpointStore,

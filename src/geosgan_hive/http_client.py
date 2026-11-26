@@ -38,9 +38,11 @@ Stdlib only (http.client + ssl + socket). Properties:
 
 from __future__ import annotations
 
+import concurrent.futures as _futures
 import http.client
 import io
 import ipaddress
+import queue
 import re
 import socket
 import ssl
@@ -89,6 +91,8 @@ class HttpLimits(BaseModel):
     read_timeout_seconds: float = Field(default=10.0, gt=0)
     total_deadline_seconds: float = Field(default=30.0, gt=0)
     dns_timeout_seconds: float = Field(default=5.0, gt=0)
+    max_dns_workers: int = Field(default=4, ge=1, le=16)
+    max_dns_pending: int = Field(default=16, ge=0, le=256)
     max_concurrent_requests: int = Field(default=4, ge=1)
     max_retries: int = Field(default=2, ge=0, le=10)
     max_pages: int = Field(default=10, ge=1, le=1000)
@@ -433,6 +437,82 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
             (self.pinned_ip, self.port), timeout=timeout, source_address=source_address)
 
 
+class _ResolverPool:
+    """A small, FIXED, bounded DNS resolver facility (not one thread per
+    request). Exactly `max_workers` daemon workers consume a bounded queue of
+    at most `max_pending` items:
+
+    - submit() uses put_nowait: when the queue is full the request fails CLOSED
+      immediately and consumes NO worker or queue slot.
+    - a worker holds its slot for the whole execution of the resolver call, so
+      a request that times out while waiting NEVER frees a DNS worker slot
+      while getaddrinfo is still running.
+    - the OS getaddrinfo call cannot be forcibly interrupted: on a wait timeout
+      the worker thread is abandoned (it finishes whenever the OS resolver
+      returns) — it is NOT terminated, and this is documented, not claimed
+      otherwise.
+    """
+
+    def __init__(self, *, max_workers: int, max_pending: int) -> None:
+        self._max_workers = max_workers
+        self._max_pending = max_pending
+        self._q: queue.Queue = queue.Queue(maxsize=max_pending)
+        self._lock = threading.Lock()
+        self._busy = 0
+        self._workers = [
+            threading.Thread(target=self._run, daemon=True, name=f"hive-dns-{i}")
+            for i in range(max_workers)
+        ]
+        for w in self._workers:
+            w.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            try:
+                if item is None:  # shutdown sentinel
+                    return
+                fn, args, fut = item
+                with self._lock:
+                    self._busy += 1
+                try:
+                    fut.set_result(fn(*args))
+                except BaseException as exc:  # noqa: BLE001 - delivered via future
+                    fut.set_exception(exc)
+                finally:
+                    with self._lock:
+                        self._busy -= 1
+            finally:
+                self._q.task_done()
+
+    def submit(self, fn: Callable, *args: Any) -> _futures.Future:
+        """Enqueue resolver work. Raises TransportError (fail closed) when the
+        bounded pending queue is full — no slot is consumed in that case."""
+        fut: _futures.Future = _futures.Future()
+        try:
+            self._q.put_nowait((fn, args, fut))
+        except queue.Full as exc:
+            raise TransportError(
+                f"DNS resolver capacity exhausted ({self._max_workers} workers busy, "
+                f"{self._max_pending} pending) — request rejected (fail closed)") from exc
+        return fut
+
+    def stats(self) -> dict[str, int]:
+        """Observability for tests/audit: outstanding executing workers and
+        queued items (never above the configured maxima)."""
+        with self._lock:
+            busy = self._busy
+        return {"workers": self._max_workers, "busy": busy, "queued": self._q.qsize(),
+                "max_pending": self._max_pending}
+
+    def close(self) -> None:
+        for _ in self._workers:
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
+
+
 class SecureHttpClient:
     """The single shared secure HTTP transport. One connection per request,
     always closed; no pooling, no redirects, no env proxies, no arbitrary
@@ -454,10 +534,22 @@ class SecureHttpClient:
         self._clock = clock
         self._rules = {e.endpoint_id: e for e in config.endpoints}
         self._sem = threading.Semaphore(config.limits.max_concurrent_requests)
+        self._resolver_pool = _ResolverPool(
+            max_workers=config.limits.max_dns_workers,
+            max_pending=config.limits.max_dns_pending)
 
     @property
     def config(self) -> TransportConfig:
         return self._config
+
+    @property
+    def free_slots(self) -> int:
+        """Currently free concurrency slots (observability; never negative)."""
+        return max(0, self._sem._value)
+
+    @property
+    def dns_stats(self) -> dict[str, int]:
+        return self._resolver_pool.stats()
 
     # -- allowlist validation -------------------------------------------------
 
@@ -525,39 +617,38 @@ class SecureHttpClient:
     # -- destination resolution + pinning --------------------------------------
 
     def _resolve_pinned(self, rule: EndpointRule, *, deadline: float) -> ipaddress._BaseAddress:
-        """Resolve the allowlisted host with a BOUNDED DNS wait: the resolver
-        runs on a daemon thread and is awaited for at most min(dns_timeout,
-        remaining total deadline). A safe TOTAL DNS deadline cannot be
-        guaranteed (the OS getaddrinfo call is not interruptible), so on
-        timeout the thread is abandoned and the request fails closed."""
+        """Resolve the allowlisted host through the bounded _ResolverPool and
+        wait at most min(dns_timeout, remaining total deadline). A safe TOTAL
+        DNS deadline cannot be guaranteed (the OS getaddrinfo call is not
+        interruptible): on wait-timeout the pool worker keeps running until the
+        OS resolver returns — it is abandoned, NOT terminated — and the request
+        fails closed with TransportDeadlineExceededError. The worker slot stays
+        occupied for the whole execution, so timed-out requests never free DNS
+        capacity early. Queue exhaustion fails closed without consuming a slot."""
         port = rule.default_port()
         remaining = deadline - self._clock()
         dns_wait = min(self._config.limits.dns_timeout_seconds, max(0.0, remaining))
         if dns_wait <= 0:
             raise TransportDeadlineExceededError(
                 "total request deadline expired before DNS resolution")
-        outcome: dict[str, Any] = {}
-
-        def work() -> None:
-            try:
-                outcome["infos"] = self._resolver(
-                    rule.host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            except OSError as exc:
-                outcome["error"] = exc
-
-        t = threading.Thread(target=work, daemon=True, name="hive-dns")
-        t.start()
-        t.join(dns_wait)
-        if t.is_alive():
-            raise TransportDeadlineExceededError(
-                f"DNS resolution of {rule.host!r} exceeded the bounded DNS timeout "
-                f"({dns_wait:.3f}s); resolver thread abandoned (daemon)")
-        if "error" in outcome:
+        fut = self._resolver_pool.submit(
+            self._resolver, rule.host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        try:
+            infos = fut.result(timeout=dns_wait)
+        except TimeoutError as exc:
+            if not fut.done():
+                raise TransportDeadlineExceededError(
+                    f"DNS resolution of {rule.host!r} exceeded the bounded DNS timeout "
+                    f"({dns_wait:.3f}s); pool worker abandoned (not terminated) — "
+                    "the OS resolver call cannot be forcibly interrupted") from exc
             raise DestinationRejectedError(
-                f"cannot resolve allowlisted host {rule.host!r}: {outcome['error']}")
+                f"cannot resolve allowlisted host {rule.host!r}: {exc}") from exc
+        except OSError as exc:
+            raise DestinationRejectedError(
+                f"cannot resolve allowlisted host {rule.host!r}: {exc}") from exc
         valid = []
         errors = []
-        for info in outcome["infos"]:
+        for info in infos:
             addr = info[4][0]
             try:
                 valid.append(validate_destination(addr, allow_loopback=self._config.allow_loopback))
@@ -598,7 +689,23 @@ class SecureHttpClient:
         # interruptible.
         deadline = self._clock() + limits.total_deadline_seconds
         state = {"wire": 0}
-        self._sem.acquire()
+        # Deadline-aware, cancellation-aware concurrency-slot acquisition: poll
+        # in short slices so neither the total deadline nor a cancel event can
+        # be missed while waiting. If acquisition fails, NO DNS resolution or
+        # network operation is started and NO slot is released later.
+        acquired = False
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise TransportCancelledError(
+                    "cancelled while waiting for a concurrency slot")
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise TransportDeadlineExceededError(
+                    "total request deadline expired while waiting for a "
+                    "concurrency slot")
+            if self._sem.acquire(timeout=min(0.05, remaining)):
+                acquired = True
+                break
         conn: http.client.HTTPConnection | None = None
         try:
             if cancel is not None and cancel.is_set():
@@ -684,13 +791,15 @@ class SecureHttpClient:
             )
         finally:
             # capacity is released ONLY after the socket is fully closed, so a
-            # cancelled request never frees concurrency while still active
+            # cancelled request never frees concurrency while still active —
+            # and ONLY if this request actually acquired a slot
             if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
-            self._sem.release()
+            if acquired:
+                self._sem.release()
 
 
 def parse_retry_after(value: str | None, *, cap_seconds: float = 86400.0) -> float | None:
