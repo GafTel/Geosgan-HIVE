@@ -52,6 +52,17 @@ class QuotaPeriod(StrEnum):
     MONTH = "month"
 
 
+#: v0.7.0 PRODUCTION RELEASE GATE: in zero-cost (FREE_ONLY) mode ONLY local
+#: inference (ollama, loopback-only transport) may receive live dispatch. Cloud
+#: providers stay blocked independently of profile evidence, the legacy
+#: trusted_evidence_binding flag, or the evidence-vault state (even an injected
+#: vault with syntactically valid provider_enforced records cannot activate
+#: them) until a future, separately authorized acceptance gate re-opens
+#: verified provider-enforced zero-cost paths. Outside zero-cost mode, legacy
+#: semantics are preserved.
+ZERO_COST_RELEASE_LOCAL_PROVIDERS = ("ollama",)
+
+
 class BillingEnforcement(StrEnum):
     """How zero billing exposure is ESTABLISHED provider-side (not inferred from
     model names or local accounting):
@@ -493,6 +504,17 @@ class CloudProfileRegistry:
             return False, (
                 f"billing={p.billing.value} for {model!r} — only free_tier_verified "
                 "is allowed in zero-cost mode"
+            )
+        # v0.7.0 release gate (ZERO_COST_RELEASE_LOCAL_PROVIDERS): non-local cloud
+        # inference is denied in zero-cost mode INDEPENDENTLY of evidence state -
+        # profile evidence, trusted flags and vault contents included
+        if p.provider not in ZERO_COST_RELEASE_LOCAL_PROVIDERS:
+            return False, (
+                f"v0.7.0 release gate: non-local cloud inference ({p.provider!r}) is "
+                f"denied in zero-cost (FREE_ONLY) mode for {model!r} - only local "
+                "inference (ollama, loopback) is allowed; cloud providers stay blocked "
+                "regardless of evidence-vault state until a future separately "
+                "authorized gate establishes provider-enforced zero-cost guarantees"
             )
         if not p.verification_current(now):
             if p.verified_at is not None and p.verified_at > now:

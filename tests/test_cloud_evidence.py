@@ -238,24 +238,40 @@ def test_vault_wired_blocks_cloud_without_provider_enforced_evidence(tmp_path):
                       overage_behavior=OverageBehavior.UNKNOWN,
                       credential_fingerprint=None))
     ok, why = reg.live_dispatch_eligible(model, now=NOW)
-    assert not ok and "NO_PROVIDER_ENFORCED_EVIDENCE" in why
-    # a matching provider_enforced record unblocks ONLY this exact binding
+    # release gate fires first for non-local providers in zero-cost mode; the
+    # vault-specific reason is covered by the oracle tests above
+    assert not ok and ("NO_PROVIDER_ENFORCED_EVIDENCE" in why
+                       or "release gate" in why)
+    # a matching provider_enforced record satisfies the VAULT oracle for this
+    # exact binding...
     vault.record(_rec(evidence_id="pe-1", provider_id="gemini", model_id=model,
                       endpoint=None, credential_fingerprint=FP))
+    ok_v, why_v = vault.eligible_for_live_dispatch(
+        provider_id="gemini", model_id=model, endpoint=None,
+        account_fingerprint=FP, now=NOW)
+    assert ok_v, why_v
+    # ...but the v0.7.0 RELEASE GATE still denies non-local cloud inference in
+    # zero-cost mode independently of vault state (injected vault included)
     ok, why = reg.live_dispatch_eligible(model, now=NOW)
-    assert ok, why
+    assert not ok and "release gate" in why
     # model substitution still blocked
     ok2, _ = reg.live_dispatch_eligible("gemini/gemini-2.5-pro", now=NOW)
     assert not ok2  # no profile for that model at all
     store.close()
 
 
-def test_vault_not_wired_preserves_existing_behavior(tmp_path):
+def test_vault_not_wired_release_gate_still_applies(tmp_path):
     store = _store(tmp_path)
+    # zero-cost mode: non-local denied by the v0.7.0 release gate even without
+    # a vault and even with the legacy trusted flag
     reg = CloudProfileRegistry(profiles=[_profile()], zero_cost=True,
                                max_spend_usd=0.0, trusted_evidence_binding=True)
     ok, why = reg.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
-    assert ok, why  # unchanged legacy trusted path (vault opt-in only)
+    assert not ok and "release gate" in why
+    # legacy mode OUTSIDE zero-cost is unchanged (known provider allowed)
+    legacy = CloudProfileRegistry(profiles=(), zero_cost=False)
+    ok, _ = legacy.live_dispatch_eligible("gemini/gemini-2.0-flash", now=NOW)
+    assert ok is True
     store.close()
 
 

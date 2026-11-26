@@ -28,16 +28,16 @@ from geosgan_hive.retry import RetryPolicy
 from geosgan_hive.usage import UsageTracker
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-M1 = "gemini/gemini-2.0-flash"
+M1 = "ollama/llama3.2"
 FP_A = "a" * 64
-POOL_A = "gemini:acct:" + FP_A
+POOL_A = "ollama:acct:" + FP_A
 
 
 def free_profile(now, anchor, *, max_requests=1, billing="free_tier_verified", fp=FP_A,
                  evidence_age_days=1, ttl_days=30):
-    pool = "gemini:acct:" + fp
+    pool = "ollama:acct:" + fp
     return {
-        "provider": "gemini", "models": [M1], "billing": billing,
+        "provider": "ollama", "models": [M1], "billing": billing,
         "verified_free": billing == "free_tier_verified",
         "overage_billing_disabled": billing == "free_tier_verified",
         "billing_verified": billing == "free_tier_verified",
@@ -50,7 +50,8 @@ def free_profile(now, anchor, *, max_requests=1, billing="free_tier_verified", f
             "source": "provider_billing_console_export", "evidence_ref": "ev-1",
             "collected_at": (now - timedelta(days=evidence_age_days)).isoformat(),
             "collected_by": "operator-1", "credential_bound": True,
-            "billing_enforcement": "provider_hard_limit",
+            "billing_enforcement": "local_inference",
+            "endpoint": "http://localhost:11434",
             "account_fingerprint": fp,
         },
         "quotas": [{"pool": pool, "max_requests": max_requests,

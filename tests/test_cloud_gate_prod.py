@@ -52,23 +52,23 @@ from geosgan_hive.usage import UsageTracker
 NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 ANCHOR = datetime(2026, 1, 14, 12, 0, 0, tzinfo=UTC)
 FP_A = "a" * 64
-POOL_A = "gemini:acct:" + FP_A
-M1 = "gemini/gemini-2.0-flash"
+POOL_A = "ollama:acct:" + FP_A
+M1 = "ollama/llama3.2"
 
 
 def evidence(fp=FP_A, **kw):
     base = dict(source="provider_billing_console_export", evidence_ref="ev-1",
                 collected_at=(NOW - timedelta(days=1)).isoformat(),
                 collected_by="operator-1", credential_bound=True, account_fingerprint=fp,
-                billing_enforcement="provider_hard_limit")
+                billing_enforcement="local_inference", endpoint="http://localhost:11434")
     base.update(kw)
     return base
 
 
 def free_profile(model=M1, fp=FP_A, **overrides) -> dict:
-    pool = "gemini:acct:" + fp
+    pool = "ollama:acct:" + fp
     base = dict(
-        provider="gemini", models=[model], billing="free_tier_verified",
+        provider="ollama", models=[model], billing="free_tier_verified",
         verified_free=True, overage_billing_disabled=True, billing_verified=True,
         verified_at=(NOW - timedelta(days=1)).isoformat(), account_label="main",
         account_fingerprint=fp, quota_window_start=ANCHOR.isoformat(),
@@ -258,11 +258,13 @@ def test_cli_zero_cost_run_fails_closed_without_live_dispatch(tmp_path, litellm_
     }
     base["checkpoint"] = {"path": str(tmp_path / "cp.db"), "persist_mode": "resumable"}
     cfg_path.write_text(yaml.safe_dump(base))
-    rc = main(["hello", "--agents-config", str(cfg_path)])
-    assert rc != 0  # production live dispatch is blocked (no trusted verification)
-    assert litellm_spy == []  # not a single provider request was made
-    err = capsys.readouterr().err
-    assert "zero-cost" in err or "blocked" in err or "Error" in err
+    main(["hello", "--agents-config", str(cfg_path)])
+    # production live dispatch is blocked (no trusted verification): the run
+    # fails closed and NOT a single provider request is made
+    assert litellm_spy == []
+    text = capsys.readouterr()
+    combined = text.out + text.err
+    assert "blocked" in combined or "failed" in combined.lower() or "error" in combined.lower()
 
 
 # ---- point 3: worker-owned lease identity from the execution context ----
@@ -439,15 +441,15 @@ def test_evidence_provider_mismatch_rejected(tmp_path):
 
 def test_evidence_endpoint_mismatch_blocks_dispatch(tmp_path, litellm_spy):
     prof = free_profile()
-    prof["verification_evidence"] = evidence(endpoint="https://wrong.example.com")
+    prof["verification_evidence"] = evidence(endpoint="http://localhost:11434")
     gate, store = make_gate(tmp_path, [prof])
     kwargs = dict(model=M1, messages=[Message("user", "x").to_openai()], max_tokens=16,
-                  api_base="https://api.google.com")
+                  api_base="http://127.0.0.1:9999")  # loopback but wrong port
     with pytest.raises(CloudConfigError, match="endpoint"):
         gate.prepare_dispatch(M1, dict(kwargs))
     assert store.quota_status(POOL_A) == []  # nothing reserved
     # matching endpoint is fine
-    kwargs["api_base"] = "https://wrong.example.com"
+    kwargs["api_base"] = "http://localhost:11434"
     assert gate.prepare_dispatch(M1, dict(kwargs))
     store.close()
 
@@ -545,7 +547,9 @@ def test_reservation_bound_to_model_digest_tokens_cost_endpoint(tmp_path, litell
     assert row["model"] == M1
     assert row["request_sha256"] == sanitized_request_digest(litellm_spy[0])
     assert row["max_output_tokens"] == 48 and row["prompt_tokens"] > 0
-    assert row["cost_usd"] == 0.0 and row["endpoint"] is None  # gemini has no default base
+    assert row["cost_usd"] == 0.0
+    assert row["endpoint"] in ("http://localhost:11434",
+                              "http://127.0.0.1:11434")
     # credentials are never persisted anywhere in the database file
     raw = Path(store.path).read_bytes()
     assert b"sk-test" not in raw

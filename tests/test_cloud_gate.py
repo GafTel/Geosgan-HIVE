@@ -43,10 +43,10 @@ NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 ANCHOR = datetime(2026, 1, 14, 12, 0, 0, tzinfo=UTC)
 FP_A = "a" * 64
 FP_B = "b" * 64
-POOL_A = "gemini:acct:" + FP_A
-POOL_B = "gemini:acct:" + FP_B
-M1 = "gemini/gemini-2.0-flash"
-M2 = "gemini/gemini-2.5-flash"
+POOL_A = "ollama:acct:" + FP_A
+POOL_B = "ollama:acct:" + FP_B
+M1 = "ollama/llama3.2"
+M2 = "ollama/gemma3"
 
 
 class LiveStubAdapter:
@@ -60,10 +60,10 @@ class LiveStubAdapter:
                                        token_estimation=TokenEstimationMode.EXACT)
 
     def estimate_cost(self, model, *, prompt_tokens, max_output_tokens):
-        return 0.0 if model.startswith("gemini/") else None
+        return 0.0 if model.startswith("ollama/") else None
 
     def estimate_tokens(self, model, *, prompt_chars, max_output_tokens):
-        if not model.startswith("gemini/") or max_output_tokens < 1:
+        if not model.startswith("ollama/") or max_output_tokens < 1:
             return None
         return TokenEstimate(prompt_tokens=prompt_chars, max_output_tokens=max_output_tokens)
 
@@ -76,9 +76,9 @@ class LiveStubAdapter:
 
 def free_profile(model=M1, fp=FP_A, label="main", max_requests=100,
                  max_tokens=10**9, **overrides) -> dict:
-    pool = "gemini:acct:" + fp
+    pool = "ollama:acct:" + fp
     base = dict(
-        provider="gemini",
+        provider="ollama",
         models=[model],
         billing="free_tier_verified",
         verified_free=True,
@@ -95,7 +95,8 @@ def free_profile(model=M1, fp=FP_A, label="main", max_requests=100,
             "collected_at": (NOW - timedelta(days=1)).isoformat(),
             "collected_by": "operator-1",
             "credential_bound": True,
-            "billing_enforcement": "provider_hard_limit",
+            "billing_enforcement": "local_inference",
+            "endpoint": "http://localhost:11434",
             "account_fingerprint": fp,
         },
         quotas=[{"pool": pool, "max_requests": max_requests, "max_tokens": max_tokens,
@@ -291,7 +292,7 @@ def test_gate_covers_retries_and_honors_retry_after(tmp_path, litellm_spy, no_ne
     assert rows[0]["used"] == 2
     # Retry-After honored (never invented): sleep >= 7s, hint recorded
     assert sleeps and sleeps[0] >= 7.0
-    assert gw.retry_after_hint("gemini") == 7.0
+    assert gw.retry_after_hint("ollama") == 7.0
     store.close()
 
 
