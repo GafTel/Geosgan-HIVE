@@ -83,6 +83,29 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     return min(parsed, 86400.0)  # cap excessively large hints (<= 24h) safely
 
 
+class _OfflineEncoding:
+    """Duck-typed tiktoken encoding that NEVER downloads BPE files.
+
+    LiteLLM's ollama completion path loads a tiktoken encoding lazily, which
+    on a cold cache fetches from a remote host. HIVE installs this stub as
+    litellm's cached encoding so no such fetch can ever happen; token counts
+    from it are only heuristic hints for litellm's internal logging - HIVE's
+    zero-cost gate uses its own conservative bounds and the provider response
+    carries the authoritative usage."""
+
+    def encode(self, text, *a, **k):
+        return list(range(max(1, -(-len(str(text)) // 4))))
+
+    def encode_ordinary(self, text, *a, **k):
+        return self.encode(text)
+
+    def decode(self, tokens, *a, **k):
+        return ""
+
+    def name(self):
+        return "hive-offline-heuristic"
+
+
 _LITELLM_TRANSPORT_HARDENED = False
 
 
@@ -105,6 +128,13 @@ def _harden_litellm_transport() -> None:
     import litellm
     try:
         litellm.disable_token_counter = True  # no tiktoken BPE downloads (offline)
+    except Exception:
+        pass
+    try:
+        import litellm.main as _litellm_main
+        if getattr(_litellm_main, "_encoding_cache", None) is None:
+            _litellm_main._encoding_cache = _OfflineEncoding()
+        _litellm_main.__dict__.setdefault("encoding", _litellm_main._encoding_cache)
     except Exception:
         pass
     for name in ("module_level_client", "module_level_aclient"):
