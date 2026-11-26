@@ -597,3 +597,60 @@ def test_web_get_page_tool_end_to_end_and_typed_input(tmp_path, page_server):
                       ctx=ToolExecutionContext(agent="analyst", run_id="run-1"))
     assert res2.ok is False and "not allowed" in res2.error
     store.close()
+
+
+# ---- W3 residual acceptance gate ------------------------------------------------------
+
+def test_duplicate_query_param_ambiguous_rejected(tmp_path, page_server):
+    engine, store, reg = make_engine(tmp_path, page_server, web_apis())
+    gen = make_run(store)
+    with pytest.raises(WebRetrievalError, match="duplicate query"):
+        fetch(engine, page_server, path="/docs/guide?q=1&q=2", run_id="run-1",
+              lease_owner="w1", lease_generation=gen)
+    assert PageHandler.hits == []
+    store.close()
+
+
+def test_unicode_hostname_confusion_rejected(tmp_path, page_server):
+    from geosgan_hive.web_retrieval import parse_web_url
+
+    engine, store, reg = make_engine(tmp_path, page_server, web_apis())
+    gen = make_run(store)
+    # Cyrillic homoglyph in the host must not match the allowlisted ASCII host
+    evil = "http://\u043e" + f"127.0.0.1:{page_server}/docs"
+    with pytest.raises(WebRetrievalError, match="not the allowlisted"):
+        fetch(engine, page_server, url=evil, run_id="run-1", lease_owner="w1",
+              lease_generation=gen)
+    # a trailing dot is the SAME name (FQDN form) -> accepted and canonicalized
+    rule = engine.session.client.rule_for("web-docs")
+    c = parse_web_url(f"http://127.0.0.1.:{page_server}/docs/a",
+                      engine.policies["web-docs"], rule)
+    assert c.url == f"http://127.0.0.1:{page_server}/docs/a"
+    store.close()
+
+def test_html_huge_attribute_and_input_bound(tmp_path):
+    # 500KB attribute value inside one tag: parser input is bounded, extraction truncates
+    body = b'<p title="' + b"A" * 500_000 + b'">text</p>'
+    r = html_to_text(body, charset="utf-8", max_chars=1000, max_tags=100, deadline_s=5)
+    assert r.truncated is True and len(r.text) <= 1000
+    # input bound: max_chars*8+64KB; larger input is cut and flagged
+    big = b"<p>" + b"x" * (1000 * 8 + 70_000) + b"</p>"
+    r2 = html_to_text(big, charset="utf-8", max_chars=1000, max_tags=100, deadline_s=5)
+    assert r2.truncated is True
+
+
+def test_canonicalization_parity_approval_vs_dispatch(tmp_path, page_server):
+    """The approval digest and the dispatched request are computed from the SAME
+    canonical (path, params) — a URL that canonicalizes differently can never
+    ride an approval for another request."""
+    from geosgan_hive.web_retrieval import parse_web_url
+
+    engine, store, reg = make_engine(tmp_path, page_server, web_apis())
+    rule = engine.session.client.rule_for("web-docs")
+    pol = engine.policies["web-docs"]
+    a = parse_web_url(f"http://127.0.0.1:{page_server}/docs/a?q=x%20y", pol, rule)
+    b = parse_web_url(f"http://127.0.0.1:{page_server}/docs/a?q=x+y", pol, rule)
+    assert a.url == b.url and a.request_sha256 == b.request_sha256  # same canonical form
+    c = parse_web_url(f"http://127.0.0.1:{page_server}/docs/a?q=xy", pol, rule)
+    assert c.request_sha256 != a.request_sha256
+    store.close()

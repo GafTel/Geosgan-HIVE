@@ -136,6 +136,10 @@ def parse_web_url(url: Any, policy: WebEndpointPolicy, rule: EndpointRule) -> Ca
     for k, v in parse_qsl(parts.query, keep_blank_values=True):
         if k not in allowed_q:
             raise WebRetrievalError(f"query parameter {k!r} is not allowed by the endpoint policy")
+        if k in params:
+            # W3 residual: duplicate names are ambiguous (which value was
+            # authorized?) — reject instead of silently keeping the last one
+            raise WebRetrievalError(f"duplicate query parameter {k!r} — ambiguous, rejected")
         if len(v) > policy.max_query_value_chars:
             raise WebRetrievalError(f"query parameter {k!r} value exceeds "
                                     f"{policy.max_query_value_chars} chars")
@@ -268,8 +272,11 @@ def html_to_text(body: bytes, *, charset: str = "utf-8", max_chars: int,
         decoded = body.decode(charset or "utf-8", "replace")
     except LookupError:
         decoded = body.decode("utf-8", "replace")
-    # bound the decode input defensively as well (body is already transport-capped)
-    decoded = decoded[: max_chars * 8 + 65536]
+    # bound the parser input defensively as well (body is already transport-capped);
+    # cutting input is recorded as truncation, never silently
+    input_cap = max_chars * 8 + 65536
+    input_truncated = len(decoded) > input_cap
+    decoded = decoded[:input_cap] if input_truncated else decoded
     parser = _TextExtractor(max_chars=max_chars, max_tags=max_tags,
                             deadline=time.monotonic() + deadline_s)
     try:
@@ -285,7 +292,7 @@ def html_to_text(body: bytes, *, charset: str = "utf-8", max_chars: int,
     text = "\n".join(line.strip() for line in raw.split("\n") if line.strip())[:max_chars]
     return ExtractionResult(
         title=parser.title, text=text, headings=parser.headings[:20],
-        truncated=parser.truncated or len(raw) > max_chars,
+        truncated=parser.truncated or input_truncated or len(raw) > max_chars,
         tags_seen=parser.tags_seen,
         extract_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
     )
