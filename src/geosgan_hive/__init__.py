@@ -30,6 +30,7 @@ from .agents import (
     parse_tool_call,
 )
 from .api_adapters import register_api_tools
+from .benchmarks import SimulatedCaller, format_report, run_benchmark
 from .catalog import (
     BillingClassification,
     CatalogModel,
@@ -189,6 +190,9 @@ __all__ = [
     "load_catalog",
     "ApiSession",
     "register_api_tools",
+    "SimulatedCaller",
+    "run_benchmark",
+    "format_report",
     "EndpointRule",
     "HttpLimits",
     "HttpResult",

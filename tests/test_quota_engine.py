@@ -164,8 +164,8 @@ def _make_v5_db(path):
     conn.close()
 
 
-def test_schema_version_is_9_and_fresh_store_has_quota_tables(tmp_path):
-    assert SCHEMA_VERSION == 9
+def test_schema_version_is_10_and_fresh_store_has_quota_and_benchmark_tables(tmp_path):
+    assert SCHEMA_VERSION == 10
     store = CheckpointStore(str(tmp_path / "fresh.db"))
     with store._lock:
         names = {r[0] for r in store._conn.execute(
@@ -184,7 +184,7 @@ def test_migrate_v5_to_v6_preserves_all_data(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         names = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "9"
+    assert v == "10"
     assert {"quota_reservations", "quota_usage", "quota_policies",
             "quota_policy_audit"} <= names
     cp = store.get("r5")
@@ -972,7 +972,8 @@ def test_interrupted_migration_rolls_back_and_recovers(tmp_path, monkeypatch):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "9" and {"quota_reservations", "quota_usage", "quota_policies", "api_reservations",
+    assert v == "10" and {"quota_reservations", "quota_usage", "quota_policies",
+                         "api_reservations", "benchmark_evidence",
                          "quota_policy_audit"} <= tables
     assert store.get("r5") is not None
     store.close()
@@ -1195,7 +1196,7 @@ def test_dev_v6_database_migrates_to_v7_explicitly(tmp_path):
             "PRAGMA table_info(quota_policies)").fetchall()}
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "9"
+    assert v == "10"
     assert {"constraints_json", "reset_semantics"} <= cols
     assert "quota_policy_audit" in tables
     # stored rows preserved and hashes recomputed consistently

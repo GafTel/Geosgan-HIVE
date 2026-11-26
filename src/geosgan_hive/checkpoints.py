@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ from typing import Any
 
 from .errors import CheckpointError, QuotaExhaustedError
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: Phase 3 (T4): durable tool-execution ledger + human approvals
 _LEDGER_SCHEMA = """
@@ -173,6 +174,35 @@ CREATE TABLE IF NOT EXISTS api_audit (
     provenance TEXT NOT NULL DEFAULT '',
     at TEXT NOT NULL
 );
+"""
+
+#: Phase 5 (A2): reproducible model-benchmark evidence (v10). Evidence records the
+#: EXACT model identity (model_id with a pinned version) and execution_mode
+#: (simulated vs measured). Simulated results are synthetic fixtures and must
+#: NEVER be presented as real model measurements; measured records require an
+#: execution transcript hash + operator attestation. Evidence expires (TTL) and
+#: is swept; rows are bounded metadata + per-case scores (no raw prompts/outputs
+#: beyond the bounded case results).
+_BENCHMARK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS benchmark_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    suite_version TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('simulated', 'measured')),
+    aggregate_score REAL NOT NULL,
+    cases_passed INTEGER NOT NULL,
+    cases_total INTEGER NOT NULL,
+    cases_json TEXT NOT NULL,
+    hardware_profile TEXT NOT NULL DEFAULT '',
+    run_config_json TEXT NOT NULL,
+    provenance TEXT NOT NULL,
+    transcript_sha256 TEXT,
+    runner_attestation TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_model ON benchmark_evidence (model_id);
 """
 
 _QUOTA_KINDS = ("requests", "tokens")
@@ -584,6 +614,7 @@ class CheckpointStore:
             _exec_schema(self._conn, _LEDGER_SCHEMA)  # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _QUOTA_SCHEMA)    # idempotent (IF NOT EXISTS)
             _exec_schema(self._conn, _API_SCHEMA)      # idempotent (IF NOT EXISTS)
+            _exec_schema(self._conn, _BENCHMARK_SCHEMA)  # idempotent (IF NOT EXISTS)
             row = self._conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -613,6 +644,8 @@ class CheckpointStore:
                         self._migrate_7_to_8()
                     elif v == 8:
                         self._migrate_8_to_9()
+                    elif v == 9:
+                        self._migrate_9_to_10()
                     else:
                         raise CheckpointError(
                             f"checkpoint database {self.path!r} has schema_version {v}, "
@@ -728,7 +761,17 @@ class CheckpointStore:
         Runs inside the caller's open transaction; an interruption rolls back fully."""
         _exec_schema(self._conn, _API_SCHEMA)
         self._conn.execute(
-            "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(9),)
+        )
+
+    def _migrate_9_to_10(self) -> None:
+        """v9 -> v10 (Phase 5 A2): adds benchmark_evidence (model benchmark runs with
+        exact model identity, simulated/measured separation, expiry). Purely additive
+        (IF NOT EXISTS); all v9 data preserved. Runs inside the caller's open
+        transaction; an interruption rolls back fully."""
+        _exec_schema(self._conn, _BENCHMARK_SCHEMA)
+        self._conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(10),)
         )
 
     def _harden_permissions(self) -> None:
@@ -2326,6 +2369,117 @@ class CheckpointStore:
                     "SELECT * FROM api_audit WHERE provider=? ORDER BY id DESC LIMIT 500",
                     (provider,)).fetchall()
         return [{k: r[k] for k in r.keys()} for r in rows]
+
+    # ---- benchmark evidence (v10, Phase 5 A2) ----------------------------------
+
+    #: maximum TTL for benchmark evidence (bounded retention)
+    BENCHMARK_MAX_TTL_DAYS = 90
+    #: maximum serialized size of the per-case results blob
+    BENCHMARK_MAX_CASES_BYTES = 256 * 1024
+
+    def record_benchmark_evidence(
+        self,
+        *,
+        evidence_id: str,
+        suite_version: str,
+        model_id: str,
+        model_version: str,
+        execution_mode: str,
+        aggregate_score: float,
+        cases_passed: int,
+        cases_total: int,
+        cases_json: str,
+        hardware_profile: str = "",
+        run_config_json: str = "{}",
+        provenance: str = "",
+        transcript_sha256: str | None = None,
+        runner_attestation: str = "",
+        ttl_days: int = 30,
+        now_iso: str | None = None,
+    ) -> None:
+        """Atomically persist ONE benchmark evidence record. Validation is strict:
+        - execution_mode is 'simulated' or 'measured';
+        - a MEASURED record REQUIRES a transcript hash AND a non-empty runner
+          attestation (operator) — a simulated result can never be relabeled as a
+          real measurement;
+        - model_id must be an exact pinned identity (contains '@' version pin);
+        - scores are within [0, 1], case counts consistent, cases_json bounded;
+        - expiry is in the future and within the max TTL.
+        One transaction; fail closed on any violation."""
+        now = now_iso or self.now_iso()
+        if execution_mode not in ("simulated", "measured"):
+            raise CheckpointError(f"invalid execution_mode {execution_mode!r}")
+        if execution_mode == "measured" and (not transcript_sha256 or not runner_attestation):
+            raise CheckpointError(
+                "measured benchmark evidence requires transcript_sha256 AND "
+                "runner_attestation (operator) — simulated results must never be "
+                "presented as real model measurements")
+        if not re.fullmatch(r"[a-z0-9_./-]+@[A-Za-z0-9][A-Za-z0-9._:+-]{3,127}", model_id or ""):
+            raise CheckpointError(
+                "model_id must be an exact pinned identity like 'ollama/llama3.2@sha256:...'")
+        if not model_version or len(model_version) > 128:
+            raise CheckpointError("model_version must be a non-empty bounded string")
+        if not 0.0 <= aggregate_score <= 1.0:
+            raise CheckpointError("aggregate_score must be within [0, 1]")
+        if not (0 <= cases_passed <= cases_total) or cases_total < 1 or cases_total > 10_000:
+            raise CheckpointError("inconsistent case counts")
+        if len(cases_json.encode("utf-8")) > self.BENCHMARK_MAX_CASES_BYTES:
+            raise CheckpointError("cases_json too large")
+        if not 1 <= ttl_days <= self.BENCHMARK_MAX_TTL_DAYS:
+            raise CheckpointError(f"ttl_days must be within 1..{self.BENCHMARK_MAX_TTL_DAYS}")
+        created = datetime.fromisoformat(now)
+        expires = (created + timedelta(days=ttl_days)).isoformat(timespec="milliseconds")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO benchmark_evidence (evidence_id, suite_version, model_id, "
+                "model_version, execution_mode, aggregate_score, cases_passed, cases_total, "
+                "cases_json, hardware_profile, run_config_json, provenance, "
+                "transcript_sha256, runner_attestation, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (evidence_id, suite_version, model_id, model_version, execution_mode,
+                 float(aggregate_score), int(cases_passed), int(cases_total), cases_json,
+                 hardware_profile[:500], run_config_json[:4096], provenance[:500],
+                 transcript_sha256, runner_attestation[:200], now, expires),
+            )
+
+    def get_benchmark_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM benchmark_evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+        return {k: row[k] for k in row.keys()} if row else None
+
+    def list_benchmark_evidence(
+        self, *, model_id: str | None = None, include_expired: bool = False,
+        now_iso: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List benchmark evidence (newest first). Expired records are hidden by
+        default; pass include_expired=True to see them (marked expired)."""
+        now = now_iso or self.now_iso()
+        with self._lock:
+            query = "SELECT * FROM benchmark_evidence"
+            cond, params = [], []
+            if model_id is not None:
+                cond.append("model_id=?")
+                params.append(model_id)
+            if not include_expired:
+                cond.append("expires_at > ?")
+                params.append(now)
+            if cond:
+                query += " WHERE " + " AND ".join(cond)
+            query += " ORDER BY created_at DESC, evidence_id DESC LIMIT 500"
+            rows = self._conn.execute(query, params).fetchall()
+        out = [{k: r[k] for k in r.keys()} for r in rows]
+        for r in out:
+            r["expired"] = r["expires_at"] <= now
+        return out
+
+    def sweep_expired_benchmark_evidence(self, now_iso: str | None = None) -> int:
+        now = now_iso or self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM benchmark_evidence WHERE expires_at <= ?", (now,))
+            return cur.rowcount
 
     def close(self) -> None:
         with self._lock:

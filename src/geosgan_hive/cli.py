@@ -136,6 +136,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision", default=None, choices=["completed", "failed"],
                         help="Resolution decision for --resolve-execution")
     parser.add_argument("--evidence", default="", help="Evidence note for --resolve-execution")
+    # Phase 5 (v0.7.0, A2): model benchmark engine management (offline/simulated
+    # by default; measured runs need separate authorization — never executed here)
+    parser.add_argument(
+        "--benchmark-simulate", action="store_true",
+        help="Run the benchmark suite with the deterministic SIMULATED caller "
+             "(synthetic fixtures, no model/network) and store the evidence; exit",
+    )
+    parser.add_argument("--benchmark-model", default="simulated/fixture@sha256:0000",
+                        help="Exact pinned model identity recorded for --benchmark-simulate")
+    parser.add_argument("--benchmark-suite", default=None,
+                        help="Benchmark suite version (default: latest)")
+    parser.add_argument("--benchmark-report", action="store_true",
+                        help="Print the stored benchmark evidence report and exit")
+    parser.add_argument("--benchmark-list", action="store_true",
+                        help="Like --benchmark-report but includes expired records")
+    parser.add_argument("--benchmark-model-filter", default=None,
+                        help="Filter benchmark report by exact model id")
     args = parser.parse_args(argv)
 
     management = bool(
@@ -143,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.recovery_worker or args.pending_approvals is not None
         or args.show_approval or args.approve or args.deny or args.cancel_approval
         or args.tool_executions or args.resolve_execution
+        or args.benchmark_simulate or args.benchmark_report or args.benchmark_list
     )
     if args.task is None and not management:
         parser.error("task is required unless a management command is used "
@@ -327,6 +345,33 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if args.benchmark_simulate and store is not None:
+            from .benchmarks import SUITE_VERSION, SimulatedCaller, format_report, run_benchmark
+
+            suite = args.benchmark_suite or SUITE_VERSION
+            result = run_benchmark(
+                store, caller=SimulatedCaller(), model_id=args.benchmark_model,
+                model_version=args.benchmark_model.split("@", 1)[1], suite_version=suite,
+                execution_mode="simulated",
+                hardware_profile="offline-simulated",
+                run_config={"caller": "SimulatedCaller", "suite": suite},
+                provenance="CLI --benchmark-simulate (synthetic fixtures; NOT a real "
+                           "model measurement)",
+            )
+            print(f"Simulated benchmark recorded: {result.evidence_id} "
+                  f"score={result.aggregate_score:.3f} "
+                  f"cases={result.cases_passed}/{result.cases_total} "
+                  f"mode={result.execution_mode.upper()}")
+            print(format_report(store.list_benchmark_evidence()))
+            return 0
+        if (args.benchmark_report or args.benchmark_list) and store is not None:
+            from .benchmarks import format_report
+
+            rows = store.list_benchmark_evidence(
+                model_id=args.benchmark_model_filter,
+                include_expired=args.benchmark_list)
+            print(format_report(rows))
+            return 0
         if args.resume:
             if args.async_:
                 result = asyncio.run(supervisor.aresume(args.resume))

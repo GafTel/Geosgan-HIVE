@@ -550,7 +550,7 @@ def test_schema_v4_migrates_to_v6_with_ledger_and_quota_tables(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         v = store2._conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert v == "9" and {"tool_executions", "approvals", "quota_reservations", "api_reservations",
+    assert v == "10" and {"tool_executions", "approvals", "quota_reservations", "api_reservations",
                          "quota_usage", "quota_policies", "quota_policy_audit"} <= tables
     store2.close()
 
