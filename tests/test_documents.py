@@ -560,8 +560,11 @@ def test_missing_dependency_in_worker_fails_closed(env):
 
     reader, store, sandbox, ws, gen = env
     make_pdf(ws / "doc.pdf", ["hello"])
+    # the parser libraries are import-blocked INSIDE the worker regardless of
+    # where pip installed them (works in user-site and system-site installs)
     pool = ParserWorkerPool(work_root=str(store.path + ".jobs"),
-                            worker_extra_paths=[])  # no site dirs in the worker
+                            worker_blocked_modules=["pypdf", "docx", "openpyxl",
+                                                    "defusedxml"])
     reader._pool = pool
     with pytest.raises(DocumentUnavailableError, match="pypdf"):
         reader.read("doc.pdf", **lease(gen))

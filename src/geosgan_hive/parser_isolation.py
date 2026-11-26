@@ -97,6 +97,19 @@ for _p in _cfg.get("extra_paths", []):
             _sys.path.append(_p)
     except Exception:
         pass
+# optional import blocklist (test/diagnostic use): modules that must never be
+# importable inside the worker, regardless of where they are installed
+_blocked = set(_cfg.get("blocked_modules", []))
+if _blocked:
+    import importlib.abc as _abc
+
+    class _Blocker(_abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name.split(".")[0] in _blocked:
+                raise ImportError(f"module blocked in parser worker: {name}")
+            return None
+
+    _sys.meta_path.insert(0, _Blocker())
 for _name, _soft, _hard in _cfg["rlimits"]:
     try:
         _resource.setrlimit(getattr(_resource, _name), (_soft, _hard))
@@ -180,6 +193,7 @@ class ParserWorkerPool:
         work_root: str | None = None,
         platform: str | None = None,
         worker_extra_paths: list[str] | None = None,
+        worker_blocked_modules: list[str] | None = None,
     ) -> None:
         if max_workers < 1 or max_workers > 16:
             raise ValueError("max_workers must be in [1, 16]")
@@ -204,6 +218,7 @@ class ParserWorkerPool:
         #: None = interpreter-standard site dirs; [] = none (used by tests to
         #: prove fail-closed behavior when optional parser deps are missing)
         self._worker_extra_paths = worker_extra_paths
+        self._worker_blocked = list(worker_blocked_modules or [])
         if work_root is not None:
             Path(work_root).mkdir(parents=True, exist_ok=True)
 
@@ -403,7 +418,8 @@ class ParserWorkerPool:
         argv = [
             sys.executable, "-I", "-c", _WORKER_BOOTSTRAP,
             self._src_dir,
-            json.dumps({"rlimits": self._rlimits_cfg(), "extra_paths": extra_paths}),
+            json.dumps({"rlimits": self._rlimits_cfg(), "extra_paths": extra_paths,
+                        "blocked_modules": self._worker_blocked}),
             input_path, output_path,
         ]
         deadline = started + deadline_s
