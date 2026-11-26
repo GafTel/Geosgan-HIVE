@@ -585,6 +585,31 @@ def test_simulated_and_operator_reported_evidence_never_routing_eligible(tmp_pat
     store.close()
 
 
+def test_runtime_recorder_flag_is_not_a_caller_parameter(tmp_path):
+    """Failing-first regression for a confirmed defect: the public recorder used
+    to accept _runtime_recorder=True, letting a caller mint trusted_runtime
+    evidence with NO lease fencing. Now the public method has NO such parameter
+    (TypeError) and the tier is unconditionally rejected (CheckpointError). The
+    trusted-process boundary is documented: this defends the API boundary, not
+    against arbitrary privileged local code or direct DB writes."""
+    store = _store(tmp_path)
+    kw = _record_kwargs(execution_mode="measured", transcript_sha256="ab" * 32,
+                        runner_attestation="op", trust_tier="trusted_runtime",
+                        evaluator_id=CheckpointStore.RUNTIME_EVALUATOR_ID)
+    with pytest.raises(TypeError):
+        store.record_benchmark_evidence(**{**kw, "_runtime_recorder": True})
+    with pytest.raises(CheckpointError, match="trusted_runtime"):
+        store.record_benchmark_evidence(**kw)
+    # reserved evaluator id alone (no tier) is also rejected on the caller path
+    with pytest.raises(CheckpointError, match="reserved"):
+        store.record_benchmark_evidence(**_record_kwargs(
+            execution_mode="measured", transcript_sha256="ab" * 32,
+            runner_attestation="op",
+            evaluator_id=CheckpointStore.RUNTIME_EVALUATOR_ID))
+    assert store.list_benchmark_evidence(include_expired=True) == []
+    store.close()
+
+
 def test_runtime_recorder_requires_live_lease(tmp_path):
     store = _store(tmp_path)
     kw = dict(run_id="r1", lease_owner="w1", lease_generation=0, evidence_id="ev-rt",

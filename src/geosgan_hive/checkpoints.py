@@ -2460,26 +2460,60 @@ class CheckpointStore:
         trust_tier: str | None = None,
         evaluator_id: str = "",
         now_iso: str | None = None,
-        _runtime_recorder: bool = False,
     ) -> None:
-        """Atomically persist ONE benchmark evidence record. Validation is strict:
+        """Atomically persist ONE benchmark evidence record (CALLER path).
+
+        Validation is strict and fail-closed:
         - execution_mode is 'simulated' or 'measured';
         - TRUST TIERS: simulated -> infrastructure_test|synthetic_fixture;
-          measured+attestation -> operator_reported ONLY (a caller can NEVER set
-          trusted_runtime — that tier is reserved for the lease-fenced runtime
-          recorder below). Operator-attested evidence is NOT verified
-          measurement evidence and is ineligible for automatic quality routing;
+          measured+attestation -> operator_reported ONLY. trusted_runtime is
+          UNCONDITIONALLY rejected here: this public method has NO parameter
+          that can enable it (the lease-fenced runtime recorder calls the
+          private inserter directly). Operator-attested evidence is NOT
+          verified measurement evidence and is never routing-eligible;
         - a MEASURED record REQUIRES a transcript hash AND a non-empty operator
           attestation; arbitrary caller-provided hashes never elevate the tier;
-        - evaluator_id is required; RUNTIME_EVALUATOR_ID is RESERVED and usable
-          only through the private _runtime_recorder path (solely the
-          lease-fenced recorder) — a caller naming the runtime evaluator
-          never gains trusted_runtime status;
+        - evaluator_id is required; RUNTIME_EVALUATOR_ID is RESERVED and
+          unconditionally rejected on this path;
         - model_id must be an exact pinned identity (contains '@' version pin);
         - scores within [0,1], case counts consistent, cases_json bounded;
         - duplicate evidence_id is rejected (no replay/substitution);
         - expiry is in the future and within the max TTL.
-        One transaction; fail closed on any violation."""
+        One transaction; fail closed on any violation.
+
+        TRUSTED-PROCESS BOUNDARY (documented limitation): this boundary defends
+        against unauthorized API misuse inside the process. It does NOT claim
+        protection against arbitrary privileged Python execution or direct
+        database modification by an already-privileged local actor."""
+        trust_tier, expires = self._validate_benchmark_evidence(
+            execution_mode=execution_mode, trust_tier=trust_tier,
+            evaluator_id=evaluator_id, model_id=model_id,
+            model_version=model_version, aggregate_score=aggregate_score,
+            cases_passed=cases_passed, cases_total=cases_total,
+            cases_json=cases_json, ttl_days=ttl_days,
+            transcript_sha256=transcript_sha256,
+            runner_attestation=runner_attestation,
+            allow_runtime_tier=False, now_iso=now_iso)
+        self._insert_benchmark_evidence(
+            evidence_id=evidence_id, suite_version=suite_version, model_id=model_id,
+            model_version=model_version, execution_mode=execution_mode,
+            aggregate_score=aggregate_score, cases_passed=cases_passed,
+            cases_total=cases_total, cases_json=cases_json,
+            hardware_profile=hardware_profile, run_config_json=run_config_json,
+            provenance=provenance, transcript_sha256=transcript_sha256,
+            runner_attestation=runner_attestation, trust_tier=trust_tier,
+            evaluator_id=evaluator_id, expires=expires, now_iso=now_iso)
+
+    def _validate_benchmark_evidence(
+        self, *, execution_mode, trust_tier, evaluator_id, model_id, model_version,
+        aggregate_score, cases_passed, cases_total, cases_json, ttl_days,
+        transcript_sha256, runner_attestation, allow_runtime_tier: bool,
+        now_iso: str | None,
+    ) -> tuple[str, str]:
+        """Shared strict validation. Returns (resolved_trust_tier, expires).
+        `allow_runtime_tier` is hardcoded False by the public caller path and
+        True ONLY by the lease-fenced runtime recorder; it is never a
+        caller-controlled parameter."""
         now = now_iso or self.now_iso()
         if execution_mode not in ("simulated", "measured"):
             raise CheckpointError(f"invalid execution_mode {execution_mode!r}")
@@ -2489,12 +2523,12 @@ class CheckpointStore:
                 else "operator_reported"
         if trust_tier not in self.TRUST_TIERS:
             raise CheckpointError(f"invalid trust_tier {trust_tier!r}")
-        if trust_tier == "trusted_runtime" and not _runtime_recorder:
+        if trust_tier == "trusted_runtime" and not allow_runtime_tier:
             raise CheckpointError(
                 "trusted_runtime evidence can only be recorded through the "
                 "lease-fenced runtime recorder (record_runtime_benchmark_evidence) "
                 "— a caller-provided tier, hash or boolean never establishes it")
-        if evaluator_id == self.RUNTIME_EVALUATOR_ID and not _runtime_recorder:
+        if evaluator_id == self.RUNTIME_EVALUATOR_ID and not allow_runtime_tier:
             raise CheckpointError(
                 f"evaluator_id {self.RUNTIME_EVALUATOR_ID!r} is reserved for the "
                 "lease-fenced runtime recorder — caller-supplied evidence never "
@@ -2505,11 +2539,11 @@ class CheckpointStore:
                 "simulated evidence can only have infrastructure_test/synthetic_fixture "
                 "trust — relabeling simulated results is rejected")
         if execution_mode == "measured":
-            if trust_tier != "operator_reported" and not _runtime_recorder:
+            if trust_tier != "operator_reported" and not allow_runtime_tier:
                 raise CheckpointError(
                     "caller-recorded measured evidence is operator_reported at most — "
                     "not verified measurement evidence")
-            if not transcript_sha256 or not runner_attestation:
+            if not allow_runtime_tier and (not transcript_sha256 or not runner_attestation):
                 raise CheckpointError(
                     "measured benchmark evidence requires transcript_sha256 AND "
                     "runner_attestation (operator); a hash alone never suffices")
@@ -2530,6 +2564,19 @@ class CheckpointStore:
             raise CheckpointError(f"ttl_days must be within 1..{self.BENCHMARK_MAX_TTL_DAYS}")
         created = datetime.fromisoformat(now)
         expires = (created + timedelta(days=ttl_days)).isoformat(timespec="milliseconds")
+        return trust_tier, expires
+
+    def _insert_benchmark_evidence(
+        self, *, evidence_id, suite_version, model_id, model_version, execution_mode,
+        aggregate_score, cases_passed, cases_total, cases_json, hardware_profile,
+        run_config_json, provenance, transcript_sha256, runner_attestation,
+        trust_tier, evaluator_id, expires, now_iso: str | None,
+    ) -> None:
+        """Private atomic insert of an ALREADY-VALIDATED evidence record. Only
+        record_benchmark_evidence (caller path, non-trusted tiers) and
+        record_runtime_benchmark_evidence (lease-fenced, trusted_runtime) call
+        this; both validate first via _validate_benchmark_evidence."""
+        now = now_iso or self.now_iso()
         try:
             with self._lock, self._conn:
                 self._conn.execute(
@@ -2583,7 +2630,19 @@ class CheckpointStore:
             if not self._verify_lease_locked(run_id, lease_owner, lease_generation):
                 raise CheckpointError(
                     "stale worker: lease fencing failed for runtime benchmark evidence")
-        self.record_benchmark_evidence(
+        # the ONLY trusted_runtime path: lease-fenced above; the validation is
+        # shared but allow_runtime_tier=True is hardcoded HERE (never a caller
+        # parameter of the public recorder)
+        _tier, expires = self._validate_benchmark_evidence(
+            execution_mode="measured", trust_tier="trusted_runtime",
+            evaluator_id=self.RUNTIME_EVALUATOR_ID, model_id=model_id,
+            model_version=model_version, aggregate_score=aggregate_score,
+            cases_passed=cases_passed, cases_total=cases_total,
+            cases_json=cases_json, ttl_days=ttl_days,
+            transcript_sha256=transcript_sha256,
+            runner_attestation=self.RUNTIME_EVALUATOR_ID,
+            allow_runtime_tier=True, now_iso=now_iso)
+        self._insert_benchmark_evidence(
             evidence_id=evidence_id, suite_version=suite_version, model_id=model_id,
             model_version=model_version, execution_mode="measured",
             aggregate_score=aggregate_score, cases_passed=cases_passed,
@@ -2592,10 +2651,8 @@ class CheckpointStore:
             provenance="trusted runtime measurement (lease-fenced recorder)",
             transcript_sha256=transcript_sha256,
             runner_attestation=self.RUNTIME_EVALUATOR_ID,
-            ttl_days=ttl_days, trust_tier="trusted_runtime",
-            evaluator_id=self.RUNTIME_EVALUATOR_ID, now_iso=now_iso,
-            _runtime_recorder=True,
-        )
+            trust_tier="trusted_runtime", evaluator_id=self.RUNTIME_EVALUATOR_ID,
+            expires=expires, now_iso=now_iso)
 
     def benchmark_evidence_is_routing_eligible(self, row: dict[str, Any],
                                                suite_cases: int | None = None,
