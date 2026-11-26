@@ -129,6 +129,12 @@ def test_real_loopback_transport_end_to_end(tmp_path, local_server, monkeypatch,
     assert answer == "hello from real local transport"
     assert handler.seen and handler.seen[0]["path"] == "/api/generate"
     assert handler.seen[0]["host"].startswith("127.0.0.1:")  # loopback only
+    # the gateway hardened the real transport: no redirect following, and no
+    # tiktoken BPE downloads (litellm's local token counter disabled)
+    import litellm
+    assert litellm.module_level_client._client.follow_redirects is False
+    assert litellm.module_level_aclient._client.follow_redirects is False
+    assert litellm.disable_token_counter is True
     status = gate.engine.quota_status(MODEL, now=NOW)
     assert status[("requests", "day")]["used"] == 1  # durable reservation+dispatch
     store.close()

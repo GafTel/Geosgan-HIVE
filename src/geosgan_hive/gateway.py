@@ -93,11 +93,20 @@ def _harden_litellm_transport() -> None:
     could open a connection to an UNAUTHORIZED destination. Disabling redirect
     following makes any 3xx surface as an error (fail closed) instead of a new
     connection. This is a real production control on the actual transport, not
-    a test spy. Applied to both the sync and async module-level clients."""
+    a test spy. Applied to both the sync and async module-level clients.
+
+    Also disables LiteLLM's local token counter: on cold caches tiktoken
+    downloads BPE files from a remote host during provider calls (observed on
+    the ollama path). HIVE never needs it - the zero-cost gate uses its own
+    conservative bounds and usage comes from the provider response."""
     global _LITELLM_TRANSPORT_HARDENED
     if _LITELLM_TRANSPORT_HARDENED:
         return
     import litellm
+    try:
+        litellm.disable_token_counter = True  # no tiktoken BPE downloads (offline)
+    except Exception:
+        pass
     for name in ("module_level_client", "module_level_aclient"):
         handler = getattr(litellm, name, None)
         if handler is None:
