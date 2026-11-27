@@ -189,6 +189,35 @@ def _op_fds(req: dict[str, Any]) -> dict[str, Any]:
     return {"fds": sorted(targets)}
 
 
+def _make_gen_op(fn_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """W5: document generation ops. The spec comes from the validated request
+    (bounded); the generator runs in the isolated worker and the produced bytes
+    go to the output path (capped); the response carries only the hash."""
+
+    def op(req: dict[str, Any]) -> dict[str, Any]:
+        from geosgan_hive import docgen as _dg
+
+        fn = getattr(_dg, fn_name)
+        lim = req["limits"]
+        try:
+            spec = _dg.DocumentSpec.model_validate(req.get("spec") or {})
+            data = fn(spec, lim)
+        except Exception as exc:
+            # bounded, typed error frame (never a traceback); ok=False overrides
+            # the wrapper's ok=True so the parent reports the failure cleanly
+            return {"ok": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        cap = int(lim["max_output_bytes"])
+        if len(data) > cap:
+            return {"ok": False, "error": "generated artifact exceeds output cap"}
+        with open(req["output_path"], "wb") as fh:
+            fh.write(data)
+        return {"output_bytes": len(data),
+                "output_sha256": hashlib.sha256(data).hexdigest()}
+
+    return op
+
+
 def _make_parse_op(fn_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """W4: document parse ops. The op reads the capped input, calls the trusted
     parser function (lazy optional-dependency import inside), and writes the
@@ -231,6 +260,9 @@ OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "parse_pdf": _make_parse_op("worker_parse_pdf"),
     "parse_docx": _make_parse_op("worker_parse_docx"),
     "parse_xlsx": _make_parse_op("worker_parse_xlsx"),
+    "gen_pdf": _make_gen_op("worker_generate_pdf"),
+    "gen_docx": _make_gen_op("worker_generate_docx"),
+    "gen_xlsx": _make_gen_op("worker_generate_xlsx"),
 }
 
 

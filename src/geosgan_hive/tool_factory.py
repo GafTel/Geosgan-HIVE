@@ -51,6 +51,13 @@ def build_tool_catalog(config: HiveConfig | None = None) -> tuple[ToolCatalog, W
     root = config.tools.workspace_root if has_tools else "workspace"
     deny = config.tools.deny_name_patterns if has_tools else None
     write_ext = config.tools.write_extensions if has_tools else None
+    # W5: when document generation is enabled, its output extensions join the
+    # sandbox write allowlist (operator opt-in via documents.enabled)
+    docs_on = (config is not None and getattr(config, "documents", None) is not None
+               and config.documents.enabled)
+    if docs_on:
+        extra = {".pdf", ".docx", ".xlsx", ".csv", ".json", ".md", ".txt"}
+        write_ext = sorted(set(write_ext or [".txt", ".md"]) | extra)
     sandbox = WorkspaceSandbox(root, deny, write_extensions=write_ext)
     # Fail closed where race-resistant containment cannot be guaranteed (no
     # post-open fd re-verification, e.g. Windows/macOS): file tools are not even
@@ -87,10 +94,14 @@ def build_tool_gateway(
     # parse inside the isolated POSIX parser worker (fail closed elsewhere).
     docs_cfg = getattr(config, "documents", None)
     if docs_cfg is not None and docs_cfg.enabled and store is not None:
+        from .docgen import DocumentWriter, docgen_tools
         from .documents import DocumentReader, doc_tools
 
         reader = DocumentReader(store=store, sandbox=_sandbox, config=docs_cfg)
         for spec, adapter in doc_tools(reader, lease_lookup=lease_lookup):
+            catalog.register(spec, adapter)
+        writer = DocumentWriter(store=store, sandbox=_sandbox, config=docs_cfg)
+        for spec, adapter in docgen_tools(writer, lease_lookup=lease_lookup):
             catalog.register(spec, adapter)
     if approval_manager is None and store is not None and config.tools is not None:
         approval_manager = ApprovalManager(
