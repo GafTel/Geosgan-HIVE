@@ -75,6 +75,10 @@ examples/demo_collaboration.py  # Offline Phase 2 demo (parallel delegation, run
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env   # add only the provider keys you actually use
+# Optional (v0.8.0 Web & Document Engine): local document read/generate libraries
+# (pypdf, python-docx, openpyxl, reportlab, defusedxml - all free, local, lazy).
+# Without this extra the core package installs and runs fully offline.
+pip install -e ".[docs]"
 ```
 
 ## Usage
@@ -823,7 +827,22 @@ zero-cost paths. Outside zero-cost mode, legacy semantics are preserved.
 - No real model-quality ranking has been established; evidence-based routing
   stays unavailable until genuinely trusted measurements exist.
 
-## Phase 6: WEB & DOCUMENT ENGINE (v0.8.0, feature branch `feat/web-document-engine`)
+## Phase 6: WEB & DOCUMENT ENGINE (v0.8.0)
+
+**v0.8.0 release notes.** Adds the Web & Document Engine on top of v0.7.0
+(main @ 641bd90): secure web retrieval (`web_get_page`), a citation-grade
+source registry (schema v13), local document reading (`doc_read`), secure
+document generation with exact-byte human approval (`doc_generate` /
+`doc_publish`), read-only source tools for agents (`source_list` /
+`source_get` / `source_excerpt`), opt-in per-agent tool permissions, and the
+extended operator CLI (`--start-run`, `--doc-prepare`, `--doc-publish`,
+`--doc-status`, `--doc-read`, `--capabilities`, `--json`, `--sources`,
+`--source-id`, `--source-excerpt`). 15 offline demos; 997-test Linux CI
+baseline (Ubuntu 3.11/3.12/3.13 + Windows 3.12). Zero-cost guarantees are
+unchanged: `ZERO_COST_RELEASE_LOCAL_PROVIDERS = ("ollama",)`; all non-local
+cloud inference stays blocked in zero-cost mode. See `docs/web-document-engine-w1.md`,
+`docs/web-document-engine-w6.md`, `docs/web-document-engine-w7.md` for the
+stage-level design/audit documents.
 
 Agents can research authorized web pages, read local documents, prepare
 documents under exact-byte human approval, and share citable source

@@ -654,3 +654,22 @@ def test_canonicalization_parity_approval_vs_dispatch(tmp_path, page_server):
     c = parse_web_url(f"http://127.0.0.1:{page_server}/docs/a?q=xy", pol, rule)
     assert c.request_sha256 != a.request_sha256
     store.close()
+
+
+def test_model_supplied_extract_chars_cannot_raise_operator_max(tmp_path, page_server):
+    """W8 audit (failing-first): a model-supplied max_extract_chars (the
+    web_get_page tool passes args["max_chars"] straight through) may LOWER but must
+    never RAISE the operator-configured policy maximum."""
+    apis = web_apis()
+    apis.web_endpoints[0].max_extract_chars = 40
+    engine, store, reg = make_engine(tmp_path, page_server, apis)
+    gen = make_run(store)
+    # exactly what the agent-facing adapter forwards when the model asks for 5000
+    r = fetch(engine, page_server, run_id="run-1", lease_owner="w1",
+              lease_generation=gen, max_extract_chars=5_000)
+    assert len(r.text) <= 40, "model-supplied limit raised the operator maximum"
+    assert r.truncated is True
+    d = reg.get(r.source_id)
+    prov = json.loads(d["provenance_json"])
+    assert prov["extract_chars"] <= 40
+    store.close()

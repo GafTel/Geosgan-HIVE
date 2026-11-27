@@ -356,7 +356,11 @@ class WebRetrievalEngine:
         if rule is None:
             raise WebRetrievalError(f"no transport rule for endpoint {endpoint_id!r}")
         creq = parse_web_url(url, policy, rule)
-        max_chars = max_extract_chars or policy.max_extract_chars
+        # W8 audit fix: a caller/model-supplied value may LOWER but never RAISE the
+        # operator-configured policy maximum (the agent tool forwards max_chars
+        # straight through) — clamp to the policy cap
+        max_chars = min(max_extract_chars or policy.max_extract_chars,
+                        policy.max_extract_chars)
         result = self.session.request(
             provider=self.provider, endpoint_id=endpoint_id,
             operation_id=WEB_OPERATION_ID, method="GET", path=creq.path,
