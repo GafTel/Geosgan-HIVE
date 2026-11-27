@@ -1242,6 +1242,27 @@ class CheckpointStore:
         assert cp is not None
         return cp
 
+    def renew_lease_gen(self, run_id: str, owner: str) -> int | None:
+        """W7: renew a LIVE lease held by the same owner (extends expiry, keeps the
+        generation — renewal, not takeover). Returns the current generation, or
+        None when the run is not RUNNING, the lease is not held by `owner`, or it
+        already expired (an expired RUNNING run is marked FAILED by crash recovery
+        at open — existing semantics, never weakened)."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET lease_expires_at=?, updated_at=? "
+                "WHERE run_id=? AND state=? AND lease_owner=? AND lease_expires_at > ?",
+                (self._lease_expiry(), now, run_id, ExecutionState.RUNNING.value,
+                 owner, now),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = self._conn.execute(
+                "SELECT lease_generation FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            return int(row["lease_generation"])
+
     def takeover_lease_gen(self, run_id: str, owner: str) -> int | None:
         """W7: operator continuation takeover. Moves a run back to RUNNING with a
         fresh lease (owner, expiry) and a bumped generation — returning the new

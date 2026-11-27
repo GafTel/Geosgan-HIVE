@@ -596,6 +596,14 @@ class DocumentWriter:
         if os.path.lexists(dest_resolved):
             raise DocumentGenError(
                 f"destination {destination!r} already exists — publication is creation-only")
+        # W7 residual: the destination PARENT must exist inside the workspace at
+        # prepare time — fail fast here so no approval is ever created for a
+        # doomed destination (re-checked at publish time against TOCTOU)
+        parent = os.path.dirname(dest_resolved)
+        if not os.path.isdir(parent):
+            raise DocumentGenError(
+                f"destination parent directory for {destination!r} does not exist inside "
+                "the workspace — create it or choose another destination")
         # bounded staging: sweep expired orphans (protecting live approvals), then
         # enforce the operator caps on staged artifact count and aggregate bytes
         self._sweep_staging()
@@ -701,6 +709,15 @@ class DocumentWriter:
                 "publication refuses to clobber (fail closed)")
         if os.path.lexists(dest_resolved):
             raise DocumentGenError(f"destination {dest!r} exists — creation-only (fail closed)")
+        # W7 residual: parent-directory precondition re-checked BEFORE the approval
+        # is consumed — a missing/removed parent fails clean here and the approval
+        # stays approved (the operator can fix the workspace and retry the SAME
+        # approved bytes; nothing is burned into an uncertain consumed state)
+        parent = os.path.dirname(dest_resolved)
+        if not os.path.isdir(parent):
+            raise DocumentGenError(
+                f"destination parent directory for {dest!r} does not exist inside the "
+                "workspace — approval NOT consumed, nothing published")
         # canonical args digest binding
         args = {"format": pre.get("format"), "destination": dest,
                 "spec_sha256": pre.get("spec_sha256"), "artifact_sha256": out_sha,

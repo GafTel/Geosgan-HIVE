@@ -1136,3 +1136,15 @@ def test_privacy_no_artifact_or_content_bytes_in_db_records(env):
     # only hashes/paths/ids are persisted
     assert row["args_sha256"] == art.artifact_sha256 or True  # digest of args, not content
     store.close()
+
+
+@posix_only
+def test_write_bytes_atomic_missing_parent_raises_typed_error(tmp_path):
+    """W7 residual (failing-first): a missing destination parent must raise a typed
+    SandboxViolationError (caught by the CLI as a clean Error), never a raw
+    FileNotFoundError traceback."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sandbox = WorkspaceSandbox(str(ws), write_extensions=DOC_EXTS)
+    with pytest.raises(SandboxViolationError, match="parent"):
+        sandbox.write_bytes_atomic("nodir/x.csv", b"a,b\n1,2\n", max_bytes=1024)

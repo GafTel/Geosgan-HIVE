@@ -822,3 +822,100 @@ zero-cost paths. Outside zero-cost mode, legacy semantics are preserved.
 - Windows CI skips 18 POSIX-only tests (documented platform-specific skips).
 - No real model-quality ranking has been established; evidence-based routing
   stays unavailable until genuinely trusted measurements exist.
+
+## Phase 6: WEB & DOCUMENT ENGINE (v0.8.0, feature branch `feat/web-document-engine`)
+
+Agents can research authorized web pages, read local documents, prepare
+documents under exact-byte human approval, and share citable source
+provenance. Everything reuses the existing ToolGateway, ToolPolicy,
+ApprovalManager, durable execution ledger, lease fencing, WorkspaceSandbox and
+CheckpointStore — no parallel permission or networking systems.
+
+### Install (optional document extras)
+```
+pip install -e ".[dev,docs]"    # adds pypdf, python-docx, openpyxl, reportlab, defusedxml
+pip install -e .                # core works WITHOUT them (lazy-loaded; document tools report unavailable)
+```
+All extras are free, open-source, locally executed; licenses: pypdf BSD-3-Clause,
+python-docx MIT, openpyxl MIT, reportlab BSD-style, defusedxml PSFL.
+Python 3.11–3.13. PDF/DOCX/XLSX parse and generate ONLY inside the isolated
+POSIX parser worker (rlimits + watchdog + process-group kill, no inherited
+credentials, network guard, `-I -S` bootstrap so no `.pth` executes) and fail
+closed on other platforms (Windows Job Objects = documented future path; no
+`allow_insecure_fs`, no timeout-only mode).
+
+### Capabilities
+- Web: `web_get_page` for operator allowlisted HTTPS endpoints (exact
+  host/port + segment-aware path prefixes + query-name allowlist, canonical URL
+  binding, no credential forwarding, redirect/proxy/private-IP rejected,
+  bounded HTML-to-text via stdlib html.parser, scripts/resources never fetched).
+  Disabled by default; needs `apis:` web provider + `web_endpoints` policies +
+  durable outbound authorization. SearXNG stays disabled.
+- Documents read: PDF (pypdf), DOCX (python-docx), XLSX (openpyxl, read-only,
+  formulas never evaluated), CSV/JSON/TXT/MD/HTML bounded. ZIP-bomb and
+  XXE/DTD guards before library parsing. `doc_read`.
+- Documents generate: PDF (reportlab), DOCX, XLSX, CSV/JSON/TXT/MD.
+  `doc_generate` prepares ONCE, stages securely, and binds a pending approval
+  to the exact artifact sha256 + byte count; `doc_publish` publishes ONLY the
+  approved bytes after human approval, atomically and no-clobber
+  (creation-only; overwrite disabled), with lease fencing and a durable
+  execution-ledger row. Formula injection stays literal (XLSX `data_type='s'`,
+  CSV documented `'`-prefix policy). Generated artifacts are registered as
+  provenance (`generated: true`, provider `hive-docgen`) — never as retrieved
+  factual evidence.
+- Sources: `source_list` / `source_get` / `source_excerpt` (lease-fenced,
+  scope-checked, integrity-verified, metadata-only by default). Citations are
+  provenance, not factual verification.
+
+### Agent permissions (opt-in)
+See `config/agents.webdocs.example.yaml` for a full example (supervisor,
+researcher, developer, analyst, reviewer matrix). New tools are deny-by-default:
+an agent may use a tool only if it is in `tools.enabled` AND in the agent's
+`permissions.allowed_tools`; delegation never transfers permissions; no agent
+can approve its own mutation.
+
+### CLI operator workflow (requires a `checkpoint:` block; exit codes 0/1/2)
+```
+geosgan-hive --agents-config config/agents.webdocs.example.yaml --start-run "informe" --run-id demo --operator alice
+geosgan-hive --agents-config ... --doc-prepare --doc-format csv --doc-destination out/reporte.csv \
+    --spec-file spec.json --run demo --operator alice --json        # -> pending approval + sha256
+geosgan-hive --agents-config ... --pending-approvals               # inspect in another process
+geosgan-hive --agents-config ... --show-approval <APPROVAL_ID>     # full sha256/bytes/format/destination/expiry
+geosgan-hive --agents-config ... --approve <APPROVAL_ID> --operator alice
+geosgan-hive --agents-config ... --doc-publish <APPROVAL_ID> --run demo --operator alice   # exact bytes only
+geosgan-hive --agents-config ... --doc-status <APPROVAL_ID> --json   # lifecycle: pending/approved/published/...
+geosgan-hive --agents-config ... --doc-read out/reporte.csv --json
+geosgan-hive --agents-config ... --sources / --source-id <SRC_ID> [--source-excerpt <SRC_ID>]
+geosgan-hive --agents-config ... --tool-executions --run demo
+geosgan-hive --agents-config ... --capabilities --json            # effective agents/tools/providers/platform
+```
+`--json` gives structured output for automation. `--doc-publish` never
+auto-approves; it renews/takes over only a free or same-operator lease and is
+rejected while another live worker holds it. Pending artifacts survive across
+CLI processes within the lease TTL; a run whose owner died is marked FAILED by
+crash recovery (existing semantics) — then fresh preparation + approval is
+required. Never are bytes regenerated under an old approval.
+
+### Staging privacy
+Prepared artifacts are staged in `<workspace>/.hive-staging/` (0700 dir, 0600
+files, denied to agent file tools, bounded count/bytes, age- plus
+terminal-state-swept while live approvals are protected). Staged bytes are
+never persisted to SQLite and are not shared across agents.
+
+### Offline demos (15)
+`PYTHONPATH=src python examples/demo_*.py` — includes `demo_web_retrieval.py`,
+`demo_documents.py`, `demo_docgen.py`, `demo_agent_integration.py` (scripted
+multi-agent workflow) and `demo_cli_workflow.py` (real CLI subprocesses:
+prepare → approve → publish, incl. rejection and replay refusal). All offline;
+simulated/scripted model responses and loopback fixtures are identified as such.
+
+### Known limitations (Phase 6)
+- Windows: document parsing/generation/publication fail closed (no insecure
+  override). No OCR. No macro-enabled formats. No executable spreadsheet
+  formulas. No document overwrite (creation-only no-clobber publication).
+- No general-purpose authorized search engine (limitation, not a proven
+  absence of free search). No live non-local inference in zero-cost mode
+  (ollama only; `ZERO_COST_RELEASE_LOCAL_PROVIDERS = ("ollama",)`).
+- No GUI/MCP/persistent semantic memory yet (future phases). Trusted-process
+  boundary: no defense against arbitrary privileged local code, direct DB
+  edits, or compromised installed dependencies.

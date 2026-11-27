@@ -556,7 +556,13 @@ class WorkspaceSandbox:
             raise SandboxViolationError(f"{relpath!r} is a symlink — refusing")
         parent = os.path.dirname(resolved)
         base = os.path.basename(resolved)
-        pst = os.stat(parent)
+        try:
+            pst = os.stat(parent)
+        except OSError as exc:
+            # W7 residual: typed error, never a raw traceback (missing parent dir)
+            raise SandboxViolationError(
+                f"destination parent directory {parent!r} is missing or not accessible: "
+                "create it inside the workspace first") from exc
         if not stat.S_ISDIR(pst.st_mode) \
                 or os.path.commonpath([parent, self.root]) != self.root:
             raise SandboxViolationError("parent directory is not inside the workspace")
