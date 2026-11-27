@@ -601,28 +601,43 @@ def test_artifact_substitution_after_approval_rejected(env):
 
 
 @posix_only
-def test_destination_substitution_after_approval_rejected(env):
+def test_overwrite_disabled_creation_only(env):
+    """W5 residual: overwrite is DISABLED (a rename cannot atomically bind the
+    pre-existing content hash) — publication is secure no-clobber creation only."""
     writer, store, sandbox, ws, gen = env
     (ws / "out" / "old.csv").write_text("original", encoding="utf-8")
-    art = writer.prepare(format="csv", destination="out/old.csv", spec=csv_spec(),
-                         agent="researcher", **lease(gen))
-    row = store.get_approval(art.approval_id)
-    pre = json.loads(row["preconditions_json"])
-    assert pre["expected_absent"] is False
-    assert pre["expected_existing_sha256"] == hashlib.sha256(b"original").hexdigest()
-    approve(store, art)
-    (ws / "out" / "old.csv").write_text("SUBSTITUTED", encoding="utf-8")  # race after approval
-    with pytest.raises(DocumentGenError, match="changed since approval"):
-        do_publish(writer, art, gen)
-    assert (ws / "out" / "old.csv").read_text(encoding="utf-8") == "SUBSTITUTED"
-    assert store.get_approval(art.approval_id)["status"] == "approved"  # not burned
+    with pytest.raises(DocumentGenError, match="creation-only"):
+        writer.prepare(format="csv", destination="out/old.csv", spec=csv_spec(),
+                       agent="researcher", **lease(gen))
+    assert store.list_approvals() == []  # rejected before any approval
+    # even at the sandbox level, an existing destination is refused...
+    with pytest.raises(SandboxViolationError, match="creation-only"):
+        sandbox.write_bytes_atomic("out/old.csv", b"new", max_bytes=100)
+    assert (ws / "out" / "old.csv").read_text(encoding="utf-8") == "original"
     store.close()
 
 
 @posix_only
-def test_destination_appeared_or_vanished_since_approval(env):
+def test_no_clobber_atomic_link_under_race(env, monkeypatch):
+    """Even if the pre-check is bypassed (simulated race), the atomic os.link
+    no-clobber refuses to replace an existing destination."""
     writer, store, sandbox, ws, gen = env
-    # appeared: prepared for absent destination, file appears before publish
+    (ws / "out" / "race.csv").write_text("intruder", encoding="utf-8")
+    # simulate a destination appearing AFTER the pre-check: lexists reports absent
+    real_lexists = os.path.lexists
+    monkeypatch.setattr(os.path, "lexists", lambda p: False)
+    try:
+        with pytest.raises(SandboxViolationError, match="appeared concurrently"):
+            sandbox.write_bytes_atomic("out/race.csv", b"approved-bytes", max_bytes=100)
+    finally:
+        monkeypatch.setattr(os.path, "lexists", real_lexists)
+    assert (ws / "out" / "race.csv").read_text(encoding="utf-8") == "intruder"
+    store.close()
+
+
+@posix_only
+def test_destination_appeared_since_approval_rejected(env):
+    writer, store, sandbox, ws, gen = env
     art = writer.prepare(format="csv", destination="out/new.csv", spec=csv_spec(),
                          agent="researcher", **lease(gen))
     approve(store, art)
@@ -630,15 +645,7 @@ def test_destination_appeared_or_vanished_since_approval(env):
     with pytest.raises(DocumentGenError, match="appeared since approval"):
         do_publish(writer, art, gen)
     assert (ws / "out" / "new.csv").read_text(encoding="utf-8") == "intruder"
-    # vanished: prepared over an existing file, file removed before publish
-    (ws / "out" / "gone.csv").write_text("x", encoding="utf-8")
-    art2 = writer.prepare(format="csv", destination="out/gone.csv", spec=csv_spec(),
-                          agent="researcher", **lease(gen))
-    approve(store, art2)
-    os.unlink(ws / "out" / "gone.csv")
-    with pytest.raises(DocumentGenError, match="vanished since approval"):
-        do_publish(writer, art2, gen)
-    assert not (ws / "out" / "gone.csv").exists()
+    assert store.get_approval(art.approval_id)["status"] == "approved"  # not burned
     store.close()
 
 
@@ -846,4 +853,168 @@ def test_docgen_tools_via_gateway(env):
                                 ctx=ctx).output)
     assert res["status"] == "published"
     assert (ws / "out" / "gw.csv").exists()
+    store.close()
+
+
+# ---- W5 residual gate: atomic ledger, crash windows, staging lifecycle, provenance -------
+
+@posix_only
+def test_publish_requires_run_bound_lease(env):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/norun.csv", spec=csv_spec(),
+                         agent="researcher")  # no run binding at prepare is allowed
+    approve(store, art)
+    with pytest.raises(DocumentGenError, match="run-bound lease"):
+        writer.publish(approval_id=art.approval_id, agent="researcher", run_id="")
+    assert store.get_approval(art.approval_id)["status"] == "approved"
+    assert not (ws / "out" / "norun.csv").exists()
+    store.close()
+
+
+@posix_only
+def test_atomic_ledger_start_and_completion_on_publish(env):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/led.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    approve(store, art)
+    res = do_publish(writer, art, gen)
+    # approval consumed AND ledger row inserted atomically; then completed, fenced
+    row = store.get_approval(art.approval_id)
+    assert row["status"] == "consumed"
+    led = store.ledger_get(res["execution_id"])
+    assert led is not None and led["status"] == "completed"
+    assert led["approval_id"] == art.approval_id and led["run_id"] == "run-1"
+    assert led["result_sha256"] == art.artifact_sha256
+    assert led["lease_owner"] == "w1" and led["lease_generation"] == gen
+    store.close()
+
+
+@posix_only
+def test_crash_after_consume_before_write_is_uncertain_no_replay(env, monkeypatch):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/crash2.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    approve(store, art)
+
+    def boom(relpath, data, **kw):
+        raise RuntimeError("simulated crash during publication")
+
+    monkeypatch.setattr(sandbox, "write_bytes_atomic", boom)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        do_publish(writer, art, gen)
+    # approval consumed + ledger 'started' (uncertain), but NOTHING published
+    assert store.get_approval(art.approval_id)["status"] == "consumed"
+    led = store.ledger_list(run_id="run-1", status="started")
+    assert led and led[0]["approval_id"] == art.approval_id
+    assert not (ws / "out" / "crash2.csv").exists()
+    # replay is impossible (consumed) — no duplicate mutation, ever
+    with pytest.raises(DocumentGenError, match="consumed"):
+        do_publish(writer, art, gen)
+    assert not (ws / "out" / "crash2.csv").exists()
+    store.close()
+
+
+@posix_only
+def test_atomic_start_rejected_leaves_approval_and_fs_untouched(env, monkeypatch):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/rej.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    approve(store, art)
+    monkeypatch.setattr(store, "start_execution", lambda **kw: False)
+    with pytest.raises(DocumentGenError, match="atomic execution-start rejected"):
+        do_publish(writer, art, gen)
+    assert store.get_approval(art.approval_id)["status"] == "approved"  # not consumed
+    assert not (ws / "out" / "rej.csv").exists()
+    assert store.ledger_list(run_id="run-1") == []
+    store.close()
+
+
+@posix_only
+def test_staging_denied_to_agent_facing_file_tools(env):
+    writer, store, sandbox, ws, gen = env
+    rel, sha = sandbox.stage_bytes(b"secret-bytes", max_bytes=100)
+    assert sha == hashlib.sha256(b"secret-bytes").hexdigest()
+    # agent-facing paths deny the staging area entirely...
+    with pytest.raises(SandboxViolationError):
+        sandbox.resolve(WorkspaceSandbox.STAGING_DIRNAME)
+    with pytest.raises(SandboxViolationError):
+        sandbox.resolve(rel)
+    with pytest.raises(SandboxViolationError):
+        sandbox.open_read(rel, max_bytes=100)
+    with pytest.raises(SandboxViolationError):
+        sandbox.read_text(rel, max_bytes=100)
+    with pytest.raises(SandboxViolationError):
+        sandbox.list_dir(WorkspaceSandbox.STAGING_DIRNAME, max_entries=10)
+    with pytest.raises(SandboxViolationError):
+        sandbox.sha256_file(rel)
+    # ...but the trusted staging reader still works
+    assert sandbox.read_staged(rel, max_bytes=100) == b"secret-bytes"
+    sandbox.discard_staged(rel)
+    store.close()
+
+
+@posix_only
+def test_staging_count_and_byte_caps_fail_closed(env):
+    writer, store, sandbox, ws, gen = env
+    writer.config = DocumentsConfig(enabled=True, staging_max_files=1)
+    art = writer.prepare(format="csv", destination="out/s1.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))  # 1 staged artifact (pending)
+    with pytest.raises(SandboxViolationError, match="staging full"):
+        writer.prepare(format="csv", destination="out/s2.csv", spec=csv_spec(),
+                       agent="researcher", **lease(gen))
+    assert store.list_approvals(status="pending").__len__() == 1
+    # aggregate byte cap
+    writer.config = DocumentsConfig(enabled=True, staging_max_files=10,
+                                    staging_max_bytes=art.byte_count)  # exactly full
+    with pytest.raises(SandboxViolationError, match="byte cap"):
+        writer.prepare(format="csv", destination="out/s3.csv", spec=csv_spec(),
+                       agent="researcher", **lease(gen))
+    store.close()
+
+
+@posix_only
+def test_sweep_protects_live_approval_artifacts_only(env):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/p.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    staged = os.path.join(sandbox.root, art.staging_relpath)
+    assert os.path.exists(staged)
+    # protected (pending approval references it): survives even a zero-age sweep
+    n = sandbox.sweep_staging(max_age_seconds=0, protect={art.staging_relpath})
+    assert n == 0 and os.path.exists(staged)
+    # unprotected (e.g. approval decided/expired elsewhere): swept
+    n = sandbox.sweep_staging(max_age_seconds=0, protect=set())
+    assert n == 1 and not os.path.exists(staged)
+    store.close()
+
+
+@posix_only
+def test_generated_provenance_marker_enforced_on_all_read_paths(env):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/gen.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    approve(store, art)
+    res = do_publish(writer, art, gen)
+    sid = res["source_id"]
+    binding = writer.registry.read_binding(run_id="run-1", lease_owner="w1",
+                                           lease_generation=gen)
+    d = writer.registry.get(sid, binding=binding)
+    assert json.loads(d["provenance_json"])["generated"] is True
+    assert d["source_type"] == "other" and d["provider"] == "hive-docgen"
+    cite = writer.registry.cite(sid, binding=binding)
+    assert "type=other" in cite and "provider=hive-docgen" in cite
+    assert "generated:out/gen.csv" in cite and "provenance only" in cite
+    lst = writer.registry.list(binding=binding)
+    assert any(r["source_id"] == sid and json.loads(r["provenance_json"])["generated"]
+               for r in lst)
+    ex = writer.registry.excerpt(sid, binding=binding)  # metadata-only: no content
+    assert ex["available"] is False
+    # cross-run access still denied
+    store.create_run(run_id="run-2", owner="w2", task="t", agent="a", model="ollama/x")
+    gen2 = store.get("run-2").lease_generation
+    b2 = writer.registry.read_binding(run_id="run-2", lease_owner="w2", lease_generation=gen2)
+    from geosgan_hive.errors import CheckpointError
+
+    with pytest.raises(CheckpointError):
+        writer.registry.get(sid, binding=b2)
     store.close()

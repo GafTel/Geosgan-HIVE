@@ -464,6 +464,12 @@ class DocumentsConfig(BaseModel):
     worker_max_memory_bytes: int = Field(default=512 << 20, ge=16 << 20, le=4 << 30)
     #: register successful parses as W2 sources (lease-fenced, metadata-only)
     register_sources: bool = True
+    #: W5 residual: staging lifecycle bounds (staged artifacts hold SENSITIVE
+    #: bytes in .hive-staging/, 0700 dir / 0600 files, never in SQLite, and are
+    #: denied to agent-facing file tools). Swept by age; active approvals protected.
+    staging_max_files: int = Field(default=32, ge=1, le=256)
+    staging_max_bytes: int = Field(default=64 << 20, ge=1, le=1 << 30)
+    staging_max_age_seconds: float = Field(default=3600.0, gt=0, le=86_400.0)
 
     @field_validator("allowed_formats")
     @classmethod

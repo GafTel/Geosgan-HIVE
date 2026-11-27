@@ -6,6 +6,7 @@ import os
 import stat
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +15,12 @@ from .errors import SandboxViolationError
 #: Never expose these names through file tools (credential files, checkpoint DBs,
 #: VCS internals). Matched against every path component of the resolved path.
 DEFAULT_DENY_PATTERNS = (".env", ".env.*", "*.db", "*.db-wal", "*.db-shm", ".git",
-                         ".ssh", "id_rsa", "*.pem", "*.key")
+                         ".ssh", "id_rsa", "*.pem", "*.key",
+                         # W5 residual: the staging area holds SENSITIVE approved
+                         # artifact bytes — no agent-facing file tool may touch it
+                         # (only the trusted staging methods below may, via
+                         # _resolve_staging which re-checks containment)
+                         ".hive-staging")
 
 #: Hash files only up to this size for fs_metadata.
 MAX_HASH_BYTES = 10 * 1024 * 1024
@@ -124,12 +130,35 @@ class WorkspaceSandbox:
         self._deny_check(resolved)
         return resolved
 
+    def _resolve_staging(self, relpath: str) -> str:
+        """INTERNAL trusted-staging path resolution: containment is enforced exactly
+        like resolve(), but the staging dir itself is not denied (agent-facing
+        resolve() denies it via DEFAULT_DENY_PATTERNS). The result must lie
+        directly inside <root>/.hive-staging."""
+        if not isinstance(relpath, str) or not relpath.strip() or "\x00" in relpath:
+            raise SandboxViolationError("invalid path")
+        joined = os.path.normpath(os.path.join(self.root, relpath))
+        resolved = os.path.realpath(joined)
+        if os.path.commonpath([resolved, self.root]) != self.root:
+            raise SandboxViolationError(f"path escapes the workspace root: {relpath!r}")
+        staging_root = os.path.realpath(os.path.join(self.root, self.STAGING_DIRNAME))
+        if os.path.dirname(resolved) != staging_root:
+            raise SandboxViolationError("staging path must lie directly in .hive-staging/")
+        return resolved
+
     # ---- race-resistant read ----
     def open_read(self, relpath: str, *, max_bytes: int) -> tuple[int, str]:
         """Open a file for reading race-resistently. Returns (fd, resolved_path).
         Raises SandboxViolationError on any violation (fail closed)."""
         self._fs_guard()
         resolved = self.resolve(relpath)
+        return self._open_read_resolved(resolved, relpath, max_bytes=max_bytes)
+
+    def _open_read_resolved(self, resolved: str, relpath: str, *,
+                            max_bytes: int, _skip_deny: bool = False) -> tuple[int, str]:
+        """Race-resistant open of an ALREADY resolved path (shared by open_read and
+        the trusted staging reader; _skip_deny is used ONLY for the staging dir,
+        which is denied to agent-facing paths but readable by the trusted reader)."""
         # pre-check BEFORE opening: reject non-regular files (fifos/devices would
         # otherwise block or misbehave on open)
         try:
@@ -168,7 +197,8 @@ class WorkspaceSandbox:
                 fd_target = os.path.realpath(f"/proc/self/fd/{fd}")
                 if os.path.commonpath([fd_target, self.root]) != self.root:
                     raise SandboxViolationError("opened file escaped the workspace (race)")
-                self._deny_check(fd_target)
+                if not _skip_deny:
+                    self._deny_check(fd_target)
             return fd, resolved
         except BaseException:
             os.close(fd)
@@ -341,7 +371,8 @@ class WorkspaceSandbox:
             raise SandboxViolationError(
                 "staging requires post-open fd re-verification (/proc/self/fd) — "
                 "fail closed on this platform")
-        root = self.resolve(self.STAGING_DIRNAME)
+        root = self._resolve_staging(self.STAGING_DIRNAME + "/placeholder")
+        root = os.path.dirname(root)  # the staging dir itself
         os.makedirs(root, exist_ok=True)
         try:
             os.chmod(root, 0o700)
@@ -349,14 +380,35 @@ class WorkspaceSandbox:
             pass
         return root
 
-    def stage_bytes(self, data: bytes, *, max_bytes: int) -> tuple[str, str]:
+    def stage_bytes(self, data: bytes, *, max_bytes: int,
+                    max_files: int | None = None, max_total_bytes: int | None = None,
+                    max_age_seconds: float = 3600.0) -> tuple[str, str]:
         """Write bytes to a fresh 0600 staging file; returns (relpath, sha256).
-        The relpath is workspace-relative and always under .hive-staging/."""
+        The relpath is workspace-relative and always under .hive-staging/.
+        Bounded: expired orphans are swept first, then the staged artifact COUNT
+        and AGGREGATE BYTES are capped (fail closed when full)."""
         root = self._staging_root()
         if not isinstance(data, (bytes, bytearray)):
             raise SandboxViolationError("staged content must be bytes")
         if len(data) > max_bytes:
             raise SandboxViolationError(f"staged content {len(data)}B > cap {max_bytes}B")
+        # sweep expired orphans, then enforce the bounded count/byte caps
+        self.sweep_staging(max_age_seconds=max_age_seconds)
+        names = [n for n in os.listdir(root)
+                 if os.path.isfile(os.path.join(root, n))]
+        if max_files is not None and len(names) >= max_files:
+            raise SandboxViolationError(
+                f"staging full: {len(names)} artifacts >= cap {max_files} — fail closed")
+        total = 0
+        for n in names:
+            try:
+                total += os.path.getsize(os.path.join(root, n))
+            except OSError:
+                pass
+        if max_total_bytes is not None and total + len(data) > max_total_bytes:
+            raise SandboxViolationError(
+                f"staging byte cap exceeded: {total}+{len(data)} > {max_total_bytes} — "
+                "fail closed")
         name = f"artifact-{uuid.uuid4().hex}"
         full = os.path.join(root, name)
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -391,10 +443,11 @@ class WorkspaceSandbox:
         if not os.path.basename(staging_relpath).startswith("artifact-") \
                 or os.path.dirname(staging_relpath) != self.STAGING_DIRNAME:
             raise SandboxViolationError("invalid staging path")
-        resolved = self.resolve(staging_relpath)
+        resolved = self._resolve_staging(staging_relpath)
         if os.path.dirname(resolved) != root:
             raise SandboxViolationError("staging path escapes the staging dir")
-        fd, _ = self.open_read(staging_relpath, max_bytes=max_bytes)
+        fd, _ = self._open_read_resolved(resolved, staging_relpath, max_bytes=max_bytes,
+                                        _skip_deny=True)
         try:
             chunks = []
             remaining = max_bytes + 1
@@ -414,7 +467,7 @@ class WorkspaceSandbox:
     def discard_staged(self, staging_relpath: str) -> None:
         self._fs_guard()
         root = self._staging_root()
-        resolved = self.resolve(staging_relpath)
+        resolved = self._resolve_staging(staging_relpath)
         if os.path.dirname(resolved) != root:
             raise SandboxViolationError("staging path escapes the staging dir")
         try:
@@ -422,14 +475,22 @@ class WorkspaceSandbox:
         except OSError:
             pass
 
-    def sweep_staging(self, *, max_age_seconds: float = 3600.0) -> int:
-        """Delete staged artifacts older than max_age_seconds (orphan/crash cleanup)."""
+    def sweep_staging(self, *, max_age_seconds: float = 3600.0,
+                      protect: Iterable[str] | None = None) -> int:
+        """Delete staged artifacts older than max_age_seconds (orphan/crash cleanup).
+        `protect` holds workspace-relative staging paths still referenced by a
+        live pending/approved approval — those are NEVER swept (no cleanup of
+        active artifacts owned by another valid worker)."""
         self._fs_guard()
         root = self._staging_root()
+        keep = {os.path.normpath(p) for p in (protect or ())}
         now = time.time()
         n = 0
         for name in os.listdir(root):
             full = os.path.join(root, name)
+            rel = os.path.normpath(f"{self.STAGING_DIRNAME}/{name}")
+            if rel in keep:
+                continue
             try:
                 if now - os.path.getmtime(full) > max_age_seconds:
                     os.unlink(full)
@@ -439,15 +500,16 @@ class WorkspaceSandbox:
         return n
 
     def write_bytes_atomic(self, relpath: str, data: bytes, *,
-                           expected_sha256: str | None = None,
-                           require_exists: bool = False,
                            max_bytes: int = MAX_WRITE_BYTES) -> str:
-        """W5 secure binary publication: containment + deny patterns + extension
-        allowlist + symlink/hardlink/special-file rejection + destination
-        precondition (expected current hash or expected absence) + size cap +
-        staging in the same directory + PARENT DIRECTORY HANDLE + staged-fd
-        re-verification + descriptor-relative rename + POST-PUBLISH re-open and
-        hash verification. os.replace alone is never trusted. Requires fd
+        """W5 residual secure binary publication — CREATION-ONLY, atomic no-clobber:
+        containment + deny patterns + extension allowlist + symlink/hardlink/
+        special-file rejection + destination MUST NOT EXIST + size cap + tmp file
+        in the same directory + PARENT DIRECTORY HANDLE + staged-fd re-verification
+        + ATOMIC NO-CLOBBER LINK (os.link fails EEXIST if the destination appeared
+        concurrently — never replaces an existing file; overwrite is DISABLED
+        because a rename cannot atomically bind the pre-existing content hash)
+        + descriptor-relative unlink of the tmp name + POST-PUBLISH re-open
+        (O_NOFOLLOW) and re-hash. os.replace alone is never trusted. Requires fd
         re-verification — fail closed elsewhere. Returns sha256 of published bytes."""
         self._fs_guard()
         if not self.fd_reverify:
@@ -474,24 +536,13 @@ class WorkspaceSandbox:
         if not stat.S_ISDIR(pst.st_mode) \
                 or os.path.commonpath([parent, self.root]) != self.root:
             raise SandboxViolationError("parent directory is not inside the workspace")
-        exists = os.path.lexists(resolved)
-        if exists:
-            st = os.lstat(resolved)
-            if not stat.S_ISREG(st.st_mode):
-                raise SandboxViolationError(f"{relpath!r} is not a regular file")
-            if st.st_nlink > 1:
-                raise SandboxViolationError(
-                    f"{relpath!r} has {st.st_nlink} hard links — refusing")
-            if not require_exists:
-                raise SandboxViolationError(f"{relpath!r} already exists — approval must bind "
-                                             "the expected current hash (fs_update semantics)")
-            if expected_sha256 is not None:
-                current = self.sha256_file(relpath)
-                if current != expected_sha256:
-                    raise SandboxViolationError(
-                        f"{relpath!r} changed after approval (sha256 mismatch) — fresh approval")
-        elif require_exists:
-            raise SandboxViolationError(f"{relpath!r} does not exist")
+        if os.path.lexists(resolved) or os.path.lexists(lexical):
+            # creation-only: any existing destination (including a raced-in symlink
+            # or file) is rejected; the atomic link below is the authoritative
+            # no-clobber guarantee (overwrite is disabled — see docstring)
+            raise SandboxViolationError(
+                f"{relpath!r} already exists — publication is creation-only "
+                "(overwrite disabled; no-clobber enforced atomically)")
         digest = hashlib.sha256(data).hexdigest()
         tmpname = f".{base}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
         dirfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -513,7 +564,16 @@ class WorkspaceSandbox:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.rename(tmpname, base, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            try:
+                # ATOMIC NO-CLOBBER: hard-link tmp -> destination fails with EEXIST
+                # if anything created the destination concurrently (symlink swap,
+                # file creation, ...). rename() is never used for publication.
+                os.link(tmpname, base, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            except FileExistsError:
+                raise SandboxViolationError(
+                    f"{relpath!r} appeared concurrently — no-clobber publication refused"
+                ) from None
+            os.unlink(tmpname, dir_fd=dirfd)
         except BaseException:
             try:
                 os.unlink(tmpname, dir_fd=dirfd)

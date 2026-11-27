@@ -4,29 +4,36 @@ Flow (mandatory acceptance gate):
   1. validate the structured DocumentSpec (extra=forbid, bounded) and clamp all
      limits to operator maxima (models may lower, never raise);
   2. validate destination (workspace-relative, extension matches format,
-     containment via WorkspaceSandbox) and record its precondition (current
-     sha256 or expected absence);
+     containment via WorkspaceSandbox). Publication is CREATION-ONLY: an
+     existing destination is rejected (overwrite disabled — a rename cannot
+     atomically bind the pre-existing content hash);
   3. generate the document EXACTLY ONCE — pdf/docx/xlsx inside the trusted
      parser-worker (same isolation as W4: rlimits, watchdog, killpg, bounded
      IPC, sanitized env); csv/json/txt/md in-process via stdlib, bounded;
-  4. stage the bytes securely (sandbox.stage_bytes: 0700 dir, 0600 file);
+  4. stage the bytes securely (sandbox.stage_bytes: 0700 dir, 0600 file,
+     bounded count + aggregate bytes, age-swept with live approvals protected;
+     .hive-staging is denied to agent-facing file tools and never persisted to
+     SQLite);
   5. compute exact sha256 + byte count;
   6. bind an ApprovalManager approval to run/task/agent/tool/version, canonical
-     arg digest, destination, expected-existing-hash/absence, exact new artifact
-     sha256 + byte count, staging id, expiry;
-  7. publication revalidates approval (single-use, unexpired, unconsumed), current
-     policy, destination preconditions, budgets and lease owner+generation,
-     re-hashes the staged bytes (substitution -> reject), then publishes via
+     arg digest, destination absence, exact new artifact sha256 + byte count,
+     staging id, expiry;
+  7. publication revalidates approval (single-use, unexpired, unconsumed), run
+     binding, current policy, destination preconditions and lease owner+
+     generation, re-hashes the staged bytes (substitution -> reject), then
+     ATOMICALLY consumes the approval AND inserts the durable execution-ledger
+     row in ONE transaction (store.start_execution), publishes via
      sandbox.write_bytes_atomic (parent dir handle + staged-fd re-verification +
-     descriptor-relative rename + post-publish re-open/re-hash) and verifies the
-     final artifact hash; the outcome is recorded in the durable ledger and the
-     artifact provenance is registered (clearly marked GENERATED, never as
-     retrieved external evidence).
+     ATOMIC NO-CLOBBER os.link, never rename/replace + post-publish re-open/
+     re-hash; a hash mismatch is never reported as success), marks the ledger
+     row completed, and registers the artifact provenance (clearly marked
+     GENERATED, never as retrieved external evidence).
 
 Never regenerate after approval; an approval for one artifact never authorizes
 different bytes; replay/expired/substitution/stale-worker publication rejected.
-Crash after publication before durable completion = uncertain outcome, never
-auto-replayed. Staging is in-workspace, never persisted to SQLite, age-swept.
+Crash windows are documented and never auto-replayed (the approval is consumed
+atomically with the ledger start, so a retry is impossible by construction).
+Staging is in-workspace, never persisted to SQLite, age-swept, count/byte-bounded.
 
 Formula injection: XLSX cells and CSV fields starting with = + - @ TAB CR are
 kept LITERAL (never formulas; the CSV transformation is the documented
@@ -52,12 +59,14 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 from xml.sax.saxutils import escape as xml_escape
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .agent_config import DocumentsConfig
 from .approvals import ApprovalManager
+from .checkpoints import ToolExecutionStatus
 from .errors import HiveError
 from .parser_isolation import ParserIsolationError, ParserResourceLimits, ParserWorkerPool
 from .sources import SourceRegistry, SourceType
@@ -451,6 +460,30 @@ class DocumentWriter:
                 "max_pdf_pages": c.max_pdf_pages, "max_docx_blocks": c.max_docx_blocks,
                 "max_xlsx_sheets": c.max_xlsx_sheets, "max_xlsx_cells": c.max_xlsx_cells}
 
+    def _active_staging(self) -> set[str]:
+        """Staging relpaths still referenced by a live PENDING/APPROVED approval."""
+        out: set[str] = set()
+        for status in ("pending", "approved"):
+            for row in self.store.list_approvals(status=status):
+                try:
+                    pre = json.loads(row.get("preconditions_json") or "{}")
+                except (ValueError, TypeError):
+                    continue
+                rel = pre.get("staging_relpath")
+                if isinstance(rel, str) and rel:
+                    out.add(rel)
+        return out
+
+    def _sweep_staging(self) -> int:
+        """W5 residual staging lifecycle: expire stale approvals, then age-sweep the
+        staging dir while PROTECTING artifacts referenced by live approvals (never
+        clean up an active artifact owned by another valid worker). Staged bytes
+        are sensitive and are never persisted to SQLite."""
+        self.store.sweep_expired_approvals()
+        return self.sandbox.sweep_staging(
+            max_age_seconds=self.config.staging_max_age_seconds,
+            protect=self._active_staging())
+
     def _get_pool(self) -> ParserWorkerPool:
         if self._platform != "posix":
             raise DocumentGenUnavailableError(
@@ -524,13 +557,11 @@ class DocumentWriter:
         artifact_sha = hashlib.sha256(data).hexdigest()
         spec_sha = hashlib.sha256(canonical_args({"spec": _spec_dict(spec), "format": format,
                                                   "destination": destination}).encode()).hexdigest()
-        staging_rel, stage_sha = self.sandbox.stage_bytes(data, max_bytes=eff_max_out)
-        if stage_sha != artifact_sha:
-            self.sandbox.discard_staged(staging_rel)
-            raise DocumentGenError("staged artifact hash mismatch — discarded")
-        # destination precondition (lexical lstat: symlink/hardlink/special files
-        # are rejected BEFORE an approval is created, so approvals are never burned
-        # on doomed destinations; write_bytes_atomic re-checks authoritatively)
+        # destination precondition (checked BEFORE generating/staging so approvals
+        # are never burned on doomed destinations): publication is CREATION-ONLY —
+        # an existing destination means overwrite, and overwrite is DISABLED (a
+        # rename cannot atomically bind the pre-existing content hash); the
+        # atomic no-clobber link in write_bytes_atomic is the authoritative check
         dest_resolved = self.sandbox.resolve(destination)
         lexical = os.path.normpath(os.path.join(self.sandbox.root, destination))
         if os.path.lexists(lexical):
@@ -542,11 +573,22 @@ class DocumentWriter:
             if lst.st_nlink > 1:
                 raise DocumentGenError(
                     f"destination {destination!r} has {lst.st_nlink} hard links — rejected")
-        expected_existing: str | None = None
-        expected_absent = True
+            raise DocumentGenError(
+                f"destination {destination!r} already exists — publication is "
+                "creation-only (overwrite disabled; secure no-clobber creation only)")
         if os.path.lexists(dest_resolved):
-            expected_absent = False
-            expected_existing = self.sandbox.sha256_file(destination)
+            raise DocumentGenError(
+                f"destination {destination!r} already exists — publication is creation-only")
+        # bounded staging: sweep expired orphans (protecting live approvals), then
+        # enforce the operator caps on staged artifact count and aggregate bytes
+        self._sweep_staging()
+        staging_rel, stage_sha = self.sandbox.stage_bytes(
+            data, max_bytes=eff_max_out, max_files=self.config.staging_max_files,
+            max_total_bytes=self.config.staging_max_bytes,
+            max_age_seconds=self.config.staging_max_age_seconds)
+        if stage_sha != artifact_sha:
+            self.sandbox.discard_staged(staging_rel)
+            raise DocumentGenError("staged artifact hash mismatch — discarded")
         args = {"format": format, "destination": destination, "spec_sha256": spec_sha,
                 "artifact_sha256": artifact_sha, "byte_count": len(data)}
         ctx = ToolExecutionContext(agent=agent, run_id=run_id, task_id=task_id)
@@ -556,8 +598,7 @@ class DocumentWriter:
             preconditions={
                 "output_sha256": artifact_sha, "byte_count": len(data),
                 "spec_sha256": spec_sha, "staging_relpath": staging_rel,
-                "expected_existing_sha256": expected_existing,
-                "expected_absent": expected_absent, "format": format,
+                "expected_absent": True, "format": format,
                 "generator": generator,
             })
         return PreparedArtifact(
@@ -565,14 +606,28 @@ class DocumentWriter:
             artifact_sha256=artifact_sha, byte_count=len(data), spec_sha256=spec_sha,
             destination=destination, format=format, generator=generator)
 
-    def publish(self, *, approval_id: str, agent: str,
-                run_id: str | None = None, task_id: str | None = None,
-                lease_owner: str | None = None,
+    def publish(self, *, approval_id: str, agent: str, run_id: str,
+                task_id: str | None = None, lease_owner: str | None = None,
                 lease_generation: int | None = None) -> dict[str, Any]:
-        """Revalidate everything, re-hash the staged artifact, consume the approval
-        once, publish the exact approved bytes, verify, record provenance."""
+        """W5 residual: revalidate everything, re-hash the staged artifact, then
+        ATOMICALLY consume the approval AND start the durable execution-ledger row
+        in ONE transaction (store.start_execution — never a standalone consume),
+        publish the exact approved bytes with an atomic no-clobber creation,
+        verify the published hash (a mismatch is NEVER reported as success), mark
+        the ledger row completed, discard staging, register provenance.
+
+        Crash windows (documented, never auto-replayed — the approval is consumed
+        atomically with the ledger start, so a retry is impossible by construction):
+        - before start_execution: nothing happened; approval still approved.
+        - after start_execution, before/during publication: ledger row stays
+          'started' (uncertain), approval consumed, destination may or may not
+          exist with the approved bytes; recovery must NOT replay.
+        - after publication, before ledger_update: same uncertain outcome."""
         if not self.config.enabled:
             raise DocumentGenError("document generation is disabled")
+        if not run_id:
+            raise DocumentGenError(
+                "publication requires a run-bound lease (run_id) — fail closed")
         row = self.store.get_approval(approval_id)
         if row is None:
             raise DocumentGenError(f"unknown approval {approval_id!r}")
@@ -580,19 +635,21 @@ class DocumentWriter:
             raise DocumentGenError(f"approval {approval_id!r} is {row['status']}, not approved")
         if row["expires_at"] <= self.store.now_iso():
             raise DocumentGenError("approval expired — regenerate and re-approve (fail closed)")
+        if row["run_id"] != run_id:
+            raise DocumentGenError("approval belongs to a different run — rejected")
         pre = json.loads(row["preconditions_json"] or "{}")
         out_sha = pre.get("output_sha256")
         if not out_sha:
             raise DocumentGenError("approval is not bound to an exact artifact hash")
         # lease fencing: current owner+generation must hold the run
-        if run_id is not None:
-            with self.store._lock:
-                if not self.store._verify_lease_locked(run_id, lease_owner, lease_generation):
-                    raise DocumentGenError("stale worker: lease fencing failed at publication")
+        with self.store._lock:
+            if not self.store._verify_lease_locked(run_id, lease_owner, lease_generation):
+                raise DocumentGenError("stale worker: lease fencing failed at publication")
         # re-hash the staged artifact: substitution after approval is rejected
         staged = self.sandbox.read_staged(pre["staging_relpath"],
                                           max_bytes=int(pre["byte_count"]) + 1)
         if hashlib.sha256(staged).hexdigest() != out_sha:
+            self.sandbox.discard_staged(pre["staging_relpath"])  # corrupt: never publishable
             raise DocumentGenError("staged artifact does not match the approved hash — rejected")
         if len(staged) != int(pre["byte_count"]):
             raise DocumentGenError("staged artifact byte count mismatch — rejected")
@@ -606,59 +663,69 @@ class DocumentWriter:
             if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode) or lst.st_nlink > 1:
                 raise DocumentGenError(
                     f"destination {dest!r} is a symlink/hardlink/special file — rejected")
-        require_exists = not bool(pre.get("expected_absent", True))
-        expected_existing = pre.get("expected_existing_sha256")
-        if require_exists and not os.path.lexists(dest_resolved):
-            raise DocumentGenError("destination vanished since approval — fail closed")
-        if not require_exists and os.path.lexists(dest_resolved):
-            raise DocumentGenError("destination appeared since approval — fail closed")
-        if require_exists and expected_existing is not None:
-            # pre-consume hash re-check: a substituted destination rejects BEFORE the
-            # approval is burned (write_bytes_atomic re-checks authoritatively again)
-            if self.sandbox.sha256_file(dest) != expected_existing:
-                raise DocumentGenError(
-                    "destination changed since approval (sha256 mismatch) — "
-                    "fresh generation and approval required")
-        # consume the approval EXACTLY ONCE, bound to the canonical args digest
+            raise DocumentGenError(
+                f"destination {dest!r} appeared since approval — creation-only "
+                "publication refuses to clobber (fail closed)")
+        if os.path.lexists(dest_resolved):
+            raise DocumentGenError(f"destination {dest!r} exists — creation-only (fail closed)")
+        # canonical args digest binding
         args = {"format": pre.get("format"), "destination": dest,
                 "spec_sha256": pre.get("spec_sha256"), "artifact_sha256": out_sha,
                 "byte_count": int(pre["byte_count"])}
         if row["args_sha256"] != args_sha256(args):
             raise DocumentGenError("approval args digest mismatch — substitution rejected")
-        if not self.store.consume_approval(
-            approval_id, expected_args_sha256=row["args_sha256"],
-            expected_run_id=row["run_id"] or None, expected_agent=row["agent"],
-            expected_tool=row["tool"], expected_tool_version=row["tool_version"],
+        # ATOMIC start-before-effect: consume the approval AND insert the ledger
+        # row in ONE transaction, fenced by lease owner+generation, bound to the
+        # exact args hash / tool version / run / agent / tool / task / expiry
+        execution_id = uuid4().hex
+        args_json = ("" if getattr(self.store.persist_mode, "value", "") == "metadata_only"
+                     else redact_secrets(canonical_args(args))[:8_000])
+        if not self.store.start_execution(
+            execution_id=execution_id, run_id=run_id, agent=agent, tool=row["tool"],
+            args_sha256=row["args_sha256"], status=ToolExecutionStatus.STARTED.value,
+            approval_id=approval_id, expected_args_sha256=row["args_sha256"],
+            task_id=task_id, tool_version=row["tool_version"], args_json=args_json,
+            lease_owner=lease_owner, lease_generation=lease_generation,
             expected_task_id=row["task_id"],
         ):
             raise DocumentGenError(
-                "approval consumption rejected (replay, substitution or expiry)")
-        # publish the exact approved bytes (dir-fd rename + post-publish hash verify)
-        published_sha = self.sandbox.write_bytes_atomic(
-            dest, staged, expected_sha256=expected_existing, require_exists=require_exists,
-            max_bytes=int(pre["byte_count"]))
+                "atomic execution-start rejected (replay, substitution, expiry or stale "
+                "lease) — approval NOT consumed, nothing published")
+        # publish the exact approved bytes (parent dir-fd + staged-fd re-verify +
+        # ATOMIC NO-CLOBBER link + post-publish re-open/re-hash)
+        published_sha = self.sandbox.write_bytes_atomic(dest, staged,
+                                                        max_bytes=int(pre["byte_count"]))
         if published_sha != out_sha:
-            raise DocumentGenError("published artifact hash != approved hash — rejected")
+            raise DocumentGenError(
+                "post-publication hash mismatch — NOT reported as successful completion")
+        # durable completion, fenced by the same lease (a failure here leaves an
+        # uncertain 'started' row; the consumed approval makes auto-replay impossible)
+        if not self.store.ledger_update(
+            execution_id, status=ToolExecutionStatus.COMPLETED.value,
+            result_sha256=published_sha, output_bytes=len(staged),
+            lease_owner=lease_owner, lease_generation=lease_generation,
+        ):
+            raise DocumentGenError(
+                "published but durable completion failed — uncertain outcome, no auto-replay")
         self.sandbox.discard_staged(pre["staging_relpath"])
         # artifact provenance: clearly marked GENERATED (never external evidence)
         prov = {"generated": True, "generator": pre.get("generator", ""), "format": pre["format"],
                 "spec_sha256": pre["spec_sha256"], "output_sha256": out_sha,
                 "byte_count": int(pre["byte_count"]), "destination": dest,
-                "approval_id": approval_id, "note": "generated artifact — not retrieved evidence"}
-        source_id = None
-        if run_id is not None:
-            origin = self.registry.trusted_origin(
-                run_id=run_id, lease_owner=lease_owner,  # type: ignore[arg-type]
-                lease_generation=lease_generation,      # type: ignore[arg-type]
-                agent_id=agent, task_id=task_id)
-            source_id = self.registry.register(
-                origin=origin, source_type=SourceType.OTHER, provider="hive-docgen",
-                locator=f"generated:{dest}", content_sha256=out_sha,
-                extract_method=str(pre.get("generator", "")), extract_version="1",
-                provenance=prov, license=None, attribution="")
+                "approval_id": approval_id, "execution_id": execution_id,
+                "note": "generated artifact — not retrieved evidence"}
+        origin = self.registry.trusted_origin(
+            run_id=run_id, lease_owner=lease_owner,  # type: ignore[arg-type]
+            lease_generation=lease_generation,      # type: ignore[arg-type]
+            agent_id=agent, task_id=task_id)
+        source_id = self.registry.register(
+            origin=origin, source_type=SourceType.OTHER, provider="hive-docgen",
+            locator=f"generated:{dest}", content_sha256=out_sha,
+            extract_method=str(pre.get("generator", "")), extract_version="1",
+            provenance=prov, license=None, attribution="")
         return {"status": "published", "destination": dest, "artifact_sha256": published_sha,
                 "byte_count": len(staged), "approval_id": approval_id,
-                "source_id": source_id, "format": pre["format"]}
+                "execution_id": execution_id, "source_id": source_id, "format": pre["format"]}
 
 
 # ---- tools -----------------------------------------------------------------------------------
@@ -727,12 +794,21 @@ class DocPublishAdapter:
         self._lease_lookup = lease_lookup
 
     def execute(self, args: dict[str, Any], ctx: Any) -> str:
+        # W5 residual: publication is a run-bound mutation — a full lease identity
+        # (owner+generation) is mandatory, fail closed without it
         run_id = getattr(ctx, "run_id", None)
+        if not run_id:
+            raise DocumentGenError(
+                "doc_publish requires a run-bound context (run_id) — fail closed")
         owner = gen = None
-        if run_id is not None and self._lease_lookup is not None:
+        if self._lease_lookup is not None:
             rc = self._lease_lookup(run_id)
             owner = getattr(rc, "lease_owner", None) if rc is not None else None
             gen = getattr(rc, "lease_generation", None) if rc is not None else None
+        if owner is None or gen is None:
+            from .errors import ToolPermissionError
+
+            raise ToolPermissionError(f"run {run_id!r} has no lease identity — fail closed")
         res = self.writer.publish(
             approval_id=args["approval_id"], agent=getattr(ctx, "agent", "system"),
             run_id=run_id, task_id=getattr(ctx, "task_id", None),
