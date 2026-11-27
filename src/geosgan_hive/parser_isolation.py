@@ -412,7 +412,12 @@ class ParserWorkerPool:
         if self._worker_extra_paths is None:
             import site
 
-            extra_paths = [site.getusersitepackages(), *site.getsitepackages()]
+            # W4 residual: SYSTEM site-packages come FIRST, user-site LAST, so a
+            # (less trustworthy, user-writable) user-site package can never
+            # shadow a system one. -I mode skips site initialization entirely, so
+            # no .pth files in these dirs execute either; the dirs are only used
+            # as module lookup paths, in this fixed order.
+            extra_paths = [*site.getsitepackages(), site.getusersitepackages()]
         else:
             extra_paths = list(self._worker_extra_paths)
         argv = [

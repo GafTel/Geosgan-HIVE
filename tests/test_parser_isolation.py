@@ -283,15 +283,6 @@ def test_rlimit_failure_fails_closed(tmp_path):
     assert "limits" in r.error
 
 
-def test_ops_registry_is_fixed_and_trusted():
-    expected = {"ping", "sha256", "echo_file", "sleep", "env", "rlimits",
-                "net_probe", "spam", "spam_file", "fds",
-                "parse_pdf", "parse_docx", "parse_xlsx"}
-    assert set(_parser_worker.OPS) == expected
-    for fn in _parser_worker.OPS.values():
-        assert callable(fn)
-
-
 def test_pool_validation():
     with pytest.raises(ValueError):
         ParserWorkerPool(max_workers=0)
@@ -379,3 +370,47 @@ def test_worker_inherits_no_sensitive_file_descriptors(tmp_path):
         if t.startswith(ok_prefixes):
             continue
         assert os.path.realpath(t).startswith(job_root + os.sep) or t in ("/dev/null",), t
+
+
+# ---- W4 residual: module resolution cannot be influenced by untrusted input ------
+
+@posix_only
+def test_worker_syspath_has_no_cwd_or_jobdir(tmp_path):
+    with _pool(tmp_path) as pool:
+        r = pool.run("syspath")
+    assert r.ok
+    sp = r.response["sys_path"]
+    cwd = r.response["cwd"]
+    assert "" not in sp and "." not in sp
+    assert all(not p.startswith(cwd) for p in sp if p), sp
+    # the package src dir is the only repo path; site dirs are appended after
+    assert sp[0].endswith("src")
+
+
+@posix_only
+def test_worker_module_resolution_not_shadowable(tmp_path):
+    # plant evil shadow modules in the work root (where job dirs live) and in a
+    # fake cwd: the worker must resolve the REAL modules, never these
+    (tmp_path / "pypdf.py").write_text("raise RuntimeError('shadowed pypdf')")
+    (tmp_path / "json.py").write_text("raise RuntimeError('shadowed json')")
+    (tmp_path / "hashlib.py").write_text("raise RuntimeError('shadowed hashlib')")
+    with _pool(tmp_path) as pool:
+        r = pool.run("probe")
+        assert r.ok
+        mods = r.response["modules"]
+        for name in ("json", "hashlib"):
+            assert mods[name] and "python3" in mods[name], (name, mods[name])  # stdlib
+        for name in ("pypdf", "docx", "openpyxl", "defusedxml"):
+            assert mods[name] is None or not mods[name].startswith(str(tmp_path)), \
+                (name, mods[name])  # never from the work root
+        # and the worker still works (stdlib not shadowed)
+        assert pool.run("ping").ok
+
+
+def test_ops_registry_is_fixed_and_trusted():
+    expected = {"ping", "sha256", "echo_file", "sleep", "env", "rlimits",
+                "net_probe", "spam", "spam_file", "fds", "syspath", "probe",
+                "parse_pdf", "parse_docx", "parse_xlsx"}
+    assert set(_parser_worker.OPS) == expected
+    for fn in _parser_worker.OPS.values():
+        assert callable(fn)

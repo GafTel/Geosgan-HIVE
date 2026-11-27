@@ -156,6 +156,28 @@ def _op_spam_file(req: dict[str, Any]) -> dict[str, Any]:
     return {"output_bytes": n}
 
 
+def _op_syspath(req: dict[str, Any]) -> dict[str, Any]:
+    """Report sys.path + cwd: proves the worker's module resolution cannot be
+    influenced by the job dir / cwd / workspace / document contents."""
+    return {"sys_path": list(sys.path), "cwd": os.getcwd(),
+            "path0": sys.path[0] if sys.path else None}
+
+
+def _op_probe(req: dict[str, Any]) -> dict[str, Any]:
+    """Resolve well-known modules and report their __file__: any module
+    resolving inside the job dir / work root / workspace is a shadowing attack."""
+    import importlib
+
+    out = {}
+    for name in ("json", "hashlib", "pypdf", "docx", "openpyxl", "defusedxml"):
+        try:
+            mod = importlib.import_module(name)
+            out[name] = getattr(mod, "__file__", None)
+        except ImportError:
+            out[name] = None
+    return {"modules": out}
+
+
 def _op_fds(req: dict[str, Any]) -> dict[str, Any]:
     """Report open fd targets (proves close_fds: no inherited descriptors)."""
     targets = []
@@ -204,6 +226,8 @@ OPS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "spam": _op_spam,
     "spam_file": _op_spam_file,
     "fds": _op_fds,
+    "syspath": _op_syspath,
+    "probe": _op_probe,
     "parse_pdf": _make_parse_op("worker_parse_pdf"),
     "parse_docx": _make_parse_op("worker_parse_docx"),
     "parse_xlsx": _make_parse_op("worker_parse_xlsx"),

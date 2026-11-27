@@ -519,12 +519,24 @@ def test_non_posix_fail_closed_everywhere(tmp_path):
     store.close()
 
 
-def test_windows_fail_closed_assertion():
-    """On non-POSIX, document reading must fail closed (sandbox + worker)."""
-    if POSIX:
-        pytest.skip("posix sandbox is available here")
-    # on Windows the env-based read tests above prove the fail-closed raise;
-    # this marker documents the expectation explicitly on that platform
+def test_platform_fail_closed_guarantee(tmp_path):
+    """Runs on every platform: the pool/reader fail closed when the platform
+    override says non-POSIX (this is what Windows exercises natively — the
+    env-based tests above prove the real sandbox-level fail-closed there)."""
+    from geosgan_hive.parser_isolation import ParserWorkerPool, ParserWorkerUnavailable
+
+    with pytest.raises(ParserWorkerUnavailable):
+        ParserWorkerPool(platform="nt", work_root=str(tmp_path)).run("ping")
+    store = CheckpointStore(str(tmp_path / "cp.db"))
+    sandbox = WorkspaceSandbox(str(tmp_path / "ws")) if POSIX else None
+    if sandbox is not None:
+        (tmp_path / "ws").mkdir(exist_ok=True)
+        (tmp_path / "ws" / "a.pdf").write_bytes(b"%PDF-1.4 x")
+        reader = DocumentReader(store=store, sandbox=sandbox,
+                                config=DocumentsConfig(enabled=True), platform="nt")
+        with pytest.raises(HiveError):
+            reader.read("a.pdf")
+    store.close()
 
 
 def test_offline_startup_without_doc_extras(tmp_path):
