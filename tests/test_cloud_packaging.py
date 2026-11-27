@@ -256,4 +256,4 @@ def test_demo_cloud_runs_fully_offline(tmp_path):
 
 def test_version_matches_pyproject():
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-    assert __version__ == pyproject["project"]["version"] == "0.7.0"
+    assert __version__ == pyproject["project"]["version"] == "0.8.0"

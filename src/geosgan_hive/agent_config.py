@@ -308,6 +308,71 @@ class ApiProviderConfig(BaseModel):
         return self
 
 
+class WebEndpointPolicy(BaseModel):
+    """W3: one operator-configured web-retrieval endpoint policy. Narrows an
+    allowlisted `web` API endpoint (scheme/host/port/methods) to tightly scoped
+    path prefixes, query parameter NAMES and bounded content/extraction sizes.
+    A model-supplied URL is accepted ONLY if it canonicalizes exactly under
+    this policy. Disabled unless the `web` provider is enabled in ApiConfig."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+    #: segment-aware prefixes; must each fall under the endpoint's path_prefixes
+    allowed_path_prefixes: list[str] = Field(min_length=1)
+    #: allowed query parameter NAMES (values are bounded, never credentials)
+    allowed_query_params: list[str] = Field(default_factory=list)
+    max_query_value_chars: int = Field(default=256, ge=1, le=4096)
+    #: allowed response base content types (e.g. "text/html")
+    allowed_content_types: list[str] = Field(default_factory=lambda: ["text/html"])
+    max_response_bytes: int = Field(default=2 << 20, ge=1, le=10 << 20)
+    max_extract_chars: int = Field(default=20_000, ge=100, le=200_000)
+    max_html_tags: int = Field(default=5_000, ge=10, le=100_000)
+    extraction_deadline_seconds: float = Field(default=10.0, gt=0, le=60)
+    #: register successful retrievals in the W2 source registry (default true)
+    register_sources: bool = True
+
+    @field_validator("allowed_path_prefixes")
+    @classmethod
+    def _prefixes_ok(cls, v: list[str]) -> list[str]:
+        out = []
+        for p in v:
+            if not p.startswith("/") or ".." in p or "%" in p or "\\" in p \
+                    or any(ord(c) < 0x20 or ord(c) == 0x7F for c in p):
+                raise ValueError(f"invalid web path prefix {p!r}")
+            out.append(p.rstrip("/") or "/")
+        return out
+
+    @field_validator("allowed_query_params")
+    @classmethod
+    def _qparams_ok(cls, v: list[str]) -> list[str]:
+        for q in v:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", q):
+                raise ValueError(f"invalid query param name {q!r}")
+        return sorted(set(v))
+
+    @field_validator("allowed_content_types")
+    @classmethod
+    def _ctypes_ok(cls, v: list[str]) -> list[str]:
+        ctype = r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}"
+        for c in v:
+            if not re.fullmatch(ctype, c):
+                raise ValueError(f"invalid content type {c!r}")
+        return sorted(set(v))
+
+
+def _prefix_within(prefix: str, allowed: list[str]) -> bool:
+    """Segment-aware: `prefix` must equal or be under one of `allowed`."""
+    p = prefix.rstrip("/") or "/"
+    for a in allowed:
+        aa = a.rstrip("/") or "/"
+        if aa == "/":
+            return True
+        if p == aa or p.startswith(aa + "/"):
+            return True
+    return False
+
+
 class ApiBudgets(BaseModel):
     """Durable per-run / per-provider / per-endpoint request+byte budgets,
     enforced via atomic v9 reservations before every physical HTTP request."""
@@ -336,6 +401,9 @@ class ApiConfig(BaseModel):
         validate_default=True,
     )
     max_wire_bytes_per_request: int = Field(default=10 * 1024 * 1024, ge=1)
+    #: W3 web-retrieval endpoint policies (each must reference an endpoint of the
+    #: enabled `web` provider); empty = web retrieval disabled
+    web_endpoints: list[WebEndpointPolicy] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _consistent(self) -> ApiConfig:
@@ -349,7 +417,69 @@ class ApiConfig(BaseModel):
         ep_ids = [e.endpoint_id for p in self.providers for e in p.endpoints]
         if len(set(ep_ids)) != len(ep_ids):
             raise ValueError(f"duplicate endpoint ids: {sorted(ep_ids)}")
+        # W3: web policies must reference a `web` provider endpoint and their
+        # path prefixes must stay within that endpoint's allowlisted prefixes
+        web_eps = {e.endpoint_id: e for p in self.providers if p.provider == "web"
+                   for e in p.endpoints}
+        seen_web = set()
+        for pol in self.web_endpoints:
+            if pol.endpoint_id in seen_web:
+                raise ValueError(f"duplicate web policy for endpoint {pol.endpoint_id!r}")
+            seen_web.add(pol.endpoint_id)
+            ep = web_eps.get(pol.endpoint_id)
+            if ep is None:
+                raise ValueError(
+                    f"web policy endpoint {pol.endpoint_id!r} is not an endpoint of a "
+                    "'web' provider — fail closed")
+            for pfx in pol.allowed_path_prefixes:
+                if not _prefix_within(pfx, list(ep.path_prefixes)):
+                    raise ValueError(
+                        f"web policy prefix {pfx!r} is not within endpoint "
+                        f"{pol.endpoint_id!r} prefixes {ep.path_prefixes}")
         return self
+
+
+class DocumentsConfig(BaseModel):
+    """W4 (v0.8.0): local document reading. DISABLED BY DEFAULT (enabled=false).
+    All limits are operator maxima: model/tool arguments are CLAMPED to them,
+    never raised. PDF/DOCX/XLSX parse only inside the POSIX parser worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    allowed_formats: list[str] = Field(default_factory=lambda: [
+        "pdf", "docx", "xlsx", "csv", "json", "txt", "md", "html"])
+    max_input_bytes: int = Field(default=10 << 20, ge=1, le=100 << 20)
+    max_extract_chars: int = Field(default=20_000, ge=100, le=200_000)
+    max_pdf_pages: int = Field(default=50, ge=1, le=500)
+    max_docx_blocks: int = Field(default=2_000, ge=10, le=20_000)
+    max_xlsx_sheets: int = Field(default=10, ge=1, le=50)
+    max_xlsx_cells: int = Field(default=20_000, ge=10, le=200_000)
+    max_csv_rows: int = Field(default=5_000, ge=1, le=100_000)
+    max_csv_field_bytes: int = Field(default=100_000, ge=1, le=1 << 20)
+    max_json_depth: int = Field(default=32, ge=1, le=128)
+    worker_max_workers: int = Field(default=2, ge=1, le=8)
+    worker_max_pending: int = Field(default=4, ge=1, le=16)
+    worker_op_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    worker_max_memory_bytes: int = Field(default=512 << 20, ge=16 << 20, le=4 << 30)
+    #: register successful parses as W2 sources (lease-fenced, metadata-only)
+    register_sources: bool = True
+    #: W5 residual: staging lifecycle bounds (staged artifacts hold SENSITIVE
+    #: bytes in .hive-staging/, 0700 dir / 0600 files, never in SQLite, and are
+    #: denied to agent-facing file tools). Swept by age; active approvals protected.
+    staging_max_files: int = Field(default=32, ge=1, le=256)
+    staging_max_bytes: int = Field(default=64 << 20, ge=1, le=1 << 30)
+    staging_max_age_seconds: float = Field(default=3600.0, gt=0, le=86_400.0)
+
+    @field_validator("allowed_formats")
+    @classmethod
+    def _formats_ok(cls, v: list[str]) -> list[str]:
+        from .documents import SUPPORTED_FORMATS
+
+        bad = [f for f in v if f not in SUPPORTED_FORMATS]
+        if bad:
+            raise ValueError(f"unsupported document formats: {bad}")
+        return sorted(set(v))
 
 
 class HiveConfig(BaseModel):
@@ -369,6 +499,8 @@ class HiveConfig(BaseModel):
     #: Phase 5 A3: intelligent routing policy (None = fixed configured models only;
     #: automatic routing is OFF unless explicitly configured here)
     routing: RoutingPolicy | None = None
+    #: Phase 6 W4: local document reading (None or enabled=false = fully disabled)
+    documents: DocumentsConfig | None = None
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:

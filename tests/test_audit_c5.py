@@ -409,7 +409,7 @@ def test_dev_v7_database_migrates_to_v8(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r["name"] for r in
                 store._conn.execute("PRAGMA table_info(quota_reservations)").fetchall()}
-    assert v == "12"
+    assert v == "13"
     assert {"model", "request_sha256", "prompt_tokens", "max_output_tokens", "cost_usd",
             "endpoint"} <= cols
     assert store.get_reservation("d-old")["dispatch_id"] == "d-old"  # preserved

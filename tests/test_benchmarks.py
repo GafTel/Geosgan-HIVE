@@ -268,7 +268,7 @@ def test_v9_to_v11_migration_chain_preserves_data(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {r[0] for r in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    assert v == "12" and SCHEMA_VERSION == 12  # v9 migrates through the full chain
+    assert v == "13" and SCHEMA_VERSION == 13  # v9 migrates through the full chain
     assert {"benchmark_evidence", "routing_decisions"} <= tables
     with store._lock:
         bcols = {r["name"] for r in store._conn.execute(
@@ -310,7 +310,7 @@ def test_interrupted_v9_v10_migration_rolls_back(tmp_path):  # chain recovers to
     with store._lock:
         v = store._conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-    assert v == "12"
+    assert v == "13"
     store.close()
 
 
@@ -345,7 +345,7 @@ def test_v10_to_v11_migration_adds_trust_columns_and_routing_table(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         cols = {r["name"] for r in store._conn.execute(
             "PRAGMA table_info(benchmark_evidence)").fetchall()}
-    assert v == "12" and "routing_decisions" in tables
+    assert v == "13" and "routing_decisions" in tables
     assert {"trust_tier", "evaluator_id"} <= cols  # added by v10->v11 ALTER
     row = store.get_benchmark_evidence("ev-old")
     assert row is not None and row["evidence_id"] == "ev-old"  # v10 row preserved
@@ -408,7 +408,7 @@ def test_interrupted_v10_v11_migration_rolls_back(tmp_path):
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r["name"] for r in store._conn.execute(
             "PRAGMA table_info(benchmark_evidence)").fetchall()}
-    assert v == "12" and {"trust_tier", "evaluator_id"} <= cols
+    assert v == "13" and {"trust_tier", "evaluator_id"} <= cols
     store.close()
 
 
