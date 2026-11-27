@@ -45,7 +45,7 @@ from geosgan_hive.cloud_profiles import (
     CloudProfileRegistry,
 )
 from geosgan_hive.docgen import DocumentGenUnavailableError, DocumentWriter
-from geosgan_hive.documents import DocumentReader, DocumentUnavailableError
+from geosgan_hive.documents import DocumentReader
 from geosgan_hive.errors import CloudConfigError
 from geosgan_hive.gateway import ModelGateway
 from geosgan_hive.http_client import (
@@ -514,13 +514,16 @@ def test_K_non_posix_and_missing_deps_fail_closed(tmp_path):
                        agent="a", run_id="r")
     with pytest.raises(Exception, match="POSIX"):
         ParserWorkerPool(platform="nt").run("ping", b"")
-    # doc READING also fails closed on non-POSIX worker formats
+    # doc READING also fails closed on non-POSIX worker formats (on real Windows
+    # the sandbox guard fires first; with the platform override on POSIX the pool
+    # does — both are fail-closed, matching test_documents)
     from geosgan_hive.agent_config import DocumentsConfig
+    from geosgan_hive.errors import HiveError
 
     reader = DocumentReader(store=store, sandbox=sb, config=DocumentsConfig(enabled=True),
                             platform="nt")
     (ws / "a.pdf").write_bytes(b"%PDF-1.4 fake")
-    with pytest.raises(DocumentUnavailableError):
+    with pytest.raises(HiveError):
         reader.read("a.pdf")
     # source tools are pure registry reads — no doc libs needed
     from geosgan_hive.source_tools import source_tools
