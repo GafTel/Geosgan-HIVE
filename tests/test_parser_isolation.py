@@ -415,3 +415,26 @@ def test_ops_registry_is_fixed_and_trusted():
     assert set(_parser_worker.OPS) == expected
     for fn in _parser_worker.OPS.values():
         assert callable(fn)
+
+
+def test_worker_pth_files_never_execute(tmp_path):
+    """W6 residual: the worker runs with -I -S, so `site` never runs and .pth
+    files in an injected extra path are NOT executed (plain sys.path entries
+    only). With -I alone, system-site .pth files WOULD run."""
+    import site
+
+    evil_dir = tmp_path / "evil-site"
+    evil_dir.mkdir()
+    marker = tmp_path / "pth-executed"
+    # a .pth file whose executable line would create the marker if site processed it
+    (evil_dir / "evil.pth").write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('PWNED')\n")
+    # real site dirs first (worker needs them), evil dir appended LAST (cannot
+    # shadow system packages)
+    extra = [*site.getsitepackages(), site.getusersitepackages(), str(evil_dir)]
+    with _pool(tmp_path, worker_extra_paths=extra) as pool:
+        r = pool.run("syspath")
+        assert r.ok, r.error
+        assert str(evil_dir) in r.response["sys_path"]  # dir IS on the path...
+        assert pool.run("ping").ok  # ...and the worker still works
+    assert not marker.exists(), ".pth file executed inside the worker — fail closed violated"

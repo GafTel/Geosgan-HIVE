@@ -74,8 +74,12 @@ Adversaries / inputs:
 `ParserWorkerPool` (`parser_isolation.py`) + trusted worker (`_parser_worker.py`):
 
 **Enforceable on POSIX (tested):**
-- fixed executable `sys.executable -I -c <hardcoded bootstrap>`; `shell=False`;
-  no user/model-selected code or executable;
+- fixed executable `sys.executable -I -S -c <hardcoded bootstrap>`; `shell=False`;
+  no user/model-selected code or executable. `-I` drops the script dir and user
+  site and ignores PYTHON* env vars; `-S` additionally skips the `site` module
+  entirely, so NO `.pth` file executes (with `-I` alone, `.pth` files in SYSTEM
+  site-packages would still run — the worker injects package dirs as plain
+  `sys.path` entries instead, which never triggers `.pth` processing);
 - rlimits applied inside the worker before parsing (RLIMIT_AS/CPU/FSIZE/CORE=0)
   — NOT via `preexec_fn` (unsafe in multithreaded parents); worker is
   single-threaded at that point;

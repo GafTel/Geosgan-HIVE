@@ -604,3 +604,157 @@ def test_M_example_config_loads_and_matrix(tmp_path):
     assert gw2.policy.allows("researcher", "source_list") is False  # ...but denied
     assert gw2.policy.allows("researcher", "doc_read") is False
     store.close()
+
+
+# ---- W6 residual 2.2: REAL supervisor-driven offline orchestration (scripted models) ----
+
+@posix_only
+def test_w6_supervisor_driven_orchestration_end_to_end(tmp_path, page_server):
+    """Full offline multi-agent workflow with the real Supervisor + CollaborationEngine
+    + ToolGateway + ledger + sandbox, driven by deterministic scripted FakeLLM models:
+    supervisor delegates -> researcher web_get_page (loopback fixture) -> analyst
+    doc_read + doc_generate (pending approval) -> reviewer source inspection ->
+    supervisor reaches the approval boundary -> operator approves -> publication
+    through the existing writer/ledger with a taken-over lease."""
+    import re
+
+    from geosgan_hive.factory import build_team
+    from geosgan_hive.gateway import ModelGateway
+    from geosgan_hive.llm import FakeLLM
+    from geosgan_hive.tool_factory import build_tool_catalog
+    from geosgan_hive.usage import UsageTracker
+
+    ws = tmp_path / "ws"
+    (ws / "out").mkdir(parents=True)
+    clock = [NOW]
+    store = CheckpointStore(str(tmp_path / "cp.db"), persist_mode=PersistMode.RESUMABLE,
+                            utcnow=lambda: clock[0], lease_ttl_seconds=60.0)
+    cfg = w6_config(ws, str(tmp_path / "cp.db"))
+    make_xlsx(ws / "tabla.xlsx")
+    gateway = ModelGateway(tracker=UsageTracker())
+    supervisor, agents = build_team(cfg, gateway, UsageTracker(), checkpoint_store=store)
+    # register the offline loopback web engine into the team's shared tool gateway
+    apis = web_apis_cfg()
+    rule = EndpointRule(endpoint_id="web-docs", scheme="http", host="127.0.0.1",
+                        port=page_server, path_prefixes=("/docs",), methods=("GET",),
+                        headers={"User-Agent": "hive-test/1.0"})
+    client = SecureHttpClient(TransportConfig(
+        endpoints=(rule,), allow_loopback=True,
+        limits=HttpLimits(max_retries=1, max_wire_bytes=1_000_000,
+                          max_decompressed_bytes=2_000_000)))
+    session = build_offline_test_session(
+        client, OutboundAuthorizer(store, apis, ApprovalManager(store)), store)
+    engine = WebRetrievalEngine(session=session, registry=SourceRegistry(store),
+                                policies={p.endpoint_id: p for p in apis.web_endpoints})
+    tool_gw = agents["researcher"].tool_gateway
+    for spec, adapter in web_tools(engine, lease_lookup=lambda rid: store.get(rid)):
+        tool_gw.catalog.register(spec, adapter)
+
+    url = f"http://127.0.0.1:{page_server}/docs/guide?q=workflow"
+
+    def tool_results(messages):
+        return [m for m in messages if getattr(m, "agent", None) == "tool"]
+
+    def last_tool_json(messages):
+        m = re.search(r"\{.*\}", tool_results(messages)[-1].content, re.S)
+        return json.loads(m.group(0))
+
+    def researcher_handler(messages):
+        if not tool_results(messages):
+            return json.dumps({"tool": "web_get_page", "args": {
+                "endpoint_id": "web-docs", "url": url, "max_chars": 2_000}})
+        data = last_tool_json(messages)
+        assert data["http_status"] == 200
+        return f"Fetched the guide. Source registered: {data['source_id']}"
+
+    def analyst_handler(messages):
+        used = {re.search(r"Result of '(\w+)'", m.content).group(1)
+                for m in tool_results(messages)
+                if re.search(r"Result of '(\w+)'", m.content)}
+        if "doc_read" not in used:
+            return json.dumps({"tool": "doc_read", "args": {"path": "tabla.xlsx"}})
+        if "doc_generate" not in used:
+            spec = {"title": "Reporte ñ", "sheets": [
+                {"name": "d", "header": ["concepto", "valor"],
+                 "rows": [["ventas", 100]]}]}
+            return json.dumps({"tool": "doc_generate", "args": {
+                "format": "csv", "destination": "out/reporte.csv", "spec": spec}})
+        data = last_tool_json(messages)
+        assert data["status"] == "pending_approval"
+        return f"Prepared the report. PENDING_APPROVAL={data['approval_id']}"
+
+    def reviewer_handler(messages):
+        used = {re.search(r"Result of '(\w+)'", m.content).group(1)
+                for m in tool_results(messages)
+                if re.search(r"Result of '(\w+)'", m.content)}
+        if "source_list" not in used:
+            return json.dumps({"tool": "source_list", "args": {"limit": 20}})
+        if "source_get" not in used:
+            sid = last_tool_json(messages)["sources"][0]["source_id"]
+            return json.dumps({"tool": "source_get", "args": {"source_id": sid}})
+        return "Reviewed sources: provenance records consistent; citation valid."
+
+    sup_calls = {"n": 0}
+
+    def supervisor_handler(messages):
+        sup_calls["n"] += 1
+        n = sup_calls["n"]
+        if n == 1:
+            return json.dumps({"next": "researcher",
+                               "reason": "fetch the guide page and register the source"})
+        if n == 2:
+            return json.dumps({"next": "analyst",
+                               "reason": "read tabla.xlsx and prepare the CSV report"})
+        if n == 3:
+            return json.dumps({"next": "reviewer",
+                               "reason": "review the sources and citations"})
+        # approval boundary: the pending approval id comes from the analyst answer
+        m = re.search(r"PENDING_APPROVAL=([0-9a-f]{32})",
+                      "\n".join(getattr(x, "content", "") for x in messages))
+        assert m, "analyst answer with approval id not found in transcript"
+        return json.dumps({"next": "FINISH", "answer":
+                           f"Done. Report prepared; awaiting human approval {m.group(1)}."})
+
+    supervisor.llm = FakeLLM(handler=supervisor_handler)
+    agents["researcher"].llm = FakeLLM(handler=researcher_handler)
+    agents["analyst"].llm = FakeLLM(handler=analyst_handler)
+    agents["reviewer"].llm = FakeLLM(handler=reviewer_handler)
+    agents["developer"].llm = FakeLLM(responses=["not needed"])
+
+    result = supervisor.run("Produce the sales report from the guide and the spreadsheet",
+                            run_id="run-1")
+    assert not result.failed, result.final_answer
+    m = re.search(r"awaiting human approval ([0-9a-f]{32})", result.final_answer)
+    assert m, result.final_answer
+    approval_id = m.group(1)
+    # real delegation happened through the engine with runtime identities
+    assert len(result.transcript) > 3
+    row = store.get_approval(approval_id)
+    assert row["status"] == "pending" and row["run_id"] == "run-1"
+    assert row["tool"] == "doc_generate"
+    pre = json.loads(row["preconditions_json"])
+    assert pre["output_sha256"] and pre["expected_absent"] is True
+    assert not (ws / "out" / "reporte.csv").exists()  # nothing published pre-approval
+    # sources were registered by the REAL retrieval/parse paths
+    srcs = SourceRegistry(store).list(run_id="run-1")
+    types = {s["source_type"] for s in srcs}
+    assert "web_page" in types and "document" in types
+
+    # ---- operator side ("separate process"): approve, then publish with a taken-over lease
+    assert store.decide_approval(approval_id, decision="approved", operator="op1")
+    clock[0] = NOW + timedelta(seconds=120)  # let the agent's lease expire
+    owner = "operator:op1"
+    gen = store.takeover_lease_gen("run-1", owner)
+    assert gen is not None
+    _cat, sb = build_tool_catalog(cfg)
+    writer = DocumentWriter(store=store, sandbox=sb, config=cfg.documents)
+    res = writer.publish(approval_id=approval_id, agent="supervisor", run_id="run-1",
+                         task_id=row["task_id"], lease_owner=owner, lease_generation=gen)
+    assert res["status"] == "published"
+    data = (ws / "out" / "reporte.csv").read_bytes()
+    assert hashlib.sha256(data).hexdigest() == pre["output_sha256"]
+    led = store.ledger_get(res["execution_id"])
+    assert led["status"] == "completed" and led["lease_owner"] == owner
+    cite = SourceRegistry(store).cite(res["source_id"])
+    assert "provider=hive-docgen" in cite and "generated:" in cite
+    store.close()

@@ -386,29 +386,47 @@ class WorkspaceSandbox:
         """Write bytes to a fresh 0600 staging file; returns (relpath, sha256).
         The relpath is workspace-relative and always under .hive-staging/.
         Bounded: expired orphans are swept first, then the staged artifact COUNT
-        and AGGREGATE BYTES are capped (fail closed when full)."""
+        and AGGREGATE BYTES are capped (fail closed when full). The sweep+count+
+        write is serialized across PROCESSES with an flock on the staging lock
+        file, so concurrent processes cannot oversubscribe the aggregate caps."""
         root = self._staging_root()
         if not isinstance(data, (bytes, bytearray)):
             raise SandboxViolationError("staged content must be bytes")
         if len(data) > max_bytes:
             raise SandboxViolationError(f"staged content {len(data)}B > cap {max_bytes}B")
-        # sweep expired orphans, then enforce the bounded count/byte caps
-        self.sweep_staging(max_age_seconds=max_age_seconds)
-        names = [n for n in os.listdir(root)
-                 if os.path.isfile(os.path.join(root, n))]
-        if max_files is not None and len(names) >= max_files:
-            raise SandboxViolationError(
-                f"staging full: {len(names)} artifacts >= cap {max_files} — fail closed")
-        total = 0
-        for n in names:
+        import fcntl
+
+        lock_path = os.path.join(root, ".lock")
+        lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX)
             try:
-                total += os.path.getsize(os.path.join(root, n))
-            except OSError:
-                pass
-        if max_total_bytes is not None and total + len(data) > max_total_bytes:
-            raise SandboxViolationError(
-                f"staging byte cap exceeded: {total}+{len(data)} > {max_total_bytes} — "
-                "fail closed")
+                # sweep expired orphans, then enforce the bounded count/byte caps
+                self.sweep_staging(max_age_seconds=max_age_seconds)
+                names = [n for n in os.listdir(root)
+                         if os.path.isfile(os.path.join(root, n)) and n != ".lock"]
+                if max_files is not None and len(names) >= max_files:
+                    raise SandboxViolationError(
+                        f"staging full: {len(names)} artifacts >= cap {max_files} — "
+                        "fail closed")
+                total = 0
+                for n in names:
+                    try:
+                        total += os.path.getsize(os.path.join(root, n))
+                    except OSError:
+                        pass
+                if max_total_bytes is not None and total + len(data) > max_total_bytes:
+                    raise SandboxViolationError(
+                        f"staging byte cap exceeded: {total}+{len(data)} > "
+                        f"{max_total_bytes} — fail closed")
+                return self._stage_bytes_locked(root, bytes(data))
+            finally:
+                fcntl.flock(lfd, fcntl.LOCK_UN)
+        finally:
+            os.close(lfd)
+
+    def _stage_bytes_locked(self, root: str, data: bytes) -> tuple[str, str]:
+        """Caller must hold the staging flock. Writes the 0600 artifact file."""
         name = f"artifact-{uuid.uuid4().hex}"
         full = os.path.join(root, name)
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -476,23 +494,29 @@ class WorkspaceSandbox:
             pass
 
     def sweep_staging(self, *, max_age_seconds: float = 3600.0,
-                      protect: Iterable[str] | None = None) -> int:
-        """Delete staged artifacts older than max_age_seconds (orphan/crash cleanup).
-        `protect` holds workspace-relative staging paths still referenced by a
-        live pending/approved approval — those are NEVER swept (no cleanup of
-        active artifacts owned by another valid worker)."""
+                      protect: Iterable[str] | None = None,
+                      terminal: Iterable[str] | None = None) -> int:
+        """Delete staged artifacts: (a) immediately when referenced by a TERMINAL
+        approval state (rejected/denied/expired/cancelled/consumed — authoritative
+        state, not just age), (b) when older than max_age_seconds and not protected
+        (orphan/crash cleanup). `protect` holds staging paths of live
+        pending/approved approvals — those are NEVER swept (no cleanup of active
+        artifacts owned by another valid worker)."""
         self._fs_guard()
         root = self._staging_root()
         keep = {os.path.normpath(p) for p in (protect or ())}
+        gone = {os.path.normpath(p) for p in (terminal or ())}
         now = time.time()
         n = 0
         for name in os.listdir(root):
+            if name == ".lock":
+                continue
             full = os.path.join(root, name)
             rel = os.path.normpath(f"{self.STAGING_DIRNAME}/{name}")
             if rel in keep:
                 continue
             try:
-                if now - os.path.getmtime(full) > max_age_seconds:
+                if rel in gone or now - os.path.getmtime(full) > max_age_seconds:
                     os.unlink(full)
                     n += 1
             except OSError:

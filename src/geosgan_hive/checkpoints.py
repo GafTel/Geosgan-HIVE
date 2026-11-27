@@ -1242,6 +1242,35 @@ class CheckpointStore:
         assert cp is not None
         return cp
 
+    def takeover_lease_gen(self, run_id: str, owner: str) -> int | None:
+        """W7: operator continuation takeover. Moves a run back to RUNNING with a
+        fresh lease (owner, expiry) and a bumped generation — returning the new
+        generation to the caller (worker-owned identity). Allowed only when the
+        lease is free/absent or EXPIRED and the run is RUNNING or COMPLETED
+        (an agent run that ended normally is COMPLETED with lease cleared; the
+        trusted CLI operator reopens it solely to publish an approved artifact —
+        resume() semantics are unchanged and still reject COMPLETED runs).
+        Returns None when the lease is still live (held by an active worker) or
+        the state is anything else — fail closed, so a live worker can never be
+        displaced by a second process."""
+        now = self.now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE runs SET state=?, lease_owner=?, lease_expires_at=?, "
+                "lease_generation=lease_generation+1, updated_at=? "
+                "WHERE run_id=? AND state IN (?, ?) "
+                "AND (lease_owner IS NULL OR lease_expires_at <= ?)",
+                (ExecutionState.RUNNING.value, owner, self._lease_expiry(), now,
+                 run_id, ExecutionState.RUNNING.value, ExecutionState.COMPLETED.value,
+                 now),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = self._conn.execute(
+                "SELECT lease_generation FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            return int(row["lease_generation"])
+
     def mark_running_gen(self, run_id: str, *, owner: str) -> int | None:
         """Like mark_running, but RETURNS the effective lease generation to the
         resuming worker (worker-owned identity; never re-read from SQLite later)."""

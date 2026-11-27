@@ -79,10 +79,14 @@ class ParserJobTimeout(ParserIsolationError):
     """No worker slot became available within the deadline."""
 
 
-#: Hardcoded worker bootstrap. Runs with ``python -I -c`` so no user site-packages
-#: and no PYTHON* env vars apply. It applies rlimits FIRST (single-threaded at
-#: that point — never preexec_fn in the multithreaded parent), installs the
-#: network guard, then imports the trusted worker module and runs main().
+#: Hardcoded worker bootstrap. Runs with ``python -I -S -c``: -I removes the script
+#: dir and user site and ignores PYTHON* env vars; -S additionally skips the `site`
+#: module entirely, so NO .pth file executes anywhere (with -I alone, .pth files in
+#: SYSTEM site-packages would still run — a real code-execution vector; -S closes
+#: it because the bootstrap injects package dirs as PLAIN sys.path entries, which
+#: never triggers .pth processing). The bootstrap applies rlimits FIRST (single-
+#: threaded at that point — never preexec_fn in the multithreaded parent), installs
+#: the network guard, then imports the trusted worker module and runs main().
 _WORKER_BOOTSTRAP = r"""
 import json as _json, os as _os, resource as _resource, socket as _socket, sys as _sys
 _src = _sys.argv[1]
@@ -414,14 +418,14 @@ class ParserWorkerPool:
 
             # W4 residual: SYSTEM site-packages come FIRST, user-site LAST, so a
             # (less trustworthy, user-writable) user-site package can never
-            # shadow a system one. -I mode skips site initialization entirely, so
-            # no .pth files in these dirs execute either; the dirs are only used
-            # as module lookup paths, in this fixed order.
+            # shadow a system one. The worker runs with -I -S (see bootstrap), so
+            # site never runs and NO .pth file executes; these dirs are injected
+            # as plain module lookup paths only, in this fixed order.
             extra_paths = [*site.getsitepackages(), site.getusersitepackages()]
         else:
             extra_paths = list(self._worker_extra_paths)
         argv = [
-            sys.executable, "-I", "-c", _WORKER_BOOTSTRAP,
+            sys.executable, "-I", "-S", "-c", _WORKER_BOOTSTRAP,
             self._src_dir,
             json.dumps({"rlimits": self._rlimits_cfg(), "extra_paths": extra_paths,
                         "blocked_modules": self._worker_blocked}),

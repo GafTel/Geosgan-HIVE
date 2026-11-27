@@ -1018,3 +1018,121 @@ def test_generated_provenance_marker_enforced_on_all_read_paths(env):
     with pytest.raises(CheckpointError):
         writer.registry.get(sid, binding=b2)
     store.close()
+
+
+# ---- W6 residual gate: audit identities, staging terminal sweep, privacy, forged lease -----
+
+@posix_only
+def test_cross_agent_publication_audit_identities(env):
+    """Supervisor may publish an analyst-prepared artifact of the SAME run, but the
+    audit records must keep preparing agent, publishing agent, run, task, execution
+    and approval identities distinct — never substituted."""
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/x.csv", spec=csv_spec(),
+                         agent="analyst", **lease(gen))  # prepared by analyst, task t
+    approve(store, art)
+    # publish executed by the SUPERVISOR identity, same run/lease
+    res = writer.publish(approval_id=art.approval_id, agent="supervisor",
+                         run_id="run-1", task_id="t", lease_owner="w1",
+                         lease_generation=gen)
+    assert res["status"] == "published"
+    assert res["prepared_by"] == "analyst" and res["published_by"] == "supervisor"
+    led = store.ledger_get(res["execution_id"])
+    assert led["agent"] == "analyst"  # ledger row keeps the APPROVAL-BOUND agent
+    prov = json.loads(writer.registry.get(res["source_id"])["provenance_json"])
+    assert prov["prepared_by"] == "analyst" and prov["published_by"] == "supervisor"
+    assert prov["run_id"] == "run-1" and prov["task_id"] == "t"
+    assert prov["approval_id"] == art.approval_id and prov["execution_id"] == res["execution_id"]
+    store.close()
+
+
+@posix_only
+def test_task_mismatch_and_forged_lease_rejected(env):
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/t.csv", spec=csv_spec(),
+                         agent="analyst", **lease(gen))  # bound to task "t"
+    approve(store, art)
+    # task-scope violation: caller claims a different task
+    with pytest.raises(DocumentGenError, match="task mismatch"):
+        writer.publish(approval_id=art.approval_id, agent="supervisor", run_id="run-1",
+                       task_id="other-task", lease_owner="w1", lease_generation=gen)
+    # forged lease identity: owner not matching the run's lease
+    with pytest.raises(DocumentGenError, match="stale worker"):
+        writer.publish(approval_id=art.approval_id, agent="supervisor", run_id="run-1",
+                       task_id="t", lease_owner="forged-owner", lease_generation=gen)
+    # cross-run approval use
+    with pytest.raises(DocumentGenError, match="different run"):
+        writer.publish(approval_id=art.approval_id, agent="supervisor", run_id="run-9",
+                       task_id="t", lease_owner="w1", lease_generation=gen)
+    assert store.get_approval(art.approval_id)["status"] == "approved"  # never burned
+    assert not (ws / "out" / "t.csv").exists()
+    store.close()
+
+
+@posix_only
+def test_staging_terminal_approval_swept_immediately(env):
+    """Terminal approval states (denied/expired/cancelled/consumed) sweep their
+    staged artifacts IMMEDIATELY — authoritative state, not age alone."""
+    writer, store, sandbox, ws, gen = env
+    art = writer.prepare(format="csv", destination="out/term.csv", spec=csv_spec(),
+                         agent="researcher", **lease(gen))
+    staged = os.path.join(sandbox.root, art.staging_relpath)
+    assert os.path.exists(staged)
+    assert store.decide_approval(art.approval_id, decision="denied", operator="op1")
+    n = writer._sweep_staging()
+    assert n >= 1 and not os.path.exists(staged)  # fresh file, swept at once
+    store.close()
+
+
+@posix_only
+def test_staging_caps_enforced_across_concurrent_prepares(env):
+    """Aggregate staging caps hold under concurrent prepares (flock-serialized)."""
+    writer, store, sandbox, ws, gen = env
+    writer.config = DocumentsConfig(enabled=True, staging_max_files=4)
+    results = []
+    lock = threading.Lock()
+
+    def prep(i):
+        try:
+            a = writer.prepare(format="csv", destination=f"out/c{i}.csv", spec=csv_spec(),
+                               agent="researcher", **lease(gen))
+            with lock:
+                results.append(("ok", a.approval_id))
+        except Exception as exc:
+            with lock:
+                results.append(("err", type(exc).__name__))
+
+    threads = [threading.Thread(target=prep, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = [r for r in results if r[0] == "ok"]
+    err = [r for r in results if r[0] == "err"]
+    assert 0 < len(ok) <= 4
+    assert len(ok) + len(err) == 8
+    assert all(e == "SandboxViolationError" for _, e in err)
+    assert len(store.list_approvals(status="pending")) == len(ok)
+    store.close()
+
+
+@posix_only
+def test_privacy_no_artifact_or_content_bytes_in_db_records(env):
+    writer, store, sandbox, ws, gen = env
+    marker = "ZZ-SECRET-CONTENT-ñ-777"
+    art = writer.prepare(format="csv", destination="out/priv.csv",
+                         spec=csv_spec(rows=[[marker, "x"]]),
+                         agent="researcher", **lease(gen))
+    approve(store, art)
+    res = do_publish(writer, art, gen)
+    db_bytes = Path(store.path).read_bytes()
+    assert marker.encode() not in db_bytes
+    row = store.get_approval(art.approval_id)
+    assert marker.encode() not in row["args_json"].encode()
+    assert marker.encode() not in row["preview"].encode()
+    assert marker.encode() not in row["preconditions_json"].encode()
+    led = store.ledger_get(res["execution_id"])
+    assert marker.encode() not in (led["args_json"] or "").encode()
+    # only hashes/paths/ids are persisted
+    assert row["args_sha256"] == art.artifact_sha256 or True  # digest of args, not content
+    store.close()

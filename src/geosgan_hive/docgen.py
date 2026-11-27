@@ -475,14 +475,31 @@ class DocumentWriter:
         return out
 
     def _sweep_staging(self) -> int:
-        """W5 residual staging lifecycle: expire stale approvals, then age-sweep the
-        staging dir while PROTECTING artifacts referenced by live approvals (never
-        clean up an active artifact owned by another valid worker). Staged bytes
-        are sensitive and are never persisted to SQLite."""
+        """W6 residual staging lifecycle: expire stale approvals, then sweep the
+        staging dir. PROTECT artifacts of live pending/approved approvals (never
+        clean up an active artifact owned by another valid worker); artifacts of
+        TERMINAL approvals (denied/expired/cancelled/consumed) are swept
+        IMMEDIATELY — authoritative terminal state, not age alone. Unreferenced
+        orphans (crash between stage and approval-create) are age-swept. Staged
+        bytes are sensitive and are never persisted to SQLite."""
         self.store.sweep_expired_approvals()
+        protect: set[str] = set()
+        terminal: set[str] = set()
+        for row in self.store.list_approvals():
+            try:
+                pre = json.loads(row.get("preconditions_json") or "{}")
+            except (ValueError, TypeError):
+                continue
+            rel = pre.get("staging_relpath")
+            if not isinstance(rel, str) or not rel:
+                continue
+            if row["status"] in ("pending", "approved"):
+                protect.add(rel)
+            else:
+                terminal.add(rel)
         return self.sandbox.sweep_staging(
             max_age_seconds=self.config.staging_max_age_seconds,
-            protect=self._active_staging())
+            protect=protect, terminal=terminal)
 
     def _get_pool(self) -> ParserWorkerPool:
         if self._platform != "posix":
@@ -637,12 +654,22 @@ class DocumentWriter:
             raise DocumentGenError("approval expired — regenerate and re-approve (fail closed)")
         if row["run_id"] != run_id:
             raise DocumentGenError("approval belongs to a different run — rejected")
+        # W6 residual: identity separation in audit records — the approval-bound
+        # (preparing) agent and task are authoritative for the ledger/provenance;
+        # the EXECUTING (publishing) agent is recorded separately as published_by.
+        # A task-id mismatch is rejected outright (no substitution in audit rows).
+        if task_id is not None and row["task_id"] is not None \
+                and task_id != row["task_id"]:
+            raise DocumentGenError(
+                f"task mismatch: approval is bound to task {row['task_id']!r}, "
+                f"caller claims {task_id!r} — rejected")
         # the durable bindings (ledger + provenance) use the APPROVAL-BOUND agent;
         # who may invoke doc_publish at all is gated by ToolPolicy, and the run
         # lease owner+generation gates which worker may publish — so a supervisor
         # may publish an artifact prepared by another agent of the SAME run, but
         # never cross-run or cross-lease
         bound_agent = row["agent"] or agent
+        bound_task = row["task_id"] if row["task_id"] else task_id
         pre = json.loads(row["preconditions_json"] or "{}")
         out_sha = pre.get("output_sha256")
         if not out_sha:
@@ -690,7 +717,7 @@ class DocumentWriter:
             execution_id=execution_id, run_id=run_id, agent=bound_agent, tool=row["tool"],
             args_sha256=row["args_sha256"], status=ToolExecutionStatus.STARTED.value,
             approval_id=approval_id, expected_args_sha256=row["args_sha256"],
-            task_id=task_id, tool_version=row["tool_version"], args_json=args_json,
+            task_id=bound_task, tool_version=row["tool_version"], args_json=args_json,
             lease_owner=lease_owner, lease_generation=lease_generation,
             expected_task_id=row["task_id"],
         ):
@@ -719,11 +746,13 @@ class DocumentWriter:
                 "spec_sha256": pre["spec_sha256"], "output_sha256": out_sha,
                 "byte_count": int(pre["byte_count"]), "destination": dest,
                 "approval_id": approval_id, "execution_id": execution_id,
+                "prepared_by": bound_agent, "published_by": agent,
+                "task_id": bound_task, "run_id": run_id,
                 "note": "generated artifact — not retrieved evidence"}
         origin = self.registry.trusted_origin(
             run_id=run_id, lease_owner=lease_owner,  # type: ignore[arg-type]
             lease_generation=lease_generation,      # type: ignore[arg-type]
-            agent_id=bound_agent, task_id=task_id)
+            agent_id=bound_agent, task_id=bound_task)
         source_id = self.registry.register(
             origin=origin, source_type=SourceType.OTHER, provider="hive-docgen",
             locator=f"generated:{dest}", content_sha256=out_sha,
@@ -731,7 +760,9 @@ class DocumentWriter:
             provenance=prov, license=None, attribution="")
         return {"status": "published", "destination": dest, "artifact_sha256": published_sha,
                 "byte_count": len(staged), "approval_id": approval_id,
-                "execution_id": execution_id, "source_id": source_id, "format": pre["format"]}
+                "execution_id": execution_id, "source_id": source_id,
+                "format": pre["format"], "prepared_by": bound_agent, "published_by": agent,
+                "run_id": run_id, "task_id": bound_task}
 
 
 # ---- tools -----------------------------------------------------------------------------------
