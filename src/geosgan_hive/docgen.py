@@ -637,6 +637,12 @@ class DocumentWriter:
             raise DocumentGenError("approval expired — regenerate and re-approve (fail closed)")
         if row["run_id"] != run_id:
             raise DocumentGenError("approval belongs to a different run — rejected")
+        # the durable bindings (ledger + provenance) use the APPROVAL-BOUND agent;
+        # who may invoke doc_publish at all is gated by ToolPolicy, and the run
+        # lease owner+generation gates which worker may publish — so a supervisor
+        # may publish an artifact prepared by another agent of the SAME run, but
+        # never cross-run or cross-lease
+        bound_agent = row["agent"] or agent
         pre = json.loads(row["preconditions_json"] or "{}")
         out_sha = pre.get("output_sha256")
         if not out_sha:
@@ -681,7 +687,7 @@ class DocumentWriter:
         args_json = ("" if getattr(self.store.persist_mode, "value", "") == "metadata_only"
                      else redact_secrets(canonical_args(args))[:8_000])
         if not self.store.start_execution(
-            execution_id=execution_id, run_id=run_id, agent=agent, tool=row["tool"],
+            execution_id=execution_id, run_id=run_id, agent=bound_agent, tool=row["tool"],
             args_sha256=row["args_sha256"], status=ToolExecutionStatus.STARTED.value,
             approval_id=approval_id, expected_args_sha256=row["args_sha256"],
             task_id=task_id, tool_version=row["tool_version"], args_json=args_json,
@@ -717,7 +723,7 @@ class DocumentWriter:
         origin = self.registry.trusted_origin(
             run_id=run_id, lease_owner=lease_owner,  # type: ignore[arg-type]
             lease_generation=lease_generation,      # type: ignore[arg-type]
-            agent_id=agent, task_id=task_id)
+            agent_id=bound_agent, task_id=task_id)
         source_id = self.registry.register(
             origin=origin, source_type=SourceType.OTHER, provider="hive-docgen",
             locator=f"generated:{dest}", content_sha256=out_sha,

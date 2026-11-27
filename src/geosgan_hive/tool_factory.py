@@ -103,6 +103,15 @@ def build_tool_gateway(
         writer = DocumentWriter(store=store, sandbox=_sandbox, config=docs_cfg)
         for spec, adapter in docgen_tools(writer, lease_lookup=lease_lookup):
             catalog.register(spec, adapter)
+    # W6: read-only source inspection tools — registered whenever a durable store
+    # is wired (the registry is core W2), still deny-by-default through the same
+    # ToolPolicy (legacy mode: built-ins only; explicit mode: operator allowlist)
+    if store is not None:
+        from .source_tools import source_tools
+        from .sources import SourceRegistry
+
+        for spec, adapter in source_tools(SourceRegistry(store), lease_lookup=lease_lookup):
+            catalog.register(spec, adapter)
     if approval_manager is None and store is not None and config.tools is not None:
         approval_manager = ApprovalManager(
             store,

@@ -214,6 +214,12 @@ from .run_context import (
     TaskNode,
     TaskStatus,
 )
+from .source_tools import (
+    SourceExcerptInput,
+    SourceGetInput,
+    SourceListInput,
+    source_tools,
+)
 from .sources import (
     OriginKind,
     ReadBinding,
@@ -286,6 +292,10 @@ __all__ = [
     "PreparedArtifact",
     "SheetSpec",
     "docgen_tools",
+    "SourceExcerptInput",
+    "SourceGetInput",
+    "SourceListInput",
+    "source_tools",
     "DocumentError",
     "DocumentParseError",
     "DocumentReader",
