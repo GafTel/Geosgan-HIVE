@@ -417,10 +417,13 @@ def test_ops_registry_is_fixed_and_trusted():
         assert callable(fn)
 
 
+@posix_only
 def test_worker_pth_files_never_execute(tmp_path):
     """W6 residual: the worker runs with -I -S, so `site` never runs and .pth
     files in an injected extra path are NOT executed (plain sys.path entries
-    only). With -I alone, system-site .pth files WOULD run."""
+    only). With -I alone, system-site .pth files WOULD run.
+    POSIX-only: the pool itself fails closed on other platforms (covered by
+    test_non_posix_fails_closed), so this worker-execution test must skip there."""
     import site
 
     evil_dir = tmp_path / "evil-site"
