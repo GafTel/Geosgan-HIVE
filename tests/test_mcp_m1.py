@@ -562,3 +562,82 @@ def test_dispatch_matrix():
     reg_off = registry(stdio_server(enabled=False, cost_class="local",
                                     local_execution_attested=True))
     assert reg_off.dispatch_decision("fs", "read_file").decision is DispatchClass.DENIED
+
+
+# ---- M1 residual fixes F1-F6 (failing-first regression tests) --------------------
+
+SECRET_VAL = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
+
+
+def test_f1_secret_scan_applies_to_every_model_and_never_leaks_value():
+    # direct submodel construction must also reject secret-looking values
+    with pytest.raises(ValidationError) as ei:
+        McpServerConfig.model_validate({**stdio_server(), "description": f"key {SECRET_VAL}"})
+    assert SECRET_VAL not in str(ei.value)  # value never exposed in the error
+    with pytest.raises(ValidationError) as ei2:
+        McpToolPolicy.model_validate({"name": "t", "side_effect": "read_only",
+                                      "description": SECRET_VAL})
+    assert SECRET_VAL not in str(ei2.value)
+    with pytest.raises(ValidationError):
+        McpConfig.model_validate({"servers": [stdio_server(
+            transport={"kind": "stdio", "executable": "/opt/mcp/fs",
+                       "args": [SECRET_VAL]})]})
+
+
+def test_f2_registry_boundary_errors_are_registry_errors():
+    reg = registry(stdio_server(enabled=True, cost_class="local",
+                                 local_execution_attested=True))
+    with pytest.raises(McpRegistryError):  # not a raw McpSchemaError
+        reg.bind_capabilities("fs", [{"name": "read_file"}])  # missing inputSchema
+    with pytest.raises(McpRegistryError):
+        reg.bind_capabilities("fs", [reported(schema={"$ref": "https://x/y.json"})])
+
+
+def test_f3_no_capability_binding_when_global_mcp_disabled():
+    reg = McpRegistry(McpConfig.model_validate(
+        {"enabled": False, "servers": [stdio_server(enabled=True, cost_class="local",
+                                                    local_execution_attested=True)]}))
+    with pytest.raises(McpRegistryError, match="globally disabled"):
+        reg.bind_capabilities("fs", [reported()])
+
+
+def test_f4_max_length_ids_still_namespace_without_weakening_collisions():
+    from geosgan_hive.mcp_contracts import MAX_NAMESPACED_NAME_CHARS, McpContractError
+    name = namespaced_tool_name("a" * 32, "b" * 64)
+    assert name == "mcp_" + "a" * 32 + "__" + "b" * 64
+    assert len(name) <= MAX_NAMESPACED_NAME_CHARS
+    # collision protection unchanged
+    s1 = stdio_server(server_id="a", tools=[{"name": "b__c", "side_effect": "read_only"}])
+    s2 = stdio_server(server_id="a__b", tools=[{"name": "c", "side_effect": "read_only"}])
+    with pytest.raises(McpRegistryError, match="namespace collision"):
+        registry(s1, s2)
+    # id patterns still enforced at config level, and the length cap still guards
+    with pytest.raises(ValidationError):
+        McpServerConfig.model_validate(stdio_server(server_id="a" * 40))
+    with pytest.raises(McpContractError):
+        namespaced_tool_name("x" * 200, "b")  # over-cap -> still rejected
+
+
+def test_f5_numeric_schema_keywords_must_be_finite_and_bounded():
+    for bad in (1e308, -1e308, float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(McpSchemaError):
+            validate_input_schema({"type": "object", "properties": {
+                "n": {"type": "number", "minimum": bad}}})
+        with pytest.raises(McpSchemaError):
+            validate_input_schema({"type": "object", "properties": {
+                "n": {"type": "integer", "maximum": bad, "multipleOf": bad}}})
+    # sane bounds still accepted
+    assert len(validate_input_schema({"type": "object", "properties": {
+        "n": {"type": "number", "minimum": -1e6, "maximum": 1e6}}})) == 64
+
+
+def test_f6_tool_descriptions_excluded_from_identity_digest():
+    a = McpServerConfig.model_validate({**stdio_server(), "tools": [
+        {"name": "t", "side_effect": "read_only", "description": "one"}]})
+    b = McpServerConfig.model_validate({**stdio_server(), "tools": [
+        {"name": "t", "side_effect": "read_only", "description": "two"}]})
+    assert server_identity_digest(a) == server_identity_digest(b)
+    # but a classification change still changes identity
+    c = McpServerConfig.model_validate({**stdio_server(), "tools": [
+        {"name": "t", "side_effect": "forbidden"}]})
+    assert server_identity_digest(a) != server_identity_digest(c)

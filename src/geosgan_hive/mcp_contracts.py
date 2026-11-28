@@ -26,6 +26,7 @@ All functions here are pure (no I/O, no subprocess, no network).
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -47,7 +48,11 @@ POLICY_VERSION = "mcp-policy-1"
 SUPPORTED_PROTOCOL_REVISIONS = (SUPPORTED_PROTOCOL_REVISION,)
 
 NAMESPACE_PREFIX = "mcp"
-MAX_NAMESPACED_NAME_CHARS = 96
+#: 4 ("mcp_") + 32 (max server_id) + 2 ("__") + 64 (max tool name) — F4: max-length
+#: valid ids must still namespace; collision protection is unchanged
+MAX_NAMESPACED_NAME_CHARS = 102
+#: numeric schema keywords must be finite and within this magnitude (F5)
+MAX_NUMERIC_MAGNITUDE = 1e15
 
 MAX_SCHEMA_BYTES = 64 * 1024
 MAX_SCHEMA_DEPTH = 5
@@ -97,8 +102,11 @@ def server_identity_digest(server: McpServerConfig) -> str:
     attestations, cost class, tool classifications, protocol revision — is
     bound in. Changing any of them changes the identity."""
     data = server.model_dump(mode="json")
-    data.pop("enabled", None)
-    data.pop("description", None)
+    data.pop("enabled", None)       # volatile switch — not identity
+    data.pop("description", None)   # untrusted display text — not identity
+    for tool in data.get("tools", []):  # F6: tool descriptions are display text too
+        if isinstance(tool, dict):
+            tool.pop("description", None)
     return args_sha256(data)
 
 
@@ -303,11 +311,22 @@ def _validate_schema_node(node: Any, *, depth: int, path: str) -> None:
             raise McpSchemaError(f"format must be a short annotation string at {path!r}")
     if stype in ("number", "integer") or (stype is None and "minimum" in node):
         for k in ("minimum", "maximum", "multipleOf"):
-            if k in node and not isinstance(node[k], (int, float)):
-                raise McpSchemaError(f"{k} must be numeric at {path!r}")
+            if k in node:
+                if not isinstance(node[k], (int, float)) or isinstance(node[k], bool):
+                    raise McpSchemaError(f"{k} must be numeric at {path!r}")
+                # F5: finite and bounded — never inf/nan/huge
+                if not math.isfinite(node[k]) or abs(node[k]) > MAX_NUMERIC_MAGNITUDE:
+                    raise McpSchemaError(
+                        f"{k} must be finite with |value| <= {MAX_NUMERIC_MAGNITUDE:g} "
+                        f"at {path!r}")
         for k in ("exclusiveMinimum", "exclusiveMaximum"):
-            if k in node and not isinstance(node[k], (int, float, bool)):
-                raise McpSchemaError(f"{k} must be numeric/bool at {path!r}")
+            if k in node:
+                if isinstance(node[k], bool):
+                    continue  # draft-07 boolean form: annotation only here
+                if not isinstance(node[k], (int, float)):
+                    raise McpSchemaError(f"{k} must be numeric/bool at {path!r}")
+                if not math.isfinite(node[k]) or abs(node[k]) > MAX_NUMERIC_MAGNITUDE:
+                    raise McpSchemaError(f"{k} must be finite and bounded at {path!r}")
         if stype == "integer" and "multipleOf" in node and node["multipleOf"] <= 0:
             raise McpSchemaError(f"multipleOf must be > 0 at {path!r}")
     if stype == "array" or (stype is None and "items" in node):

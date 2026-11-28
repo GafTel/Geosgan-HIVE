@@ -42,6 +42,7 @@ from .mcp_contracts import (
     POLICY_VERSION,
     SUPPORTED_PROTOCOL_REVISIONS,
     DispatchDecision,
+    McpSchemaError,
     ToolCapability,
     dispatch_decision,
     effective_cost_class,
@@ -219,6 +220,9 @@ class McpRegistry:
         readOnlyHint) are recorded nowhere and NEVER influence classification.
         Returns one immutable ToolCapability per allowed tool; each carries a
         binding digest that changes if any bound field changes."""
+        if not self._config.enabled:
+            raise McpRegistryError(
+                "MCP is globally disabled — no capabilities can be bound (fail closed)")
         entry = self.server(server_id)
         server = entry.server
         if not server.enabled:
@@ -240,7 +244,12 @@ class McpRegistry:
                     f"server {server_id!r} reported tool {name!r} that is not in the "
                     "operator allowlist — capability change, fail closed (never "
                     "auto-registered)")
-            schema_digest = validate_input_schema(item.get("inputSchema"))
+            try:  # F2: normalize boundary errors to McpRegistryError
+                schema_digest = validate_input_schema(item.get("inputSchema"))
+            except McpSchemaError as exc:
+                raise McpRegistryError(
+                    f"tool {name!r} on server {server_id!r} has an invalid input schema "
+                    f"(outside the supported subset): {exc}") from exc
             if tool.input_schema_sha256 is not None \
                     and tool.input_schema_sha256 != schema_digest:
                 raise McpRegistryError(

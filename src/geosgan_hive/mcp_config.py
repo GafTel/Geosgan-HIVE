@@ -112,9 +112,16 @@ def cost_severity(cost: McpCostClass) -> int:
 
 
 class _McpModel(BaseModel):
-    """Base: unknown fields rejected, immutable (frozen) snapshots."""
+    """Base: unknown fields rejected, immutable (frozen) snapshots, and every
+    model (not just the root) rejects secret-looking values (F1). The error
+    never includes the offending value."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="after")
+    def _scan_secret_like(self) -> _McpModel:
+        _reject_secret_like(self)
+        return self
 
 
 class McpStdioTransport(_McpModel):
@@ -267,7 +274,6 @@ class McpConfig(_McpModel):
         ids = [s.server_id for s in self.servers]
         if len(set(ids)) != len(ids):
             raise ValueError(f"duplicate server ids: {sorted(ids)}")
-        _reject_secret_like(self)
         return self
 
 
@@ -285,14 +291,15 @@ def _iter_strings(obj: Any):
 
 
 def _reject_secret_like(model: BaseModel) -> None:
-    """Fail closed if any string in the config looks like a pasted credential."""
+    """Fail closed if any string in the model looks like a pasted credential.
+    The offending value is NEVER included in the error (F1)."""
     for s in _iter_strings(model):
         for pat in SECRET_LIKE_PATTERNS:
             if pat.search(s):
                 raise ValueError(
-                    "configuration contains a secret-looking value — credentials are "
-                    "referenced by environment-variable NAME only and are never stored "
-                    "in config files"
+                    "configuration contains a secret-looking value (redacted) — "
+                    "credentials are referenced by environment-variable NAME only and "
+                    "are never stored in config files"
                 )
 
 
