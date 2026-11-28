@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -85,6 +85,12 @@ class McpContractError(HiveError):
     """Capability identity / namespace / binding contract violation."""
 
 
+class McpUnavailableError(HiveError):
+    """The optional `mcp` extra (or a pinned dependency of it) is not installed
+    or fails the version pin — MCP stays disabled (fail closed). Defined ONCE
+    here so every M2 module raises/catches the same class."""
+
+
 def namespaced_tool_name(server_id: str, tool_name: str) -> str:
     """Deterministic, collision-free namespace mapping (amendment B). Both
     parts are already charset-restricted by mcp_config patterns; Unicode and
@@ -125,7 +131,10 @@ def transport_identity(server: McpServerConfig) -> str:
 @dataclass(frozen=True)
 class ToolCapability:
     """Immutable binding of one remote tool to the full identity context
-    (amendment B). `binding_digest` changes if ANY bound field changes."""
+    (amendment B). `binding_digest` changes if ANY bound field changes.
+    `input_schema` is the subset-validated schema (safe to enforce args with);
+    `output_schema_sha256` is set when the server declares an outputSchema
+    (also subset-validated; unsupported -> the tool is rejected at discovery)."""
 
     server_id: str
     server_identity: str          # server_identity_digest
@@ -140,6 +149,8 @@ class ToolCapability:
     requires_approval: bool
     max_output_bytes: int
     policy_version: str
+    input_schema: dict = field(default_factory=dict)
+    output_schema_sha256: str | None = None
 
     def binding_digest(self) -> str:
         return args_sha256({

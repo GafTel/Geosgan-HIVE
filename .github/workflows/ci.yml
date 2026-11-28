@@ -21,7 +21,7 @@ jobs:
       # only as a fixture writer) run on Linux CI. Resolution: pip resolves the
       # `docs` extra declared in pyproject.toml together with `dev`.
       - name: Install dependencies
-        run: pip install -e ".[dev,docs]"
+        run: pip install -e ".[dev,docs,mcp]"
       - name: Lint
         run: ruff check .
       - name: Tests
@@ -43,7 +43,7 @@ jobs:
       # Windows: docs extras installed too; worker-format parse tests assert
       # fail-closed there (parser isolation is POSIX-only by design)
       - name: Install dependencies
-        run: pip install -e ".[dev,docs]"
+        run: pip install -e ".[dev,docs,mcp]"
       - name: Lint
         run: ruff check .
       - name: Tests

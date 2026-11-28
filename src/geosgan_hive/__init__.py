@@ -162,6 +162,20 @@ from .http_client import (
     validate_destination,
 )
 from .llm import AsyncLLMClient, FakeLLM, LLMClient
+from .mcp_args import (
+    McpArgsError,
+    validate_tool_args,
+)
+from .mcp_client import (
+    MCP_PROTOCOL_REVISION,
+    REMOTE_DISPATCH_ENABLED,
+    McpClientError,
+    McpDispatchError,
+    McpProtocolError,
+    McpSession,
+    McpSessionManager,
+    check_sdk,
+)
 from .mcp_config import (
     MAX_MCP_CONFIG_BYTES,
     MAX_SERVERS,
@@ -184,6 +198,7 @@ from .mcp_contracts import (
     DispatchDecision,
     McpContractError,
     McpSchemaError,
+    McpUnavailableError,
     ToolCapability,
     dispatch_decision,
     effective_cost_class,
@@ -199,6 +214,20 @@ from .mcp_registry import (
     McpRegistryError,
     McpServerEntry,
 )
+from .mcp_stdio import (
+    McpStdioError,
+    StdioProcess,
+    check_executable,
+    stdio_transport,
+)
+from .mcp_transport import (
+    HiveMcpHttpTransport,
+    McpSessionState,
+    hive_httpx_client,
+)
+
+# mcp_transport also re-exports the session error under the client namespace
+from .mcp_transport import McpSessionError as McpSessionError
 from .messages import Message
 from .orchestrator import FINISH, OrchestratorResult, Supervisor
 from .outbound import (
@@ -397,6 +426,25 @@ __all__ = [
     "server_identity_digest",
     "transport_identity",
     "validate_input_schema",
+    "MCP_PROTOCOL_REVISION",
+    "REMOTE_DISPATCH_ENABLED",
+    "McpArgsError",
+    "McpClientError",
+    "McpDispatchError",
+    "McpProtocolError",
+    "McpSession",
+    "McpSessionError",
+    "McpSessionManager",
+    "McpSessionState",
+    "McpStdioError",
+    "McpUnavailableError",
+    "HiveMcpHttpTransport",
+    "StdioProcess",
+    "check_executable",
+    "check_sdk",
+    "hive_httpx_client",
+    "stdio_transport",
+    "validate_tool_args",
     "RoutingMode",
     "RoutingPolicy",
     "RoutingWeights",

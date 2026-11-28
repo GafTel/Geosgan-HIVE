@@ -31,6 +31,18 @@ docs = [
     "reportlab>=4",
     "defusedxml>=0.7",
 ]
+# v0.9.0 M2 (MCP & API Engine): official MCP Python SDK as an OPTIONAL extra,
+# lazy-loaded only by the MCP client modules; core installs/imports without it.
+# Pin rationale (verified against the GitHub/PyPI advisory database): the 1.x
+# line is in security maintenance; >=1.30 clears GHSA-qx49-fqc8-xw99
+# (CVE-2026-115563, OAuth credential leak) and GHSA-84m7-p3x7-pcfv
+# (CVE-2026-59951, unbounded session accumulation); <2 keeps the
+# initialize-handshake protocol family. HIVE pins the negotiated protocol
+# revision to 2025-06-18 itself (the SDK's LATEST constant is NOT used).
+# License: MIT. Client-only usage: no OAuth flows, no server components.
+mcp = [
+    "mcp>=1.30,<2",
+]
 
 [project.scripts]
 geosgan-hive = "geosgan_hive.cli:main"

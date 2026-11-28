@@ -246,9 +246,13 @@ class McpRegistry:
                     "auto-registered)")
             try:  # F2: normalize boundary errors to McpRegistryError
                 schema_digest = validate_input_schema(item.get("inputSchema"))
+                # outputSchema (if declared) must also be inside the supported subset
+                out_schema_digest = None
+                if item.get("outputSchema") is not None:
+                    out_schema_digest = validate_input_schema(item["outputSchema"])
             except McpSchemaError as exc:
                 raise McpRegistryError(
-                    f"tool {name!r} on server {server_id!r} has an invalid input schema "
+                    f"tool {name!r} on server {server_id!r} has an invalid schema "
                     f"(outside the supported subset): {exc}") from exc
             if tool.input_schema_sha256 is not None \
                     and tool.input_schema_sha256 != schema_digest:
@@ -270,6 +274,8 @@ class McpRegistry:
                 requires_approval=effective_requires_approval(tool),
                 max_output_bytes=tool.max_output_bytes,
                 policy_version=POLICY_VERSION,
+                input_schema=dict(item["inputSchema"]),
+                output_schema_sha256=out_schema_digest,
             ))
         # every allowlisted tool must be reported (missing = capability change)
         missing = sorted(set(entry.tools) - seen)

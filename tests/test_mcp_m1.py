@@ -481,8 +481,21 @@ def test_core_works_without_mcp_sdk(monkeypatch):
     assert geosgan_hive.McpRegistry is McpRegistry
     reg = registry(stdio_server())
     assert reg.server("fs").identity_digest
-    # the SDK is never imported by M1 modules
-    assert "mcp.client" not in sys.modules
+    # the SDK is never imported by core modules. Checked in a FRESH subprocess:
+    # in-process sys.modules is polluted at collection time by test_mcp_m2's
+    # module-level importorskip("mcp"), so an in-process assertion would be
+    # order-dependent. The subprocess blocks `mcp` before importing the core.
+    code = (
+        "import sys\n"
+        "sys.modules['mcp'] = None\n"
+        "import geosgan_hive\n"
+        "leaked = [m for m in sys.modules\n"
+        "          if (m == 'mcp' or m.startswith('mcp.')) and sys.modules[m] is not None]\n"
+        "assert not leaked, f'SDK modules imported by core: {leaked}'\n"
+        "print('NO_SDK_OK')\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(REPO))
+    assert out.returncode == 0 and "NO_SDK_OK" in out.stdout, out.stderr
 
 
 # ---- 21. zero-cost release gate unchanged -------------------------------------------------

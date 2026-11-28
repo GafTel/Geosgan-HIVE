@@ -233,6 +233,12 @@ class McpServerConfig(_McpModel):
     zero_cost_attested: bool = False
     description: str = Field(default="", max_length=MAX_DESCRIPTION_CHARS)
     tools: list[McpToolPolicy] = Field(default_factory=list, max_length=MAX_TOOLS_PER_SERVER)
+    #: cumulative per-session caps (M2): physical requests, wire bytes, wall-clock
+    #: deadline. Enforced by the session manager on top of the durable per-request
+    #: budgets — a session can never exceed these no matter how many requests it makes
+    max_session_requests: int = Field(default=64, ge=1, le=1024)
+    max_session_wire_bytes: int = Field(default=16 << 20, ge=1, le=256 << 20)
+    session_deadline_seconds: float = Field(default=300.0, gt=0, le=86_400.0)
 
     @model_validator(mode="after")
     def _check_server(self) -> McpServerConfig:

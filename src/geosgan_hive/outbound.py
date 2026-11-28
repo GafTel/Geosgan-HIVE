@@ -330,7 +330,12 @@ class ApiSession:
                 body: bytes | None = None, agent: str = "system",
                 run_id: str | None = None, task_id: str | None = None,
                 lease_owner: str | None = None, lease_generation: int | None = None,
-                cancel=None) -> HttpResult:
+                cancel=None,
+                headers: Mapping[str, str] | None = None) -> HttpResult:
+        """`headers` (M2: MCP protocol headers such as MCP-Protocol-Version /
+        mcp-session-id) are passed through to SecureHttpClient, which validates
+        every key against the endpoint rule's extra_header_keys allowlist and
+        rejects control characters; headers are never audited or persisted."""
         canonical_args = {"method": method.upper(), "path": path,
                           "params": {k: params[k] for k in sorted(params or {})},
                           "body_sha256": hashlib.sha256(body or b"").hexdigest()}
@@ -395,7 +400,7 @@ class ApiSession:
             t0 = self._clock()
             try:
                 result = self.client.request(endpoint_id, method, path, params=params,
-                                             body=body, cancel=cancel)
+                                             body=body, headers=headers, cancel=cancel)
             except HiveError as exc:
                 self._audit(provider, endpoint_id, operation_id, "error",
                             None, 0, 0, int((self._clock() - t0) * 1000),
