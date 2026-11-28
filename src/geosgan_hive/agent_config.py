@@ -14,6 +14,7 @@ from .checkpoints import PersistMode
 from .cloud_profiles import CloudProfile
 from .errors import ConfigError, HiveError
 from .fallback import FallbackMode, FallbackPolicy
+from .mcp_config import McpConfig
 from .providers import parse_model
 from .routing import RoutingPolicy
 from .run_context import CollaborationPolicy
@@ -501,6 +502,10 @@ class HiveConfig(BaseModel):
     routing: RoutingPolicy | None = None
     #: Phase 6 W4: local document reading (None or enabled=false = fully disabled)
     documents: DocumentsConfig | None = None
+    #: v0.9.0 M1: MCP registry (configuration-only; None or enabled=false = fully
+    #: disabled). Servers are individually disabled by default; remote transports
+    #: must reference an enabled HTTPS API endpoint (validated below).
+    mcp: McpConfig | None = None
 
     @model_validator(mode="after")
     def _check_names(self) -> HiveConfig:
@@ -541,6 +546,24 @@ class HiveConfig(BaseModel):
                     "cloud.zero_cost=true requires a persistent checkpoint.path "
                     "(':memory:' is not durable and is rejected in zero-cost mode)"
                 )
+        # v0.9.0 M1: remote MCP transports must reference an operator-allowlisted
+        # HTTPS endpoint of an ENABLED api provider — fail closed at load time
+        if self.mcp is not None:
+            enabled_eps = {e.endpoint_id for p in (self.apis.providers if self.apis else [])
+                           if p.provider in (self.apis.enabled if self.apis else [])
+                           for e in p.endpoints}
+            for srv in self.mcp.servers:
+                t = srv.transport
+                if t.kind == "streamable_http":
+                    if self.apis is None:
+                        raise ValueError(
+                            f"MCP server {srv.server_id!r} uses streamable_http but no "
+                            "'apis:' block is configured — remote MCP stays disabled")
+                    if t.endpoint_id not in enabled_eps:
+                        raise ValueError(
+                            f"MCP server {srv.server_id!r} references endpoint "
+                            f"{t.endpoint_id!r} which is not an endpoint of an ENABLED "
+                            "api provider — fail closed")
         return self
 
     def agent(self, name: str) -> AgentSpec:

@@ -1,0 +1,98 @@
+# GEOSGAN HIVE v0.9.0 — M1 example: MCP registry (configuration-only).
+#
+# OPT-IN example. Attach this block as the `mcp:` key of a team config (see the
+# bottom of this file), or load it standalone via load_mcp_config_file().
+# DEFAULT STATE: MCP is globally disabled AND every server below is disabled;
+# nothing here runs, connects, spawns or registers any tool unless the operator
+# explicitly enables it stage by stage (M2+).
+#
+# Security model (M1 amendments A–D):
+#   - Server annotations reported at runtime (readOnlyHint etc.) are UNTRUSTED
+#     hints; every permitted tool below carries an explicit OPERATOR-OWNED
+#     `side_effect` classification. Unknown/missing/changed classifications fail
+#     closed; unknown tools are never auto-registered.
+#   - Human approval can never override `forbidden`, unknown-cost or paid
+#     classifications.
+#   - Financial eligibility is explicit: `cost_class: local` requires
+#     local_execution_attested; `verified_zero_cost` requires zero_cost_attested.
+#     `unknown` (the default) fails closed. A free SDK, a free protocol, an HTTP
+#     200 or operator authorization NEVER establish zero-cost eligibility.
+#     ZERO_COST_RELEASE_LOCAL_PROVIDERS = ("ollama",) is untouched: MCP must not
+#     become an indirect path to paid inference/APIs.
+#   - stdio: absolute operator-approved executable only — no shell, no npx/uvx,
+#     no downloads. env_refs are env-var NAMES (references); secret VALUES never
+#     belong in this file (secret-looking strings are rejected at load time).
+#     An approved executable is NOT automatically a sandboxed executable: a
+#     same-user subprocess can otherwise reach host files, credentials, local
+#     services and paid APIs. Production stdio activation stays blocked until
+#     the M2 isolation guarantees are enforceable.
+#   - streamable_http: must reference an endpoint of an ENABLED `apis:` provider
+#     (https only). Remote MCP is disabled by default; M2 routes it exclusively
+#     through SecureHttpClient/ApiSession (pinning, TLS, no redirects/proxies,
+#     durable reservations, deadlines, caps, lease fencing) — one HTTP stack.
+#   - Supported MCP protocol revision: 2025-06-18 only. Others are rejected.
+#   - Capability identity: every tool is bound to a digest over server identity,
+#     transport identity, executable/endpoint, protocol revision, tool name,
+#     canonical input-schema digest, operator classification, cost class and
+#     policy version. Any change invalidates previous authorization.
+#
+# No secrets ever belong in this file.
+
+mcp:
+  enabled: false            # global kill switch; M1 default = disabled
+  servers:
+    # ---- local stdio example (disabled; NOT executable until M2 isolation) ----
+    - server_id: fs-docs
+      enabled: false
+      protocol_revision: "2025-06-18"   # the only supported revision
+      transport:
+        kind: stdio
+        executable: /opt/mcp-servers/fs-docs   # absolute path, standalone binary
+        args: ["--read-only"]                   # fixed argv; no shell ever
+        env_refs: []                            # env-var NAMES only, e.g. [DOCS_ROOT]
+      # operator attestation required for cost_class=local (see notes above)
+      cost_class: unknown                     # default: fails closed
+      local_execution_attested: false
+      zero_cost_attested: false
+      description: "untrusted display text — never used for authorization"
+      tools:
+        - name: read_file
+          side_effect: read_only              # operator-owned, NOT the server's hint
+          # input_schema_sha256: <64-hex pin> # optional pin of the canonical schema digest
+          max_output_bytes: 100000
+        - name: delete_file
+          side_effect: forbidden              # never executable; approval cannot override
+
+    # ---- remote streamable_http example (disabled; requires enabled apis endpoint) ----
+    - server_id: web-docs
+      enabled: false
+      protocol_revision: "2025-06-18"
+      transport:
+        kind: streamable_http
+        endpoint_id: mcp-gateway           # must be an endpoint of an ENABLED apis provider
+        url_path: /mcp
+      cost_class: unknown                   # verified_zero_cost needs zero_cost_attested=true
+      zero_cost_attested: false
+      tools:
+        - name: search
+          side_effect: read_only
+          cost_class: unknown               # may only be MORE conservative than the server's
+
+# ---------------------------------------------------------------------------
+# Attach to a team config like this (the `apis:` block must exist and enable the
+# provider that owns the referenced endpoint for any streamable_http server):
+#
+# supervisor: {name: supervisor, description: s, system_prompt: s, model: ollama/llama3.2}
+# agents:
+#   - {name: researcher, description: r, system_prompt: r, model: ollama/llama3.2}
+# apis:
+#   enabled: [mcp-gw]
+#   providers:
+#     - provider: mcp-gw
+#       billing: public_api_no_charge    # operator attestation, not proof
+#       outbound_policy: approval_required
+#       allowed_operations: [mcp]
+#       endpoints:
+#         - {endpoint_id: mcp-gateway, scheme: https, host: mcp.example.org,
+#            path_prefixes: [/mcp], methods: [POST, GET]}
+# mcp: <the block above>
